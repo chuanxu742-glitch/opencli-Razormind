@@ -72,11 +72,10 @@ class CdpBrowserActSession:
         await self._close_connection()
 
     async def _close_connection(self) -> None:
-        if self._browser is not None:
-            try:
-                await self._browser.close()
-            finally:
-                self._browser = None
+        # Browser.close() terminates a browser launched by Playwright. For a
+        # CDP attachment it can also tear down the user's persistent profile;
+        # stopping Playwright is the detach operation we need.
+        self._browser = None
         if self._playwright is not None:
             try:
                 await self._playwright.stop()
