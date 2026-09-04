@@ -1,6 +1,6 @@
 ---
 name: ecommerce-platform
-description: "Extract visible product listings, product details, and reviews from public JD, Pinduoduo, Douyin Shop, Kuaishou Shop, Xiaohongshu Shop, Vipshop, Suning, 1688, Dewu, or other e-commerce pages. Uses the supplied page URL and reads only data rendered in the current browser session."
+description: "Extract visible product listings, product details, and reviews from public JD, Pinduoduo, Xiaohongshu Shop, Vipshop, Suning, 1688, Dewu, or other e-commerce pages. Uses the supplied page URL and reads only data rendered in the current browser session."
 ---
 
 # E-commerce — Platform Adapter
@@ -14,7 +14,7 @@ verified in the target browser session before production use.
 
 Parameters:
 - `url`: the public or already-authorized page URL
-- `platform`: `jd`, `pinduoduo`, `douyin`, `kuaishou`, `xiaohongshu`, `vipshop`, `suning`, `1688`, `dewu`, or `auto`
+- `platform`: `jd`, `pinduoduo`, `xiaohongshu`, `vipshop`, `suning`, `1688`, `dewu`, or `auto`
 - `operation`: `listing`, `detail`, or `reviews`
 - `max_results`: maximum listing/review items per page
 - `max_pages`: listing page cap, default 5 and hard-capped at 100

@@ -18,10 +18,14 @@ def main():
         var items = Array.from(document.querySelectorAll('a[class*="feeds-item-wrap"]'));
         if (items.length === 0) {{
           items = Array.from(document.querySelectorAll('a[href*="/item"]')).filter(function(item) {{
-            return /[?&]id=\\d+/.test(item.getAttribute('href') || '');
+            return /[?&]id=\d+/.test(item.getAttribute('href') || '');
           }});
         }}
         if (items.length === 0) {{
+          var pageText = (document.body && document.body.innerText) || '';
+          if (/(?:\/login|passport\.|punish|x5sec|登录|验证码)/i.test(window.location.href + ' ' + pageText)) {{
+            return JSON.stringify({{ error: true, message: 'Login or verification required for Goofish before collecting search results' }});
+          }}
           return JSON.stringify({{ error: true, message: 'No search result items found — page may not have loaded or search returned no results' }});
         }}
         var result = [];

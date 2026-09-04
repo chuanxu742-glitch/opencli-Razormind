@@ -155,9 +155,9 @@ SKILL.md prose → manifest:
    offset formula), not something this seed pretends to support.
 3. **The other 67 vendored packs have no `channel.manifest.json` yet.**
    The manifest interpreter now covers the browser-driven e-commerce packs
-   (Taobao/Tmall, Goofish, generic e-commerce, and the JD/Pinduoduo/Douyin
-   platform adapter) plus the original search seed. Add a
-   `channel.manifest.json` next to a pack's `SKILL.md` as each compatible
+   (Taobao/Tmall, Goofish, generic e-commerce, and the JD/Pinduoduo/Xiaohongshu/
+   Vipshop/Suning/1688/Dewu platform adapter) plus the original search seed.
+   Add a `channel.manifest.json` next to a pack's `SKILL.md` as each compatible
    browser-driven pack is needed. The `*-api-skill` packs still use a
    different execution shape: their scripts call the BrowserAct API directly
    over HTTP, without a browser session, so they require a separate API

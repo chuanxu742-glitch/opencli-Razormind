@@ -53,7 +53,7 @@ import logging
 import re
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, unquote_plus, urlsplit, urlunsplit
+from urllib.parse import quote, unquote_plus, unquote_to_bytes, urlsplit, urlunsplit
 
 from pydantic import ValidationError
 
@@ -98,6 +98,12 @@ _AUTH_KEYWORDS = (
     "验证",
     "人机",
 )
+
+_AUTH_URL_RE = re.compile(r"(?:^|[./_-])(login|passport|signin|sign-in)(?:[./?/#_-]|$)", re.IGNORECASE)
+
+
+def _is_auth_wall_url(url: str) -> bool:
+    return bool(_AUTH_URL_RE.search(url))
 
 #: Minimal stop_when interpreter: only the "result_count < N" / "<= N" shape
 #: (the one every vendored SKILL.md pagination note seen so far uses, e.g.
@@ -177,6 +183,25 @@ def _page_url(url: str, page_param: str, page: int) -> str:
     if not replaced:
         kept.append(page_pair)
     return urlunsplit(parts._replace(query="&".join(kept)))
+def _normalize_platform_url(url: str, platform: str) -> str:
+    """Normalize legacy platform query encodings before navigation."""
+    if platform != "1688":
+        return url
+    parts = urlsplit(url)
+    query: list[str] = []
+    for pair in parts.query.split("&") if parts.query else []:
+        raw_key, separator, raw_value = pair.partition("=")
+        if unquote_plus(raw_key) != "keywords" or not separator:
+            query.append(pair)
+            continue
+        raw_bytes = unquote_to_bytes(raw_value.replace("+", " "))
+        try:
+            keyword = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            keyword = raw_bytes.decode("gbk")
+        query.append(f"{raw_key}={quote(keyword.encode('gbk'))}")
+    return urlunsplit(parts._replace(query="&".join(query)))
+
 
 def _item_identity(item: Any) -> str | None:
     if not isinstance(item, dict):
@@ -612,6 +637,7 @@ class BrowserActChannel(AbstractChannel):
                     )
                 else:
                     url = (step.url_template or "").format(**ctx)
+                url = _normalize_platform_url(url, platform)
                 await sess.navigate(url)
             elif step.op == "wait":
                 if (
@@ -638,6 +664,9 @@ class BrowserActChannel(AbstractChannel):
                 else:
                     items = [parsed]
             elif step.op == "scroll":
+                page = getattr(sess, "page", None)
+                if isinstance(sess, CdpBrowserActSession) and page is not None and _is_auth_wall_url(page.url):
+                    continue
                 amount = step.amount or 1000
                 await sess.run(["scroll", "down", "--amount", str(amount)])
             elif step.op == "click" and step.index is not None:

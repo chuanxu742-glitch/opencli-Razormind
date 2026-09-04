@@ -87,10 +87,10 @@ class CdpBrowserActSession:
         try:
             if self._page.url and _url_key(self._page.url) == _url_key(url):
                 return self._page.url
-            # Commerce pages often keep subresources open indefinitely. The
-            # following stable wait handles hydration; navigation only needs
-            # the document shell and must not wait for every asset.
-            await self._page.goto(url, wait_until="domcontentloaded")
+            # Commerce pages may keep the document event open while their
+            # result grid hydrates; commit is enough because the manifest's
+            # following wait step handles hydration.
+            await self._page.goto(url, wait_until="commit")
             return self._page.url
         except Exception as exc:
             raise CdpSessionError(f"navigation failed: {exc}") from exc
@@ -104,7 +104,7 @@ class CdpBrowserActSession:
                 # shell. Give client-side product cards a bounded settle
                 # window without waiting for network-idle, which may never
                 # occur on commerce sites.
-                await self._page.wait_for_timeout(5000)
+                await self._page.wait_for_timeout(10000)
         except Exception as exc:
             raise CdpSessionError(f"wait failed: {exc}") from exc
 

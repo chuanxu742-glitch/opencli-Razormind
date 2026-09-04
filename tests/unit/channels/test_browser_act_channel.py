@@ -27,7 +27,11 @@ from backend.browser_act import cli as browser_act_cli
 from backend.browser_act.cli import BrowserActResult
 from backend.browser_act.scripts import run_pack_script
 from backend.browser_act_packs.catalog import PackCatalog
-from backend.channels.browser_act_channel import BrowserActChannel, _page_url
+from backend.channels.browser_act_channel import (
+    BrowserActChannel,
+    _normalize_platform_url,
+    _page_url,
+)
 
 PACK_SELECTOR = "search-research/demo-search"
 
@@ -248,6 +252,14 @@ def test_page_url_preserves_non_utf8_query_bytes():
     assert _page_url(url, "beginPage", 2) == (
         "https://example.com/search?keywords=%B6%FA%BB%FA&beginPage=2"
     )
+def test_normalize_1688_keywords_to_gbk():
+    utf8_url = "https://s.1688.com/selloffer/offer_search.htm?keywords=%E8%80%B3%E6%9C%BA"
+    gbk_url = "https://s.1688.com/selloffer/offer_search.htm?keywords=%B6%FA%BB%FA"
+
+    assert _normalize_platform_url(utf8_url, "1688") == gbk_url
+    assert _normalize_platform_url(gbk_url, "1688") == gbk_url
+    assert _normalize_platform_url(utf8_url, "jd") == utf8_url
+
 
 # ── collect(): below min_count ────────────────────────────────────────────
 

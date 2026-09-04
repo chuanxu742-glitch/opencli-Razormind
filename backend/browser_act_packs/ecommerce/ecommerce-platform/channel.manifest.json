@@ -3,7 +3,7 @@
   "capability": "ecommerce-platform",
   "param_schema": [
     {"name": "url", "required": true},
-    {"name": "platform", "required": false, "default": "auto", "enum": ["jd", "pinduoduo", "douyin", "kuaishou", "xiaohongshu", "vipshop", "suning", "1688", "dewu", "auto"]},
+    {"name": "platform", "required": false, "default": "auto", "enum": ["jd", "pinduoduo", "xiaohongshu", "vipshop", "suning", "1688", "dewu", "auto"]},
     {"name": "operation", "required": false, "default": "detail", "enum": ["listing", "detail", "reviews"]},
     {"name": "max_results", "required": false, "default": "20"},
     {"name": "max_pages", "required": false, "default": "5"},
@@ -11,8 +11,6 @@
   ],
   "steps": [
     {"op": "navigate", "url_template": "{url}"},
-    {"op": "wait", "wait_mode": "stable", "selector": "#J_goodsList .gl-item, .c-goods-item, [class*=\"product-box\"], [class*=\"offerCard\"], [class*=\"goods-item\"], [class*=\"product-card\"], [data-offer-id], [data-sku]"},
-    {"op": "scroll", "amount": 8000},
     {"op": "wait", "wait_mode": "stable"},
     {"op": "eval_script", "script": "scripts/extract.py", "args": ["{operation}", "{platform}", "--max-results", "{max_results}"]}
   ],

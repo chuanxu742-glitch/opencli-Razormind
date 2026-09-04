@@ -5,8 +5,6 @@ import sys
 PLATFORMS = [
     "jd",
     "pinduoduo",
-    "douyin",
-    "kuaishou",
     "xiaohongshu",
     "vipshop",
     "suning",
@@ -54,8 +52,6 @@ def main():
         const platformCards = {
           jd: '#J_goodsList ul.gl-warp.clearfix > li.gl-item[data-sku], .gl-item[data-sku], [data-sku]',
           pinduoduo: '[class*="goods-item"], [class*="goodsItem"], [class*="search-result"]',
-          douyin: '[data-e2e*="product"], [class*="product-card"], [class*="goods-card"]',
-          kuaishou: '[data-e2e*="product"], [data-testid*="product"], [data-goods-id], [data-product-id]',
           xiaohongshu: '[data-testid*="product"], [data-goods-id], [data-product-id]',
           vipshop: '#J_searchCatList .c-goods-item[data-product-id], #J_wrap_pro_add .c-goods-item[data-product-id], .c-goods-item[data-product-id], .c-goods-item[data-spu], [data-spu], [data-sku]',
           suning: '[data-sku], [data-product-id], [class*="product-box"]',
@@ -380,6 +376,10 @@ def main():
           }
 
           if (items.length === 0) {
+            const authUrl = /(?:\/|[._-])(login|passport|signin|sign-in|punish|x5sec)(?=[./?#_-]|$)/i.test(window.location.href);
+            if (authUrl) {
+              return JSON.stringify({ error: true, message: `Login or verification required for ${platform} before collecting product listings` });
+            }
             return JSON.stringify({ error: true, message: 'No product listings found on this page. Ensure this is a category, search results, or product listing page.' });
           }
           return JSON.stringify({ count: items.length, items });

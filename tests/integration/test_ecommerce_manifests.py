@@ -19,8 +19,6 @@ EcommerceChannel = "ecommerce/{}"
 PLATFORM_ADAPTERS = [
     "jd",
     "pinduoduo",
-    "douyin",
-    "kuaishou",
     "xiaohongshu",
     "vipshop",
     "suning",
@@ -85,9 +83,8 @@ def test_platform_adapter_manifest_supports_bounded_listing_pagination():
     assert manifest.pagination.page_index_offset == {"suning": -1}
     assert manifest.pagination.platforms == ["suning", "1688"]
     wait_step = manifest.steps[1]
-    assert wait_step.selector and "product-box" in wait_step.selector
-    assert "#J_goodsList" in wait_step.selector
-    assert ".c-goods-item" in wait_step.selector
+    assert wait_step.wait_mode == "stable"
+    assert wait_step.selector is None
     cdp_endpoint = next(param for param in manifest.param_schema if param.name == "cdp_endpoint")
     assert cdp_endpoint.default == ""
     max_pages = next(param for param in manifest.param_schema if param.name == "max_pages")
@@ -104,8 +101,7 @@ def test_taobao_and_goofish_listing_wait_and_pagination_contracts():
 
     assert taobao.pagination.page_param == "pageNo"
     assert taobao.steps[1].selector == '[id^="item_id_"]'
-    assert goofish.steps[1].selector == 'a[class*="feeds-item-wrap"]'
-
+    assert goofish.steps[1].selector is None
 def test_platform_listing_script_emits_normalized_product_schema():
     node = shutil.which("node")
     if node is None:
@@ -274,7 +270,7 @@ async def test_platform_adapter_can_reuse_persistent_cdp_endpoint():
     assert result.items == [
         {"id": "one", "title": "授权商品", "url": "https://example.com/one"}
     ]
-    assert "offerCard" in FakeCdpSession.selector
+    assert FakeCdpSession.selector is None
     assert result.metadata["pages_fetched"] == 1
     assert FakeCdpSession.endpoint == "http://127.0.0.1:9224"
     assert FakeCdpSession.target_url == "https://example.com/listing"
