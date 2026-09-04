@@ -318,6 +318,7 @@ async def test_workflow_capabilities_project_real_backend_surfaces(client, monke
         "intelligence.source.rss-bridge",
         "intelligence.source.http",
         "intelligence.source.doubao-research",
+        "intelligence.source.kuaishou-search",
     ):
         assert catalog[source_id]["status"] == "runnable"
         assert catalog[source_id]["backendAvailable"] is True
@@ -463,12 +464,16 @@ async def test_workflow_capabilities_project_real_backend_surfaces(client, monke
         "doubao_research",
         "douyin_detail",
         "feishu_table",
+        "kuaishou_search",
         "opencli",
         "rss",
         "skill",
         "web_scraper",
     }
     assert channels["opencli"]["status"] == "runnable"
+    assert channels["kuaishou_search"]["status"] == "runnable"
+    assert channels["kuaishou_search"]["backendAvailable"] is True
+    assert channels["kuaishou_search"]["runtimeBinding"] == "workflow.source.fetch"
     assert channels["opencli"]["backendAvailable"] is True
     assert channels["rss"]["status"] == "blocked"
     assert channels["rss"]["backendAvailable"] is True

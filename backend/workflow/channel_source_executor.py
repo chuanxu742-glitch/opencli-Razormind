@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.pipeline.collector import collect
 from backend.services import source_service
 
-_SUPPORTED = {"feishu_table", "opencli", "doubao_research"}
+_SUPPORTED = {"browser_act", "feishu_table", "opencli", "doubao_research", "kuaishou_search"}
 
 
 @dataclass(frozen=True)
@@ -115,6 +115,26 @@ def _channel_config(channel_type: str, values: dict[str, Any]) -> dict[str, Any]
         return {
             key: values[key]
             for key in ("site", "command", "args", "positionalArgs", "format", "sourceGroup")
+            if key in values
+        }
+    if channel_type == "browser_act":
+        return {
+            key: values[key]
+            for key in ("pack", "domain", "capability", "mode", "cdp_endpoint", "max_pages")
+            if key in values
+        }
+    if channel_type == "kuaishou_search":
+        return {
+            key: values[key]
+            for key in (
+                "query",
+                "limit",
+                "with_comments",
+                "comment_limit",
+                "max_comment_videos",
+                "chrome_endpoint",
+                "cdp_endpoint",
+            )
             if key in values
         }
     return {

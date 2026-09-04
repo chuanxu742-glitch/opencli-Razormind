@@ -12,6 +12,7 @@ def test_all_channels_registered():
     assert "api" in types
     assert "rss" in types
     assert "cli" in types
+    assert "kuaishou_search" in types
 
 
 def test_get_channel_valid():

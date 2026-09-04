@@ -27,12 +27,17 @@ from backend.browser_act import cli as browser_act_cli
 from backend.browser_act.cli import BrowserActResult
 from backend.browser_act.scripts import run_pack_script
 from backend.browser_act_packs.catalog import PackCatalog
-from backend.channels.browser_act_channel import BrowserActChannel
+from backend.channels.browser_act_channel import BrowserActChannel, _page_url
 
 PACK_SELECTOR = "search-research/demo-search"
 
 
-def _write_synthetic_pack(root: Path, *, pagination: dict | None = None) -> Path:
+def _write_synthetic_pack(
+    root: Path,
+    *,
+    pagination: dict | None = None,
+    include_page_in_url: bool = True,
+) -> Path:
     """Build <root>/search-research/demo-search/{SKILL.md, scripts/emit.py,
     channel.manifest.json}. Returns the pack directory."""
     pack_dir = root / "search-research" / "demo-search"
@@ -72,7 +77,11 @@ def _write_synthetic_pack(root: Path, *, pagination: dict | None = None) -> Path
         "steps": [
             {
                 "op": "navigate",
-                "url_template": "https://example.com/search?q={keyword}&page={page}",
+                "url_template": (
+                    "https://example.com/search?q={keyword}&page={page}"
+                    if include_page_in_url
+                    else "https://example.com/search?q={keyword}"
+                ),
             },
             {"op": "wait", "wait_mode": "stable"},
             {"op": "eval_script", "script": "scripts/emit.py", "args": ["{keyword}"]},
@@ -184,6 +193,61 @@ async def test_collect_paginates_and_stops_on_stop_when(tmp_path):
     assert len(result.items) == 3
     assert result.metadata["pages_fetched"] == 2
 
+
+@pytest.mark.asyncio
+async def test_collect_uses_page_param_and_deduplicates_items(tmp_path):
+    _write_synthetic_pack(
+        tmp_path,
+        pagination={
+            "mode": "url_page",
+            "page_param": "page",
+            "stop_when": "result_count < 2",
+        },
+        include_page_in_url=False,
+    )
+    channel = BrowserActChannel(catalog=PackCatalog(root=tmp_path))
+    page_payloads = [
+        json.dumps([{"id": 1}, {"id": 2}]),
+        json.dumps([{"id": 2}, {"id": 3}]),
+        json.dumps([{"id": 4}]),
+    ]
+    navigated_urls: list[str] = []
+    state = {"eval": 0}
+
+    async def run(args, *, timeout=None, env=None):
+        subcommand = args[2] if len(args) > 2 else None
+        if subcommand == "navigate":
+            navigated_urls.append(args[-1])
+        if subcommand == "eval":
+            payload = page_payloads[min(state["eval"], len(page_payloads) - 1)]
+            state["eval"] += 1
+            return BrowserActResult(returncode=0, stdout=payload, stderr="")
+        return BrowserActResult(returncode=0, stdout="", stderr="")
+
+    with patch("backend.browser_act.cli._run", side_effect=run):
+        result = await channel.collect(
+            {
+                "pack": PACK_SELECTOR,
+                "params": {"keyword": "shoes"},
+                "max_pages": 4,
+            },
+            {},
+        )
+
+    assert result.success is True
+    assert [item["id"] for item in result.items] == [1, 2, 3, 4]
+    assert result.metadata["pages_fetched"] == 3
+    assert navigated_urls[0].endswith("q=shoes")
+    assert navigated_urls[1].endswith("q=shoes&page=2")
+    assert navigated_urls[2].endswith("q=shoes&page=3")
+
+
+def test_page_url_preserves_non_utf8_query_bytes():
+    url = "https://example.com/search?keywords=%B6%FA%BB%FA&beginPage=1"
+
+    assert _page_url(url, "beginPage", 2) == (
+        "https://example.com/search?keywords=%B6%FA%BB%FA&beginPage=2"
+    )
 
 # ── collect(): below min_count ────────────────────────────────────────────
 

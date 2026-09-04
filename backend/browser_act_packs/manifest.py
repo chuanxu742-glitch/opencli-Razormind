@@ -8,9 +8,10 @@ pages, and ``success`` describes when a result is trustworthy enough to
 return. The channel is a generic interpreter of this manifest — it never has
 per-pack code.
 
-PR-A (this module) defines only the schema + a loader. No pack ships a
-``channel.manifest.json`` yet; seeding 2-3 packs with real manifests is
-PR-D. Field sets are deliberately permissive/optional per-op (see ``Step``)
+This module defines the schema + loader. Browser-driven packs can ship a
+``channel.manifest.json`` beside their ``SKILL.md``; API-backed packs remain
+outside this interpreter because they need a distinct HTTP execution shape.
+Field sets are deliberately permissive/optional per-op (see ``Step``)
 since a single step in the sequence only uses a subset of fields.
 """
 
@@ -35,17 +36,17 @@ class ParamSpec(BaseModel):
 
 #: The browser-act operations a manifest step can drive. See Browser Act integration decision
 #: #1/#6: the channel drives these deterministically, argv-only, no shell.
-StepOp = Literal["navigate", "wait", "eval_script", "click", "input"]
+StepOp = Literal["navigate", "wait", "eval_script", "click", "input", "scroll"]
 
 
 class Step(BaseModel):
     """One step in a manifest's ``steps`` sequence. Fields are optional and
     only the ones relevant to ``op`` are expected to be set by an author:
 
-    - ``navigate``: ``url_template`` (e.g. "https://s.taobao.com/search?q={keyword}")
-    - ``wait``: ``wait_mode`` (e.g. "stable")
+    - ``wait``: ``wait_mode`` (e.g. "stable"), optional ``selector`` for a
+      session-backed conditional wait
     - ``eval_script``: ``script`` (path to a scripts/*.py in the pack dir,
-      relative to the pack), ``args`` (argv template, e.g. ["{keyword}", "--page", "{page}"])
+      relative to the pack), ``args`` (argv template)
     - ``click`` / ``input``: ``selector`` or ``index`` to target an element;
       ``input`` additionally uses ``value``
 
@@ -62,20 +63,25 @@ class Step(BaseModel):
     selector: Optional[str] = None
     index: Optional[int] = None
     value: Optional[str] = None
+    amount: Optional[int] = None
 
 
 class Pagination(BaseModel):
-    """How to fetch subsequent pages. ``mode`` is free-form (e.g. "url_page",
-    "none") — the PR-C interpreter switches on it; this schema doesn't
-    enumerate every mode so new pagination styles don't require a schema
-    change."""
+    """How to fetch subsequent pages.
+
+    ``operations`` optionally limits pagination to operations such as
+    ``["listing"]``. This keeps one manifest usable for listing/detail/review
+    operations when only listings are pageable.
+    """
 
     mode: str
     url_template: Optional[str] = None
     page_param: Optional[str] = None
+    page_param_map: Optional[dict[str, str]] = None
+    page_index_offset: Optional[dict[str, int]] = None
+    platforms: Optional[list[str]] = None
     stop_when: Optional[str] = None
-
-
+    operations: Optional[list[str]] = None
 class SuccessCriteria(BaseModel):
     """When a collected batch counts as a successful result."""
 

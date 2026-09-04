@@ -153,18 +153,12 @@ SKILL.md prose → manifest:
    schema doesn't currently express. Multi-page google is a future
    enhancement (e.g. a `pagination.mode` that lets a manifest declare an
    offset formula), not something this seed pretends to support.
-3. **The other ~76 vendored packs have no `channel.manifest.json` yet.**
-   Seeding is intentionally incremental (Browser Act integration PR-D scope: 2 packs to prove
-   the pipeline, not full coverage) — `backend/browser_act_packs/manifest.py`
-   (`PackManifest`) is the extension point; add a `channel.manifest.json`
-   next to a pack's `SKILL.md` as each one is needed, translating its prose
-   the same way as above. In particular, the `*-api-skill` packs (e.g.
-   `search-research/web-search-scraper-api-skill`, confirmed by reading its
-   script: it `requests.post`s straight to `https://api.browseract.com/v2/
-   workflow` with a Bearer API key) use a **different** execution shape
-   entirely — their scripts call the BrowserAct **API** directly (HTTP, no
-   browser session at all) instead of navigate→wait→eval against a live
-   browser-act session, so this channel's navigate/wait/eval_script
-   interpreter does not — and structurally cannot — model them; they would
-   need either a distinct `step.op` (e.g. `"api_call"`) or a separate
-   channel entirely, a decision deferred rather than made silently here.
+3. **The other 67 vendored packs have no `channel.manifest.json` yet.**
+   The manifest interpreter now covers the browser-driven e-commerce packs
+   (Taobao/Tmall, Goofish, generic e-commerce, and the JD/Pinduoduo/Douyin
+   platform adapter) plus the original search seed. Add a
+   `channel.manifest.json` next to a pack's `SKILL.md` as each compatible
+   browser-driven pack is needed. The `*-api-skill` packs still use a
+   different execution shape: their scripts call the BrowserAct API directly
+   over HTTP, without a browser session, so they require a separate API
+   channel rather than being silently represented as navigate/wait/eval steps.

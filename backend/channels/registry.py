@@ -35,6 +35,7 @@ def _load_all_channels() -> None:
         crawl4ai_channel,
         doubao_research_channel,
         douyin_detail_channel,
+        kuaishou_search_channel,
         feishu_table_channel,
         opencli_channel,
         rss_channel,

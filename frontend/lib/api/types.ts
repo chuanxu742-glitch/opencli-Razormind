@@ -253,6 +253,7 @@ export interface DataSource {
     | 'browser_act'
     | 'doubao_research'
     | 'douyin_detail'
+    | 'kuaishou_search'
   channel_config: Record<string, unknown>
   ai_config?: Record<string, unknown>
   enabled: boolean

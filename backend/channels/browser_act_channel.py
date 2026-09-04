@@ -24,10 +24,11 @@ attempts a bypass. Any other reported error is a generic ``"error"``.
 
 Pagination (decision #5) is only partially interpretable in general: this
 channel understands ``pagination.mode == "url_page"`` (navigate to
-``pagination.url_template`` for page 2+) and a narrow ``stop_when`` shape
-(``"result_count < N"`` / ``"<="``). Anything else falls back to a fixed
-``max_pages`` cap and an "a page returned 0 items" stop signal -- documented
-limitation, not silently pretended to be complete (see ``_stop_when_triggered``).
+``pagination.url_template`` for page 2+, or replace/append
+``pagination.page_param``) and a narrow ``stop_when`` shape (``"result_count <
+N"`` / ``"<="``). Anything else falls back to a fixed ``max_pages`` cap and
+an "a page returned 0 items" stop signal -- documented limitation, not
+silently pretended to be complete (see ``_stop_when_triggered``).
 
 Credentials (PR-E, decision #7): ``mode == "stealth"`` requires a BrowserAct
 API key, stored encrypted as a ``SourceCredential`` (key_name
@@ -38,6 +39,13 @@ subprocess env (never argv, never logged) under ``BROWSER_ACT_API_KEY_ENV``.
 ``collect()`` takes an additive optional ``source_id`` param for this; only
 ``fetch()`` (the thick-contract entry point ``run_channel`` calls) ever
 passes a real one in production -- see both methods' docstrings.
+
+If a pack config supplies ``cdp_endpoint``, the channel instead attaches to
+that already-running Chrome profile through Playwright/CDP. This path reuses
+the profile's cookies and local storage, skips BrowserAct API-key resolution,
+and detaches without closing Chrome. It is intended for manual login and
+persistent authenticated sessions; the endpoint must be an explicit HTTP(S)
+URL. Click/input manifest steps remain unsupported on this narrow path.
 """
 
 import json
@@ -45,10 +53,12 @@ import logging
 import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, unquote_plus, urlsplit, urlunsplit
 
 from pydantic import ValidationError
 
 from backend.browser_act import cli as browser_act_cli
+from backend.browser_act.cdp_session import CdpBrowserActSession, CdpSessionError
 from backend.browser_act.scripts import ScriptError, run_pack_script
 from backend.browser_act_packs.catalog import PackCatalog, PackInfo
 from backend.browser_act_packs.manifest import PackManifest, load_manifest
@@ -66,10 +76,8 @@ logger = logging.getLogger(__name__)
 
 _VALID_MODES = {"chrome-direct", "stealth"}
 
-#: Hard cap on pages fetched when channel_config doesn't override it via
-#: "max_pages". PackManifest's Pagination model (PR-A) has no max_pages
-#: field of its own (mode/url_template/page_param/stop_when only) -- this is
-#: a channel-level safety net, not something a pack manifest declares.
+#: Hard cap on pages fetched. ``max_pages`` may be set at channel level or
+#: declared in a pack's params; the hard cap prevents unbounded collection.
 _DEFAULT_MAX_PAGES = 5
 
 #: Login-wall / anti-bot keywords (decision #4). A script's reported error
@@ -145,6 +153,39 @@ def _stop_when_triggered(stop_when: str | None, page_item_count: int) -> bool:
         return False
     op, threshold = match.group(1), int(match.group(2))
     return page_item_count <= threshold if op == "<=" else page_item_count < threshold
+
+
+def _page_url(url: str, page_param: str, page: int) -> str:
+    """Return ``url`` with one page query parameter replaced or appended.
+
+    Keep existing query pairs byte-for-byte. Some Chinese commerce sites use
+    GBK-encoded keyword values; decoding those as UTF-8 before rebuilding the
+    query silently changes the search term on page 2+.
+    """
+    parts = urlsplit(url)
+    page_pair = f"{quote(page_param)}={page}"
+    kept: list[str] = []
+    replaced = False
+    for pair in parts.query.split("&") if parts.query else []:
+        raw_key, separator, _raw_value = pair.partition("=")
+        if unquote_plus(raw_key) == page_param:
+            if not replaced:
+                kept.append(page_pair)
+                replaced = True
+            continue
+        kept.append(pair if separator else raw_key)
+    if not replaced:
+        kept.append(page_pair)
+    return urlunsplit(parts._replace(query="&".join(kept)))
+
+def _item_identity(item: Any) -> str | None:
+    if not isinstance(item, dict):
+        return None
+    for field in ("url", "id", "item_id", "product_id", "sku"):
+        value = item.get(field)
+        if value:
+            return f"{field}:{value}"
+    return None
 
 
 class _CollectAbort(Exception):
@@ -353,36 +394,75 @@ class BrowserActChannel(AbstractChannel):
                 error=f"missing required param(s): {', '.join(missing)}",
             )
 
-        max_pages = config.get("max_pages") or _DEFAULT_MAX_PAGES
+        raw_max_pages = config.get(
+            "max_pages", caller_params.get("max_pages", _DEFAULT_MAX_PAGES)
+        )
+        try:
+            max_pages = max(1, min(int(raw_max_pages), 100))
+        except (TypeError, ValueError):
+            return ChannelResult(
+                success=False,
+                error_type="error",
+                error=f"invalid max_pages {raw_max_pages!r}: must be an integer",
+            )
 
-        # Credential injection (decision #7): resolve the stored BrowserAct
-        # API key via the existing AuthManager.resolve(source_id) pattern and
-        # inject it into the browser-act subprocess env. stealth mode without
-        # a resolvable key is a hard, loud error here -- it never silently
-        # falls back to chrome-direct and never runs keyless.
-        session_env, cred_error = await self._resolve_session_env(source_id, mode)
-        if cred_error:
-            return ChannelResult(success=False, error_type="error", error=cred_error)
+        cdp_endpoint = str(
+            config.get("cdp_endpoint")
+            or caller_params.get("cdp_endpoint")
+            or merged_params.get("cdp_endpoint")
+            or ""
+        ).strip()
+        session_env: dict[str, str] | None = None
+        if not cdp_endpoint:
+            # Credential injection (decision #7): resolve the stored BrowserAct
+            # API key only for the BrowserAct subprocess path. A persistent
+            # CDP profile already carries its website session in Chrome.
+            session_env, cred_error = await self._resolve_session_env(source_id, mode)
+            if cred_error:
+                return ChannelResult(success=False, error_type="error", error=cred_error)
         session_name = f"browser-act-{pack_info.domain}-{pack_info.capability}"
+        session_context = (
+            CdpBrowserActSession(
+                cdp_endpoint,
+                target_url=str(merged_params.get("url") or config.get("url") or ""),
+            )
+            if cdp_endpoint
+            else browser_act_cli.session(session_name, env=session_env)
+        )
 
         items: list[dict[str, Any]] = []
+        seen_items: set[str] = set()
         pages_fetched = 0
+        pagination_operations = manifest.pagination.operations
+        pagination_platforms = manifest.pagination.platforms
+        paginate = (
+            (not pagination_operations or merged_params.get("operation") in pagination_operations)
+            and (not pagination_platforms or merged_params.get("platform") in pagination_platforms)
+        )
 
         try:
-            async with browser_act_cli.session(session_name, env=session_env) as sess:
+            async with session_context as sess:
                 for page_num in range(1, max_pages + 1):
                     ctx = {**caller_params, **merged_params, "page": page_num}
                     page_items = await self._run_page(sess, pack_dir, manifest, ctx, page_num)
                     pages_fetched += 1
-                    items.extend(page_items)
+                    for item in page_items:
+                        identity = _item_identity(item)
+                        if identity and identity in seen_items:
+                            continue
+                        if identity:
+                            seen_items.add(identity)
+                        items.append(item)
 
                     if not page_items:
                         # Documented pagination-stop fallback: an empty page
                         # always ends collection, regardless of stop_when.
                         break
-                    if _stop_when_triggered(manifest.pagination.stop_when, len(page_items)):
+                    if paginate and _stop_when_triggered(
+                        manifest.pagination.stop_when, len(page_items)
+                    ):
                         break
-                    if manifest.pagination.mode != "url_page":
+                    if not paginate or manifest.pagination.mode != "url_page":
                         # Only "url_page" pagination is interpreted here; any
                         # other/absent mode is single-page (documented
                         # limitation -- see module docstring).
@@ -392,6 +472,13 @@ class BrowserActChannel(AbstractChannel):
                 success=False,
                 error_type=exc.error_type,
                 error=exc.message,
+                metadata={"pack": pack_info.path, "pages_fetched": pages_fetched},
+            )
+        except CdpSessionError as exc:
+            return ChannelResult(
+                success=False,
+                error_type="error",
+                error=f"persistent CDP collection failed: {exc}",
                 metadata={"pack": pack_info.path, "pages_fetched": pages_fetched},
             )
         except (
@@ -488,12 +575,22 @@ class BrowserActChannel(AbstractChannel):
         ctx: dict[str, Any],
         page_num: int,
     ) -> list[dict[str, Any]]:
-        """Run manifest.steps once (one page). ``page_num > 1`` with
-        ``pagination.mode == "url_page"`` replaces the first navigate step's
-        URL with ``pagination.url_template`` (which carries the page param)
-        -- a step's own ``url_template`` is only used for the initial
-        navigation (page 1)."""
+        """Run manifest.steps once (one page).
+
+        For ``url_page`` pagination, a manifest may provide either an explicit
+        ``url_template`` or a ``page_param``. The latter replaces/appends the
+        query parameter on the caller's original URL. Platform-specific query
+        names and zero-based offsets may be supplied by the pagination map.
+        """
         items: list[dict[str, Any]] = []
+        platform = str(ctx.get("platform", ""))
+        page_param = (
+            (manifest.pagination.page_param_map or {}).get(
+                platform, manifest.pagination.page_param
+            )
+            or manifest.pagination.page_param
+        )
+        page_offset = (manifest.pagination.page_index_offset or {}).get(platform, 0)
         for step in manifest.steps:
             if step.op == "navigate":
                 if (
@@ -502,11 +599,29 @@ class BrowserActChannel(AbstractChannel):
                     and manifest.pagination.url_template
                 ):
                     url = manifest.pagination.url_template.format(**ctx)
+                elif (
+                    page_num > 1
+                    and manifest.pagination.mode == "url_page"
+                    and page_param
+                ):
+                    base_url = (step.url_template or "").format(**ctx)
+                    url = _page_url(
+                        base_url,
+                        page_param,
+                        page_num + page_offset,
+                    )
                 else:
                     url = (step.url_template or "").format(**ctx)
                 await sess.navigate(url)
             elif step.op == "wait":
-                await sess.wait(step.wait_mode or "stable")
+                if (
+                    step.selector
+                    and ctx.get("operation", "listing") == "listing"
+                    and hasattr(sess, "wait_for_selector")
+                ):
+                    await sess.wait_for_selector(step.selector)
+                else:
+                    await sess.wait(step.wait_mode or "stable")
             elif step.op == "eval_script":
                 script_path = pack_dir / (step.script or "")
                 templated_args = [str(a).format(**ctx) for a in (step.args or [])]
@@ -516,7 +631,15 @@ class BrowserActChannel(AbstractChannel):
                 if isinstance(parsed, dict) and parsed.get("error"):
                     message = str(parsed.get("message", "unknown pack script error"))
                     raise _CollectAbort(_classify_error(message), message)
-                items = parsed if isinstance(parsed, list) else [parsed]
+                if isinstance(parsed, list):
+                    items = parsed
+                elif isinstance(parsed, dict) and isinstance(parsed.get("items"), list):
+                    items = parsed["items"]
+                else:
+                    items = [parsed]
+            elif step.op == "scroll":
+                amount = step.amount or 1000
+                await sess.run(["scroll", "down", "--amount", str(amount)])
             elif step.op == "click" and step.index is not None:
                 await sess.click(step.index)
             elif step.op == "input" and step.index is not None:

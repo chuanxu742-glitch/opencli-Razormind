@@ -721,6 +721,198 @@ def _catalog_capabilities(*, dify_runtime_ready: bool = False) -> list[WorkflowR
             },
         ),
         _capability(
+            id="intelligence.source.ecommerce-platform",
+            label="E-commerce Platform",
+            surface="catalog",
+            status="runnable",
+            backend_available=True,
+            kind="source",
+            capability="fetch",
+            provider="browser_act",
+            channel_type="browser_act",
+            runtime_binding=SOURCE_FETCH_BINDING_ID,
+            reason=(
+                "Runs the vendored ecommerce-platform BrowserAct pack for "
+                "listing, product detail, or review extraction from a rendered "
+                "e-commerce page."
+            ),
+            tags=["source", "ecommerce", "browser-act", "products", "reviews", "live"],
+            source="backend.browser_act_packs.ecommerce.ecommerce-platform",
+            manifest={
+                **_manifest(
+                    schema="capability.source.ecommerce-platform.v1",
+                    input_ports=[_port("in", "trigger")],
+                    output_ports=[_port("out", "items[]")],
+                    resources=["browser_act_channel", "ecommerce-platform_pack", "cdp_browser_session"],
+                    permissions=["network.fetch", "canFetchNetwork"],
+                    runtime_binding=SOURCE_FETCH_BINDING_ID,
+                ),
+                "canvas": {"node": True},
+                "nodeCatalog": {
+                    "authority": "backend",
+                    "origin": "source-preset",
+                    "category": "source",
+                    "kind": "source",
+                    "capability": "fetch",
+                    "adapter": {
+                        "id": "ecommerce-platform-source",
+                        "type": "source",
+                        "provider": "browser_act",
+                        "mode": "live",
+                        "config": {
+                            "channel": "browser_act",
+                            "channelType": "browser_act",
+                            "pack": "ecommerce/ecommerce-platform",
+                        },
+                    },
+                },
+                "presentation": {
+                    "icon": "ShoppingBag",
+                    "description": "读取电商平台商品列表、商品详情或评论；支持已登录 Chrome 会话。",
+                    "parameters": [
+                        {
+                            "name": "url",
+                            "label": "商品或列表页 URL",
+                            "type": "string",
+                            "required": True,
+                            "default": "",
+                        },
+                        {
+                            "name": "platform",
+                            "label": "平台",
+                            "type": "string",
+                            "required": False,
+                            "default": "auto",
+                        },
+                        {
+                            "name": "operation",
+                            "label": "操作",
+                            "type": "string",
+                            "required": False,
+                            "default": "detail",
+                        },
+                        {
+                            "name": "max_results",
+                            "label": "最多结果数",
+                            "type": "number",
+                            "required": False,
+                            "default": 20,
+                        },
+                        {
+                            "name": "max_pages",
+                            "label": "最多页数",
+                            "type": "number",
+                            "required": False,
+                            "default": 5,
+                        },
+                        {
+                            "name": "cdp_endpoint",
+                            "label": "Chrome CDP 地址",
+                            "type": "string",
+                            "required": False,
+                            "default": "",
+                        },
+                    ],
+                },
+            },
+        ),
+        _capability(
+            id="intelligence.source.kuaishou-search",
+            label="Kuaishou Video Search",
+            surface="catalog",
+            status="runnable",
+            backend_available=True,
+            kind="source",
+            capability="fetch",
+            provider="kuaishou",
+            channel_type="kuaishou_search",
+            runtime_binding=SOURCE_FETCH_BINDING_ID,
+            reason=(
+                "Runs keyword video search through the logged-in Kuaishou "
+                "browser session, with optional detail-page comments."
+            ),
+            tags=["source", "video", "kuaishou", "search", "live"],
+            source="backend.channels.kuaishou_search_channel",
+            manifest={
+                **_manifest(
+                    schema="capability.source.kuaishou-search.v1",
+                    input_ports=[_port("in", "trigger")],
+                    output_ports=[_port("out", "items[]")],
+                    resources=["kuaishou_search_channel", "cdp_browser_session"],
+                    permissions=["network.fetch", "canFetchNetwork"],
+                    runtime_binding=SOURCE_FETCH_BINDING_ID,
+                ),
+                "canvas": {"node": True},
+                "nodeCatalog": {
+                    "authority": "backend",
+                    "origin": "source-preset",
+                    "category": "source",
+                    "kind": "source",
+                    "capability": "fetch",
+                    "adapter": {
+                        "id": "kuaishou-search-source",
+                        "type": "source",
+                        "provider": "kuaishou",
+                        "mode": "live",
+                        "config": {
+                            "channel": "kuaishou_search",
+                            "channelType": "kuaishou_search",
+                        },
+                    },
+                },
+                "presentation": {
+                    "icon": "Video",
+                    "description": (
+                        "通过已登录浏览器按关键词搜索快手视频；可选采集详情页评论。"
+                    ),
+                    "parameters": [
+                        {
+                            "name": "query",
+                            "label": "搜索关键词",
+                            "type": "string",
+                            "required": True,
+                            "default": "ai",
+                        },
+                        {
+                            "name": "limit",
+                            "label": "最多结果数",
+                            "type": "number",
+                            "required": False,
+                            "default": 10,
+                        },
+                        {
+                            "name": "with_comments",
+                            "label": "采集评论",
+                            "type": "boolean",
+                            "required": False,
+                            "default": False,
+                        },
+                        {
+                            "name": "comment_limit",
+                            "label": "每条视频评论数",
+                            "type": "number",
+                            "required": False,
+                            "default": 20,
+                        },
+                        {
+                            "name": "max_comment_videos",
+                            "label": "采集评论的视频数",
+                            "type": "number",
+                            "required": False,
+                            "default": 5,
+                        },
+                        {
+                            "name": "cdp_endpoint",
+                            "label": "Chrome CDP 地址",
+                            "type": "string",
+                            "required": False,
+                            "default": "",
+                        },
+                    ],
+                },
+            },
+        ),
+        _capability(
             id="intelligence.source.pool",
             label="Source Pool",
             surface="catalog",
@@ -1629,6 +1821,28 @@ def _channel_capabilities() -> list[WorkflowRuntimeCapability]:
                     missing=["canvas_resource_resolution"],
                     tags=["channel", "source", "opencli"],
                     source="backend.channels.opencli_channel",
+                )
+            )
+            continue
+        if channel_type == "kuaishou_search":
+            rows.append(
+                _capability(
+                    id=f"channel.{channel_type}",
+                    label="Kuaishou search channel",
+                    surface="channel",
+                    status="runnable",
+                    backend_available=True,
+                    kind="source",
+                    capability="fetch",
+                    provider="kuaishou",
+                    channel_type=channel_type,
+                    runtime_binding=SOURCE_FETCH_BINDING_ID,
+                    reason=(
+                        "The workflow runtime dispatches Kuaishou keyword search "
+                        "through the logged-in browser-bound channel."
+                    ),
+                    tags=["channel", "source", "kuaishou", "video"],
+                    source="backend.channels.kuaishou_search_channel",
                 )
             )
             continue

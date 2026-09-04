@@ -5,7 +5,7 @@ description: "Scrapes second-hand item search results from Goofish (闲鱼/xiany
 
 # Goofish (闲鱼) — Search Results List
 
-> keyword + optional filters → list of 30 second-hand item cards per page (id, title, price, image, location, want-count)
+> keyword + optional filters → currently rendered second-hand item cards (the site commonly shows up to 30 per page; `count` is authoritative)
 
 ## Language
 
@@ -13,7 +13,7 @@ All process output to user (progress updates, process notifications) follows the
 
 ## Objective
 
-Extract second-hand item listing cards from Goofish keyword search results, supporting sort options, price range filters, and publish-date filters, with page-by-page pagination.
+Extract second-hand item listing cards from the currently rendered Goofish keyword-search page. The manifest deliberately runs one page: Goofish pagination is a DOM click flow, not the generic BrowserAct `url_page` contract. Manual page-by-page collection is available through `goto-page.py` with an explicit caller cap.
 
 ## Prerequisites
 
@@ -52,7 +52,7 @@ Error handling: If the page shows a CAPTCHA slider ("Please slide to verify") in
 
 ### DOM: search result item cards (data extraction)
 
-After navigating and waiting stable, extract all 30 item cards on the current page:
+After navigating and waiting stable, extract the item cards currently rendered on the page:
 
 `eval "$(python scripts/extract-search-items.py)"`
 

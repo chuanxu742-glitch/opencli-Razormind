@@ -49,8 +49,8 @@ class BrowserActPackRead(BaseModel):
 async def list_packs() -> ApiResponse:
     """List every vendored browser-act pack the catalog can see, each
     annotated with whether it has a machine-readable ``channel.manifest.json``
-    yet (PR-D seeded 2 of the ~78 vendored packs; the rest are catalog-only
-    until a future manifest is authored for them)."""
+    yet. Browser-driven e-commerce packs are executable; API-backed packs
+    remain catalog-only until a dedicated API execution channel exists."""
     catalog = PackCatalog()
     packs: list[BrowserActPackRead] = []
     for info in catalog.list_packs():

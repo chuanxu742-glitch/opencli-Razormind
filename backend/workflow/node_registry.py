@@ -31,6 +31,8 @@ WORKFLOW_CATALOG_IDS = {
     "intelligence.source.opencli-slot",
     "intelligence.source.feishu-table",
     "intelligence.source.doubao-research",
+    "intelligence.source.ecommerce-platform",
+    "intelligence.source.kuaishou-search",
     "intelligence.processing.normalize",
     "intelligence.processing.dedupe",
     "intelligence.data.generate",
