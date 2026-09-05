@@ -5,10 +5,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class BrowserBindingCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     browser_endpoint: str
     site: str
     notes: str | None = None
-
 
 class BrowserBindingRead(BaseModel):
     id: str
@@ -68,6 +69,7 @@ class RuntimeBundleManifest(BaseModel):
 
 
 class BrowserRuntimeBundleCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     manifest: RuntimeBundleManifest
     trust_level: Literal["trusted", "reviewed"] = "trusted"
     source: str = Field(default="local", min_length=1, max_length=255)
@@ -90,7 +92,9 @@ class BrowserRuntimeBundleRead(BaseModel):
     model_config = {"from_attributes": True}
 
 
+
 class BrowserInstanceCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     endpoint: str = Field(min_length=1, max_length=255)
     mode: Literal["bridge", "cdp"] = "bridge"
     label: str = Field(default="", max_length=100)
@@ -120,6 +124,7 @@ class BrowserInstanceCreate(BaseModel):
 
 
 class BrowserInstanceConfigUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     mode: Literal["bridge", "cdp"] | None = None
     agent_url: str | None = Field(default=None, max_length=255)
     agent_protocol: Literal["http", "ws"] | None = None
@@ -201,10 +206,25 @@ class BrowserRuntimeDeploymentRead(BaseModel):
 
     model_config = {"from_attributes": True}
 
-
 class CapabilityInvokeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     args: dict = Field(default_factory=dict)
     gate: str | None = Field(default=None, max_length=100)
+
+
+from backend.schemas.browser_account import (
+    AccountRef,
+    LoginObservationV1,
+    LoginRuleV1,
+    NodeCapacityFactV1,
+    NodeClaimV1,
+    NodeResultV1,
+    PortalControlMessageV1,
+    PortalPixelFrameV1,
+    PortalTransientV1,
+    ProfileManifestV1,
+    SessionEnvelopeV1,
+)
 
 
 class BrowserCapabilityInvocationRead(BaseModel):

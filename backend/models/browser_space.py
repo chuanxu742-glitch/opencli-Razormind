@@ -9,6 +9,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     String,
@@ -55,8 +56,8 @@ _ACTIVE_TASK_STATUSES = ("queued", "running")
 
 class BrowserSpace(TimestampMixin):
     """Workspace-scoped reservation for one existing BrowserInstance."""
-
     __tablename__ = "browser_spaces"
+
     __table_args__ = (
         CheckConstraint(
             "owner_type IN ('operator', 'runtime_agent')",
@@ -65,6 +66,16 @@ class BrowserSpace(TimestampMixin):
         CheckConstraint(
             "status IN ('idle', 'running', 'closed', 'error')",
             name="ck_browser_spaces_status",
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "account_id"],
+            ["browser_accounts.workspace_id", "browser_accounts.id"],
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "session_id"],
+            ["browser_login_sessions.workspace_id", "browser_login_sessions.id"],
+            ondelete="SET NULL",
         ),
     )
 
@@ -77,6 +88,10 @@ class BrowserSpace(TimestampMixin):
     binding_id: Mapped[str | None] = mapped_column(
         ForeignKey("browser_bindings.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    account_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    session_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    lease_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     owner_type: Mapped[str] = mapped_column(String(20), nullable=False)
     owner_id: Mapped[str] = mapped_column(String(255), nullable=False)
     status: Mapped[str] = mapped_column(

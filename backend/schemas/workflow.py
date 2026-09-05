@@ -199,6 +199,8 @@ class CollectorSourceBase(BaseModel):
         pattern=r"^credential://[A-Za-z0-9][A-Za-z0-9_-]{0,35}$",
     )
     credentialScheme: Optional[Literal["bearer", "api_key", "basic"]] = None
+    accountId: Optional[str] = Field(None, min_length=1, max_length=36)
+    sourceBindingRevisionId: Optional[str] = Field(None, min_length=1, max_length=36)
 
     @model_validator(mode="after")
     def validate_credential_pair(self) -> CollectorSourceBase:
@@ -1091,6 +1093,8 @@ class WorkflowRuntimeResourceRequirement(BaseModel):
     mutationMode: Literal["read", "write"]
     requestedCapability: str = Field(..., min_length=1)
     adapterNodeId: Optional[str] = None
+    accountId: Optional[str] = Field(None, min_length=1, max_length=36)
+    sourceBindingRevisionId: Optional[str] = Field(None, min_length=1, max_length=36)
 
 
 class WorkflowRuntimeResourceResolution(BaseModel):

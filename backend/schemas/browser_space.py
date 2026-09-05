@@ -15,12 +15,16 @@ EventKind = Literal["queued", "started", "completed", "failed", "cancel_requeste
 
 
 class BrowserSpaceCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     browser_instance_id: str = Field(min_length=1, max_length=64)
     binding_id: str | None = Field(default=None, min_length=1, max_length=64)
+    account_id: str | None = Field(default=None, min_length=1, max_length=36)
+    session_id: str | None = Field(default=None, min_length=1, max_length=36)
+    lease_id: str | None = Field(default=None, min_length=1, max_length=36)
     owner_type: OwnerType
     owner_id: str = Field(min_length=1, max_length=255)
     granted_capabilities: list[str] = Field(default_factory=list, max_length=64)
-
     @field_validator("granted_capabilities")
     @classmethod
     def validate_capabilities(cls, values: list[str]) -> list[str]:
@@ -32,6 +36,7 @@ class BrowserSpaceCreate(BaseModel):
 
 
 class BrowserSpaceTaskCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     request_id: str = Field(min_length=1, max_length=64)
     capability: str = Field(min_length=1, max_length=255)
     args: dict[str, Any] = Field(default_factory=dict)
@@ -67,7 +72,6 @@ class BrowserSpaceTaskRead(BaseModel):
     result: Any | None = None
     error: str | None = None
 
-
 class BrowserSpaceRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -75,6 +79,10 @@ class BrowserSpaceRead(BaseModel):
     workspace_id: str
     browser_instance_id: str
     binding_id: str | None
+    account_id: str | None
+    session_id: str | None
+    lease_id: str | None
+    epoch: int
     owner_type: OwnerType
     owner_id: str
     status: SpaceStatus
