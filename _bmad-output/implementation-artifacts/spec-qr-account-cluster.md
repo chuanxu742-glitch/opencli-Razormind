@@ -79,7 +79,7 @@ approval:
 - [ ] **T2 账号服务与安全门户**：`backend/services/browser_account_service.py`、`backend/api/v1/browser_accounts.py`（均新）、`backend/main.py`、`backend/security/workspace_rbac.py`、`backend/services/browser_space_service.py`、`backend/schemas/browser_space.py`。`/workspaces/{wid}/browser-accounts`提供创建/游标列表/详情、`/{id}/login-sessions`及会话视图/接管/异常confirm/close、账号auth-required/suspend/resume/显式迁移。管理员/维护者管理，操作员登录使用，查看者仅元数据；每次按账号归属校验，不信任endpoint。幂等键+revision CAS；正常流程由验证成功触发202 saving，持久提交后才saved，confirm仅manual_fallback。状态机 `opening→presenting↔refreshing→verifying→saving→saved/dormant`；challenge/unknown进入同会话接管，可靠探测恢复可回verifying；到期/关闭进入expired/closed且不伪称成功；保存失败保留saving/error可幂等重试。状态迁移绑定epoch/rule/view generation，持久命令不含表单秘密。
   区域投影/输入与完整接管共用短期同源HTTP/WS认证代理：票据单次兑换、绑定用户/workspace/account/session，默认10分钟上限30分钟，HttpOnly/Secure cookie，Origin/CSRF校验，秘密不进URL/日志。上游仅服务端租约映射，封闭外部VNC/CDP；节点间鉴权，禁剪贴板/上传下载与录像。NAT反向隧道仅作传输，DB登记短期owner并跨副本代理；断线关闭视图、重连重新授权，不能把旧码或输入重放到新会话。
   路由实际注册点为 `backend/api/v1/__init__.py`；复用 `backend/security/identity.py` 的身份解析但为WS显式实现cookie/票据验证，不能假设HTTP Bearer依赖自动覆盖WS。
-  撤销/权限变更以权威DB提交时间起算：所有代理副本对活跃流每≤500ms批量检查session及成员revision，查询超时计入1秒授权新鲜度上限；超过上限或无法确认授权即停止HTTP/WS转发并断连。通知仅加速，不能作为唯一撤销机制；会话到期由本地保守deadline硬断。仅检查活跃会话，不扫描账号库存；不保证已发送到网络的帧可追回。
+  撤销/权限变更以权威DB提交时间起算：所有代理副本对活跃流每≤500ms批量读取当前成员存在/role、User.disabled、Workspace.active及会话撤销/到期/revision等权威权限事实；现有WorkspaceMembership没有revision字段，不依赖虚构版本。查询使用新鲜数据库快照，超时计入1秒授权新鲜度上限；超过上限或无法确认授权即停止HTTP/WS转发并断连。通知仅加速；到期由本地保守deadline硬断。只检查活跃门户会话，不做每帧/每账号N+1、全量库存扫描或复用长事务旧快照；不保证追回已发送帧。
 - [ ] **T2a 规则与安全投影**：`backend/schemas/browser.py`、`backend/services/browser_capability_service.py`、`backend/agent_runtime_dispatch.py`、`chrome/script-host/background.js`、`chrome/script-host/packs/index.json`，新增 `chrome/script-host/packs/account-login/content.js`、`chrome/script-host/packs/account-login/rules.json`，并复用T2/T3服务。Bundle内声明式规则固定id/version、精确允许origin/登录URL/跳转与frame范围、方式切换动作、QR/表单定位及敏感区域、刷新触发/最大次数/间隔、成功证据组合、身份提取及挑战条件；配置校验拒绝任意代码/任意URL，Script Host只执行打包动作。限定tab/frame/document，禁止active-tab默认及用户覆盖；每次观察/输入/刷新/跳转重新核验真实origin和目标代际。运营配置并真实验证一次后向用户开放“自动登录”；支持清单只含对应规则版本的实测能力，未配置/未验证保持unknown/非自动。
   投影真实页面的受控像素区域/原生输入，不复制DOM或加载第三方脚本到控制台。QR只截唯一且当前允许origin的二维码元素；表单仅显示规则允许区域并遮蔽敏感回显，布局/候选不确定立即隐藏，复杂挑战展开同会话原生窗口，不绕过CSP/验证码。凭据输入走短期TLS流直达原表单而非持久队列；只允许当前字段/焦点，禁原始input/result进入capability审计、trace、错误、代理请求日志与截图，事件仅状态/代际/错误码。自有输入控件若需要仅保存短时内存，投递后清空、不自动重试；不许获取密码值或借“脱敏”先落库。规则引擎交付受控测试站点完整规则及行为验证，不以空规则/模板冒充真实平台支持。
   非敏感开页/切换/刷新/探测可复用capability；密码/验证码输入与QR/区域像素流走T2/T3独立的鉴权、期限、同session非持久通道，**不得调用通用capability args/result或agent_runtime_dispatch的req.input来承载秘密**。在 `browser_capability_service.invoke_capability` 任何持久化前构造固定白名单审计，输出仅状态/规则版本/必要身份关联；禁止原始result、page_before/page_after及异常str写库，审计输入覆盖参数不是安全通道。截图不落盘、不whole-page fallback；不复用会导出input.value的通用页面感知/录制链。
@@ -112,6 +112,8 @@ approval:
 - Given缺规则或平台布局改变，When用户添加账号，Then明确非自动/unknown并可同会话原生接管；人工兜底记录manual_fallback，不产生rule_verified证据。
 
 ## Spec Change Log
+
+- 2026-09-05：实施合同核查发现 `backend/models/identity.py:40-55` 的WorkspaceMembership没有成员revision，旧T2说明误引了不存在字段；改为有界批量读取当前权限事实及新鲜度判断，避免A依赖虚构schema或另加分叉模型。保留≤500ms检查、≤1秒撤销fail closed、deadline硬断、workspace隔离与非持久敏感通道不变量；用户批准范围、frozen字节、批准历史hash和baseline均不变。
 
 ## Design Notes
 
