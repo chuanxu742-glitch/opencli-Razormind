@@ -72,6 +72,10 @@ def upgrade() -> None:
             ["workspace_id", "id"],
             ondelete="RESTRICT",
         )
+        batch.create_check_constraint(
+            "ck_source_binding_revision_account_workspace_pair",
+            "account_id IS NULL OR workspace_id IS NOT NULL",
+        )
 
     with op.batch_alter_table("browser_durable_commands") as batch:
         batch.create_foreign_key(
@@ -102,6 +106,9 @@ def downgrade() -> None:
         batch.drop_constraint("fk_browser_commands_session_workspace", type_="foreignkey")
 
     with op.batch_alter_table("source_binding_revisions") as batch:
+        batch.drop_constraint(
+            "ck_source_binding_revision_account_workspace_pair", type_="check"
+        )
         batch.drop_constraint(
             "fk_source_binding_revision_account_workspace", type_="foreignkey"
         )

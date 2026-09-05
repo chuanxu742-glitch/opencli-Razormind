@@ -116,6 +116,10 @@ class SourceBindingRevision(TimestampMixin):
     __tablename__ = "source_binding_revisions"
     __table_args__ = (
         UniqueConstraint("source_binding_id", "revision_number"),
+        CheckConstraint(
+            "account_id IS NULL OR workspace_id IS NOT NULL",
+            name="ck_source_binding_revision_account_workspace_pair",
+        ),
         ForeignKeyConstraint(
             ["workspace_id", "account_id"],
             ["browser_accounts.workspace_id", "browser_accounts.id"],
