@@ -49,6 +49,7 @@ from typing import Any
 
 from backend.skills.loop import StepRecord
 from backend.skills.page import SkillPage
+from backend.skills.perception import is_session_sensitive, set_session_sensitive
 from backend.skills.trace import assemble_trace, outcome_from_loop
 
 logger = logging.getLogger(__name__)
@@ -69,7 +70,7 @@ logger = logging.getLogger(__name__)
 # no-ops the second session's capture entirely — the bug this comment is
 # guarding against actually happened during development).
 CAPTURE_JS = r"""
-(sessionId) => {
+(sessionId, sensitive = false) => {
   const boundKey = '__skillRecordBound_' + sessionId;
   const stateKey = boundKey + '_state';
   const currentDocument = document;
@@ -235,6 +236,7 @@ class RecordSession:
         # attempt: Python callbacks must fail closed if a frame update fails.
         self.sensitive = True
         self._listener_installed = False
+        set_session_sensitive(self.session_id, True)
         self._listener_revoked = True
 
     async def _set_page_capture_state(self, enabled: bool) -> None:
@@ -277,6 +279,7 @@ class RecordSession:
 
     async def start(self) -> None:
         """Wire the capture binding and listener onto every live frame."""
+        set_session_sensitive(self.session_id, False)
         raw_page = self._raw_page()
         await raw_page.expose_binding("__record_event", self._on_event)
         add_init_script = getattr(raw_page, "add_init_script", None)
@@ -320,6 +323,7 @@ class RecordSession:
         reported_document = getattr(self, "document_id", None)
         return raw_page, frame, generation, reported_document
 
+
     def _append(self, *, verb: str, args: dict[str, Any], target: Any) -> None:
         now = time.monotonic()
         elapsed_ms = int((now - self._last_ts) * 1000)
@@ -347,7 +351,7 @@ class RecordSession:
         if frame is main_frame:
             self._document_generation = self._frame_document_generations[frame]
         self._schedule_frame_update(frame)
-        if frame is not main_frame or self.sensitive or self.stopped:
+        if frame is not main_frame or self.sensitive or is_session_sensitive(self.session_id):
             return
         self._append(verb="navigate", args={"url": frame.url}, target=frame.url)
 
@@ -403,14 +407,17 @@ class RecordSession:
         """Revoke or restore the real capture listeners and drain callbacks."""
         if self.stopped:
             raise RuntimeError("stopped recording cannot change sensitive mode")
+        if enabled:
+            set_session_sensitive(self.session_id, True)
         async with self._event_lock:
             await self._set_page_capture_state(enabled)
             self.sensitive = enabled
             self._listener_installed = not enabled
             self._listener_revoked = enabled
+        if not enabled:
+            set_session_sensitive(self.session_id, False)
         await self._drain_events()
         return True
-
     async def stop(self, *, status: str = "success", note: str | None = None) -> dict[str, Any]:
         """Revoke capture, drain callbacks, and assemble the recorded trace."""
         if self._trace is not None:
@@ -428,6 +435,7 @@ class RecordSession:
                 await self._drain_events()
         finally:
             self.stopped = True
+            set_session_sensitive(self.session_id, False)
             remove_listener = getattr(self._raw_page(), "remove_listener", None)
             if callable(remove_listener):
                 remove_listener("framenavigated", self._on_navigate)
