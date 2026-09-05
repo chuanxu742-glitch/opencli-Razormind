@@ -51,6 +51,16 @@ def _backfill_binding_workspaces() -> None:
 def upgrade() -> None:
     # Keep existing source-only revisions valid.  E1 populates account_id and
     # the already-derived workspace_id when selecting an account.
+    with op.batch_alter_table("browser_login_sessions") as batch:
+        batch.add_column(sa.Column("revision", sa.Integer(), nullable=False, server_default="0"))
+
+    # The profile-manifest composite FK must target an explicit unique key,
+    # not merely the command's single-column primary key.
+    with op.batch_alter_table("browser_durable_commands") as batch:
+        batch.create_unique_constraint(
+            "uq_browser_commands_workspace_id", ["workspace_id", "id"]
+        )
+
     with op.batch_alter_table("source_binding_revisions") as batch:
         batch.add_column(sa.Column("workspace_id", sa.String(36), nullable=True))
         batch.create_index("ix_source_binding_revisions_workspace_id", ["workspace_id"])
@@ -76,14 +86,15 @@ def upgrade() -> None:
             "ck_source_binding_revision_account_workspace_pair",
             "account_id IS NULL OR workspace_id IS NOT NULL",
         )
-
     with op.batch_alter_table("browser_durable_commands") as batch:
+        # Durable history keeps its workspace; referenced sessions are retained
+        # rather than attempting a composite SET NULL on a non-null workspace.
         batch.create_foreign_key(
             "fk_browser_commands_session_workspace",
             "browser_login_sessions",
             ["workspace_id", "session_id"],
             ["workspace_id", "id"],
-            ondelete="SET NULL",
+            ondelete="RESTRICT",
         )
 
     with op.batch_alter_table("browser_profile_manifests") as batch:
@@ -104,7 +115,10 @@ def downgrade() -> None:
 
     with op.batch_alter_table("browser_durable_commands") as batch:
         batch.drop_constraint("fk_browser_commands_session_workspace", type_="foreignkey")
+        batch.drop_constraint("uq_browser_commands_workspace_id", type_="unique")
 
+    with op.batch_alter_table("browser_login_sessions") as batch:
+        batch.drop_column("revision")
     with op.batch_alter_table("source_binding_revisions") as batch:
         batch.drop_constraint(
             "ck_source_binding_revision_account_workspace_pair", type_="check"

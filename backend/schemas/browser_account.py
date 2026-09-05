@@ -59,7 +59,7 @@ ERROR_HTTP_STATUS: dict[BrowserAccountErrorCode, int] = {
     BrowserAccountErrorCode.PROFILE_CORRUPT: 409,
     BrowserAccountErrorCode.ISOLATION_REQUIRED: 409,
     BrowserAccountErrorCode.NODE_UNAVAILABLE: 503,
-    BrowserAccountErrorCode.CAPABILITY_MISSING: 409,
+    BrowserAccountErrorCode.CAPABILITY_MISSING: 503,
     BrowserAccountErrorCode.STALE_GENERATION: 409,
     BrowserAccountErrorCode.LEASE_LOST: 409,
     BrowserAccountErrorCode.LOGIN_RULE_UNKNOWN: 409,
@@ -69,6 +69,18 @@ ERROR_HTTP_STATUS: dict[BrowserAccountErrorCode, int] = {
     BrowserAccountErrorCode.SESSION_EXPIRED: 410,
     BrowserAccountErrorCode.SAVE_FAILED: 409,
 }
+ACCOUNT_API_ROUTE = "/api/v1/workspaces/{workspace_id}/browser-accounts"
+LOGIN_SESSIONS_ROUTE = f"{ACCOUNT_API_ROUTE}/{{account_id}}/login-sessions"
+LOGIN_SESSION_ROUTE = f"{LOGIN_SESSIONS_ROUTE}/{{session_id}}"
+LOGIN_SESSION_VIEW_ROUTE = f"{LOGIN_SESSION_ROUTE}/view"
+LOGIN_SESSION_TAKEOVER_ROUTE = f"{LOGIN_SESSION_ROUTE}/takeover"
+LOGIN_SESSION_CONFIRM_ROUTE = f"{LOGIN_SESSION_ROUTE}/confirm"
+LOGIN_SESSION_CLOSE_ROUTE = f"{LOGIN_SESSION_ROUTE}/close"
+PORTAL_TICKET_REDEEM_ROUTE = f"{LOGIN_SESSION_ROUTE}/portal-ticket"
+PORTAL_WS_ROUTE = f"{LOGIN_SESSION_ROUTE}/portal"
+IDEMPOTENCY_HEADER = "Idempotency-Key"
+REVISION_HEADER = "If-Match"
+
 
 class _ContractModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -114,6 +126,28 @@ class AccountRef(_ContractModel):
     workspace_id: str = Field(min_length=1, max_length=36)
     account_id: str = Field(min_length=1, max_length=36)
     source_binding_revision_id: str | None = Field(default=None, min_length=1, max_length=36)
+
+class ExecutionContextV1(_ContractModel):
+    """Trusted execution/run references supplied by the existing execution chain."""
+
+    account_ref: AccountRef
+    execution_id: str = Field(min_length=1, max_length=128)
+    run_id: str | None = Field(default=None, min_length=1, max_length=128)
+    caller_id: str = Field(min_length=1, max_length=128)
+    source_binding_revision_id: str | None = Field(
+        default=None, min_length=1, max_length=36
+    )
+
+
+class BrowserLoginSessionCreateV1(_ContractModel):
+    """Body for creating one leased login or execution session."""
+
+    purpose: Literal["login", "execution"]
+    execution_id: str | None = Field(default=None, min_length=1, max_length=128)
+    source_binding_revision_id: str | None = Field(
+        default=None, min_length=1, max_length=36
+    )
+    expected_revision: int = Field(ge=0)
 
 
 class SessionTargetV1(_ContractModel):
@@ -162,6 +196,7 @@ class SessionEnvelopeV1(_ContractModel):
     def validate_profile_boundary(self) -> "SessionEnvelopeV1":
         if self.purpose == "execution" and (
             self.profile_state != "committed"
+
             or self.profile_id is None
             or self.profile_version is None
             or self.profile_manifest_id is None
@@ -172,6 +207,27 @@ class SessionEnvelopeV1(_ContractModel):
         ):
             raise ValueError("committed sessions require profile_id and profile_version")
         return self
+class SessionResolutionWaitingV1(_ContractModel):
+    status: Literal["waiting"] = "waiting"
+    account_ref: AccountRef
+    account_revision: int = Field(ge=0)
+    reason: Literal[
+        "node_unavailable",
+        "capacity_missing",
+        "lease_waiting",
+        "profile_restore_waiting",
+    ]
+    retry_at: datetime | None = None
+
+
+class SessionResolutionBlockedV1(_ContractModel):
+    status: Literal["blocked"] = "blocked"
+    account_ref: AccountRef
+    account_revision: int = Field(ge=0)
+    error_code: BrowserAccountErrorCode
+
+
+SessionResolutionV1 = SessionEnvelopeV1 | SessionResolutionWaitingV1 | SessionResolutionBlockedV1
 
 
 class EmptyCommandPayloadV1(_ContractModel):
@@ -246,6 +302,8 @@ class DurableCommandV1(_ContractModel):
     execution_id: str | None = Field(default=None, min_length=1, max_length=128)
     binding_revision_id: str | None = Field(default=None, min_length=1, max_length=36)
     epoch: int = Field(ge=0)
+    # Captured from BrowserAccount.revision at enqueue; never from membership
+    # revision or view_generation.
     expected_revision: int = Field(ge=0)
     available_at: datetime
     expires_at: datetime
@@ -296,6 +354,20 @@ class NodeClaimV1(_ContractModel):
         if self.expires_at <= self.claimed_at:
             raise ValueError("expires_at must be after claimed_at")
         return self
+class NodeIdentityV1(_ContractModel):
+    """Authenticated node identity; URL and client-supplied fleet tokens are not identity."""
+
+    node_id: str = Field(min_length=1, max_length=36)
+    boot_id: str = Field(min_length=1, max_length=128)
+
+
+class ClaimedCommandV1(_ContractModel):
+    """Single scheduler result reused by every downstream execution consumer."""
+
+    command: DurableCommandV1
+    claim: NodeClaimV1
+    session: SessionEnvelopeV1
+
 
 class ExternalIdentityV1(_ContractModel):
     """Minimal non-secret identity proof; never includes cookies or tokens."""
@@ -404,6 +476,9 @@ class LoginRuleV1(_ContractModel):
     success: RuleSuccessV1
     challenge_conditions: list[str] = Field(default_factory=list, max_length=32)
 class LoginObservationV1(_ContractModel):
+    """Rule observation handed to A for the same-session evidence CAS."""
+
+    account_ref: AccountRef
     session_id: str = Field(min_length=1, max_length=36)
     epoch: int = Field(ge=0)
     rule_id: str = Field(min_length=1, max_length=128)
@@ -425,6 +500,59 @@ class LoginObservationV1(_ContractModel):
     external_identity: ExternalIdentityV1 | None = None
     observed_at: datetime
     error_code: BrowserAccountErrorCode | None = None
+
+    @model_validator(mode="after")
+    def validate_trusted_success(self) -> "LoginObservationV1":
+        self.target.require_complete()
+        if self.evidence_kind is BrowserAuthEvidence.VALID and (
+            self.external_identity is None or self.state not in {"verifying", "saved"}
+        ):
+            raise ValueError("valid login observation requires identity and verifying state")
+        return self
+class AccountStateViewV1(_ContractModel):
+    """Fresh revision state consumed by the account transition CAS."""
+
+    account_ref: AccountRef
+    account_revision: int = Field(ge=0)
+    session_id: str = Field(min_length=1, max_length=36)
+    session_revision: int = Field(ge=0)
+
+
+class AccountStateTransitionV1(_ContractModel):
+    """Result of one atomic account/session state transition."""
+
+    accepted: bool
+    account_ref: AccountRef
+    account_revision: int = Field(ge=0)
+    session_id: str = Field(min_length=1, max_length=36)
+    session_revision: int = Field(ge=0)
+    status: BrowserAccountStatus
+    error_code: BrowserAccountErrorCode | None = None
+
+
+class SensitiveSessionBindingV1(_ContractModel):
+    """Binds the account session to a real page and existing record listener."""
+
+    account_ref: AccountRef
+    session_id: str = Field(min_length=1, max_length=36)
+    epoch: int = Field(ge=0)
+    target: SessionTargetV1
+    view_generation: int = Field(ge=0)
+    record_session_id: str | None = Field(default=None, min_length=1, max_length=36)
+
+    @model_validator(mode="after")
+    def validate_binding_target(self) -> "SensitiveSessionBindingV1":
+        self.target.require_complete()
+        return self
+
+
+class SensitiveGuardStateV1(_ContractModel):
+    status: Literal["enabled", "disabled"]
+    binding: SensitiveSessionBindingV1
+    listener_revoked: bool
+    pending_events_drained: bool
+    completed_at: datetime
+
 
 
 class PortalSensitivePayloadV1(_ContractModel):
@@ -547,6 +675,26 @@ class PortalTransientV1(_ContractModel):
         return self
 
 
+class PortalWireFrameV1(_ContractModel):
+    """Explicit websocket framing without exposing transient payloads to storage."""
+
+    encoding: Literal["control-json", "pixel-binary"]
+    content_type: Literal["application/json", "application/octet-stream"]
+    transient: PortalTransientV1
+
+    @model_validator(mode="after")
+    def validate_encoding(self) -> "PortalWireFrameV1":
+        if self.encoding == "control-json" and self.content_type != "application/json":
+            raise ValueError("control frames require application/json")
+        if self.encoding == "pixel-binary" and self.content_type != "application/octet-stream":
+            raise ValueError("pixel frames require application/octet-stream")
+        if self.encoding == "control-json" and self.transient.control is None:
+            raise ValueError("control framing requires a control message")
+        if self.encoding == "pixel-binary" and self.transient.pixel is None:
+            raise ValueError("pixel framing requires a pixel frame")
+        return self
+
+
 class PortalAuthorizationFactsV1(_ContractModel):
     """Fresh bounded batch facts used by every active portal replica."""
 
@@ -557,6 +705,8 @@ class PortalAuthorizationFactsV1(_ContractModel):
     role: Literal["admin", "maintainer", "operator", "viewer"] | None = None
     user_disabled: bool
     workspace_active: bool
+    # Read from BrowserAccount.revision in the same fresh DB snapshot.
+    account_revision: int = Field(ge=0)
     session_revoked: bool
     session_revision: int = Field(ge=0)
     session_expires_at: datetime
@@ -607,6 +757,40 @@ class BrowserAccountRead(_ContractModel):
     status_reason_code: str | None
     created_at: datetime
     updated_at: datetime
+class BrowserAccountListV1(_ContractModel):
+    """Keyset page; no total/offset scan is part of the account contract."""
+
+    items: list[BrowserAccountRead] = Field(default_factory=list, max_length=200)
+    next_cursor: str | None = Field(default=None, min_length=1, max_length=512)
+
+
+class PortalTicketRedeemRequestV1(_ContractModel):
+    """Body-only one-time ticket exchange; never place either secret in a URL."""
+
+    ticket: SecretStr
+    csrf_token: SecretStr
+
+
+class PortalTicketGrantV1(_ContractModel):
+    """Non-secret routing facts returned after a successful ticket exchange."""
+
+    workspace_id: str = Field(min_length=1, max_length=36)
+    account_id: str = Field(min_length=1, max_length=36)
+    session_id: str = Field(min_length=1, max_length=36)
+    issued_at: datetime
+    expires_at: datetime
+    hard_expires_at: datetime
+    cookie_name: str = Field(min_length=1, max_length=64)
+    websocket_path: str = Field(min_length=1, max_length=512)
+
+    @model_validator(mode="after")
+    def validate_ticket_window(self) -> "PortalTicketGrantV1":
+        if self.expires_at <= self.issued_at or self.hard_expires_at < self.expires_at:
+            raise ValueError("invalid portal ticket lifetime")
+        if (self.hard_expires_at - self.issued_at).total_seconds() > 1800:
+            raise ValueError("portal ticket hard lifetime exceeds thirty minutes")
+        return self
+
 
 
 class BrowserAccountLeaseRead(_ContractModel):
@@ -647,6 +831,8 @@ class BrowserLoginSessionRead(_ContractModel):
     node_boot_id: str | None
     lease_id: str | None
     epoch: int
+    # Authoritative portal CAS revision from browser_login_sessions.revision.
+    revision: int = Field(ge=0)
     profile_id: str | None
     profile_version: int | None
     profile_state: Literal["new", "uncommitted", "committed"]

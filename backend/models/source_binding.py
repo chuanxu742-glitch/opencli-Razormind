@@ -151,8 +151,3 @@ class SourceBindingRevision(TimestampMixin):
     created_by_user_id: Mapped[str] = mapped_column(
         ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
     )
-    # Account selection is immutable at the binding-revision boundary. Runtime
-    # authentication and lease state remain independent mutable account facts.
-    account_id: Mapped[str | None] = mapped_column(
-        ForeignKey("browser_accounts.id", ondelete="RESTRICT"), nullable=True, index=True
-    )
