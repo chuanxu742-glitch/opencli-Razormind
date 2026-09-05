@@ -263,7 +263,8 @@ class DurableCommandV1(_ContractModel):
         try:
             kind = BrowserCommandKind(kind_value)
             payload_type = _COMMAND_PAYLOAD_TYPES[kind]
-            payload_type.model_validate(payload)
+            values = dict(values)
+            values["payload"] = payload_type.model_validate(payload)
         except (KeyError, TypeError, ValueError):
             raise ValueError("unsupported command payload")
         return values
