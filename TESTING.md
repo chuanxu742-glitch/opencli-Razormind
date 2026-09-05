@@ -38,6 +38,22 @@ uv run python _bmad/scripts/render_skill.py --project-root . --skill .agents/ski
 生成的机器相关快照位于 `_bmad/render/`，已忽略，不应提交。此命令只验证技能渲染，
 不验证 Docker 镜像构建或容器运行。
 
+### Release Contract 本地复现
+
+在仓库根目录使用 Python 3.13、uv 和原生 Bash（需可调用 `openssl`），执行与
+`.github/workflows/release.yml` 相同的发布契约检查：
+
+```bash
+uv sync --locked --extra dev
+uv run --locked --extra dev pytest tests/unit/test_public_release_contract.py --noconftest --no-cov -q
+```
+
+依赖统一来自项目的锁文件及 `dev` extra，避免在发布工作流维护另一份版本固定列表。
+`--noconftest` 隔离应用级 `tests/conftest.py`，不禁用 pytest 内置的 `tmp_path`
+fixture 或参数化用例；`--no-cov` 仅为此定向发布门禁关闭无关的全应用覆盖率阈值。
+应运行该文件的全部契约用例且无跳过，包括真实密码初始化成功和失败的路径。
+测试替代了 Docker 调用，不代表已验证镜像构建、容器部署或标签发布。
+
 ### 服务准备
 
 ```bash
