@@ -639,8 +639,32 @@ class OpenCLIChannel(AbstractChannel):
     # there's no empirical number specific to opencli to justify a different one.
     capabilities = Capabilities(session_affinity=True, default_rate="60/min")
 
+    def identity(self, item: dict[str, Any]) -> str | None:
+        from backend.channels.ecommerce import ecommerce_identity
+
+        return ecommerce_identity(item)
+
     async def collect(
         self, config: dict[str, Any], parameters: dict[str, Any]
+    ) -> ChannelResult:
+        from backend.channels.ecommerce import adapt_items
+
+        request_context: dict[str, Any] = {}
+        result = await self._collect(config, parameters, request_context=request_context)
+        if result.success:
+            try:
+                result.items = adapt_items(
+                    config.get("site", ""), config.get("command", ""), result.items,
+                    positional_args=request_context["positional_args"],
+                    args=request_context["args"],
+                )
+            except ValueError as exc:
+                return ChannelResult.fail(str(exc), error_type="ValueError")
+        return result
+
+    async def _collect(
+        self, config: dict[str, Any], parameters: dict[str, Any],
+        *, request_context: dict[str, Any],
     ) -> ChannelResult:
         site = config.get("site", "")
         command = config.get("command", "")
@@ -674,6 +698,9 @@ class OpenCLIChannel(AbstractChannel):
                 args[k] = v
         # extra_positional goes first (before explicitly configured positional_args)
         positional_args = extra_positional + positional_args
+        # Capture the resolved request once, for the post-dispatch adapter.
+        # Legacy argument names may have become positional through CLI help.
+        request_context.update(positional_args=positional_args, args=args)
 
         env = os.environ.copy()
 

@@ -178,6 +178,53 @@ jobs:
       - name: Backend syntax check
         run: uv run python -m compileall backend
 
+      - name: Provision isolated OpenCLI patch-test baseline
+        run: |
+          python - <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+          import tarfile
+          import urllib.request
+
+          root = Path(os.environ["RUNNER_TEMP"]) / "opencli-ecommerce-baseline"
+          root.mkdir(parents=True, exist_ok=True)
+          archive = root / "jackwener-opencli-1.8.7.tgz"
+          url = "https://registry.npmjs.org/@jackwener/opencli/-/opencli-1.8.7.tgz"
+          with urllib.request.urlopen(url, timeout=60) as response:
+              payload = response.read()
+          expected = "2M+oPc70R1jNGzKzNrsm3fN4/gdvxCKlla7s9eaaTjkDjlzHpoZFN1YdV01A185kwCTN/ChOg+rbO4epO73c3w=="
+          if base64.b64encode(hashlib.sha512(payload).digest()).decode() != expected:
+              raise RuntimeError("OpenCLI 1.8.7 archive integrity mismatch")
+          archive.write_bytes(payload)
+          with tarfile.open(archive) as bundle:
+              bundle.extractall(root, filter="data")
+          package = root / "package"
+          # Resolve only runtime dependencies, without the upstream dev/peer test graph.
+          dependencies = root / "runtime-dependencies"
+          dependencies.mkdir()
+          manifest = json.loads((package / "package.json").read_text(encoding="utf-8"))
+          (dependencies / "package.json").write_text(
+              json.dumps({"private": True, "dependencies": manifest["dependencies"]}),
+              encoding="utf-8",
+          )
+          subprocess.run(
+              [shutil.which("npm"), "install", "--prefix", str(dependencies),
+               "--omit=dev", "--ignore-scripts", "--package-lock=false",
+               "--no-audit", "--no-fund"],
+              check=True, shell=os.name == "nt",
+          )
+          shutil.copytree(dependencies / "node_modules", package / "node_modules")
+          if not (package / "node_modules").is_dir():
+              raise RuntimeError("OpenCLI patch tests require nested runtime dependencies")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as environment:
+              environment.write(f"OPENCLI_TEST_ARCHIVE={archive}\nOPENCLI_TEST_PACKAGE={package}\n")
+          PY
+
       # Coverage visibility, not a gate: pyproject.toml bakes in
       # `--cov-fail-under=80` via [tool.pytest.ini_options].addopts, but the
       # current suite sits at ~70% total. Enforcing 80% here would turn CI red

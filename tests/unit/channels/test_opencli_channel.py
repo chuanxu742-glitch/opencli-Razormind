@@ -1211,82 +1211,157 @@ async def test_fetch_binary_not_found_classifies_as_permanent(channel):
     assert is_retryable(effective_error_type(exc_info.value)) is False
 
 
-@pytest.mark.asyncio
-async def test_collect_does_not_route_through_fetch(channel):
-    """Legacy path guard: collect() must stay the single source of truth for
-    site-routing (unlike api_channel/crawl4ai_channel's inverted
-    collect()-calls-fetch() pattern) — migrating fetch() must not silently
-    become a rewrite of collect()'s dispatch logic. Same mocked seam and config
-    as test_collect_local_cdp_success, plus a spy proving fetch() is never
-    called from inside collect()."""
-    mock_pool = _make_mock_pool(mode="cdp")
-    mock_settings = _make_mock_settings(collection_mode="local")
+@pytest.mark.parametrize(
+    ("site", "command", "rows", "requested", "canonical_url"),
+    [
+        ("taobao", "detail", [
+            {"field": "商品名称", "value": "Fixture"},
+            {"field": "价格", "value": "¥19.90"},
+            {"field": "ID", "value": "827563850178"},
+            {"field": "链接", "value": "https://item.taobao.com/item.htm?id=827563850178"},
+        ], "827563850178", "https://item.taobao.com/item.htm?id=827563850178"),
+        ("jd", "detail", [
+            {"field": "商品名称", "value": "Fixture"},
+            {"field": "价格", "value": "¥19.90"},
+            {"field": "SKU", "value": "100291143898"},
+            {"field": "链接", "value": "https://item.jd.com/100291143898.html"},
+        ], "100291143898", "https://item.jd.com/100291143898.html"),
+        ("jd", "item", [{
+            "title": "Fixture", "price": "¥19.90", "specs": {"颜色": "蓝"},
+            "mainImages": [], "detailImages": [],
+            "pageState": {"href": "https://item.jd.com/100291143898.html", "isProductPage": True},
+        }], "100291143898", "https://item.jd.com/100291143898.html"),
+    ],
+)
+def test_product_detail_batch_has_one_observable_identity(site, command, rows, requested, canonical_url):
+    from backend.channels.ecommerce import adapt_items
+    from backend.pipeline.normalizer import normalize_item
 
-    with (
-        patch("backend.browser_pool.get_pool", return_value=mock_pool),
-        patch("backend.config.get_settings", return_value=mock_settings),
-        patch(
-            "backend.channels.opencli_channel._run_opencli",
-            new=AsyncMock(return_value=(0, '[{"title": "test"}]', "")),
-        ),
-        patch.object(
-            channel,
-            "fetch",
-            new=AsyncMock(side_effect=AssertionError("collect() must not call fetch()")),
-        ) as mock_fetch,
+    products = adapt_items(site, command, rows, positional_args=[requested])
+    assert len(products) == 1
+    normalized, _ = normalize_item(products[0], "fixture-source")
+    assert normalized["title"] == "Fixture"
+    assert normalized["url"] == canonical_url
+
+
+@pytest.mark.parametrize(
+    ("site", "command", "rows", "requested"),
+    [
+        ("amazon", "product", [{"title": "Missing identity", "price_value": 19.9}], None),
+        ("amazon", "product", [{"asin": "B000000002", "title": "Wrong", "product_url": "https://www.amazon.com/dp/B000000002"}], "B000000001"),
+        ("jd", "item", [{"title": "Wrong", "pageState": {"href": "https://item.jd.com/100291143899.html", "isProductPage": True}}], "100291143898"),
+        ("taobao", "detail", [{"field": "商品名称", "value": "Missing identity"}], None),
+        ("amazon", "product", [{"error": "fixture upstream failure"}], "B000000001"),
+    ],
+)
+def test_product_missing_or_conflicting_identity_is_rejected(site, command, rows, requested):
+    from backend.channels.ecommerce import adapt_items
+
+    with pytest.raises(ValueError):
+        adapt_items(site, command, rows, positional_args=[requested] if requested else None)
+
+
+def test_product_identity_separates_marketplaces_and_coupang_variants():
+    from backend.channels.ecommerce import adapt_items, ecommerce_identity
+
+    def identity(site, row):
+        return ecommerce_identity(adapt_items(site, "product", [row])[0])
+
+    us = identity("amazon", {"asin": "B000000001", "title": "Same", "product_url": "https://www.amazon.com/dp/B000000001"})
+    de = identity("amazon", {"asin": "B000000001", "title": "Same", "product_url": "https://www.amazon.de/dp/B000000001"})
+    first = identity("coupang", {"product_id": "123456789", "title": "Same", "url": "https://www.coupang.com/vp/products/123456789?itemId=111&vendorItemId=222"})
+    second = identity("coupang", {"product_id": "123456789", "title": "Same", "url": "https://www.coupang.com/vp/products/123456789?itemId=112&vendorItemId=223"})
+    assert us != de
+    assert first != second
+
+
+@pytest.mark.parametrize(
+    ("site", "command", "rows"),
+    [
+        ("twitter", "search", [{"id": "123", "text": "A sale costs $10", "price": 10}]),
+        ("jd", "reviews", [{"rank": 1, "user": "Fixture", "content": "Good product", "date": "2026-09-05"}]),
+    ],
+)
+def test_nonproduct_commands_keep_their_original_record_semantics(site, command, rows):
+    from backend.channels.ecommerce import adapt_items, ecommerce_identity
+
+    result = adapt_items(site, command, rows)
+    assert result == rows
+    assert ecommerce_identity(result[0]) is None
+
+
+@pytest.mark.asyncio
+async def test_collect_rejects_successful_json_with_invalid_product_identity(channel, opencli_manifest_mocks):
+    opencli_manifest_mocks["requires_browser"] = False
+    with patch(
+        "backend.channels.opencli_channel._run_opencli",
+        new=AsyncMock(return_value=(0, '[{"title":"No product identity"}]', "")),
     ):
         result = await channel.collect(
-            {"site": "example.com", "command": "list", "format": "json"}, {}
+            {"site": "amazon", "command": "product", "format": "json"}, {},
         )
-
-    assert result.success is True
-    assert result.items == [{"title": "test"}]
-    mock_fetch.assert_not_called()
+    assert result.success is False
+    assert result.items == []
 
 
 @pytest.mark.asyncio
-async def test_run_channel_builds_rate_limited_client_for_opencli(
-    opencli_manifest_mocks,
-):
-    """End-to-end proof of the migration through the real runner entry point
-    (mirrors test_channel_runner.py's
-    test_migrated_channel_still_builds_rate_limited_client_when_none_injected,
-    and test_rss_fetch.py's test_run_channel_drives_rss_and_persists_cursor, but
-    with the real OpenCLIChannel): a migrated channel gets a RateLimitedClient
-    built from its declared default_rate when the caller injects no http of its
-    own — even though opencli's fetch() never reads ctx.http (documented
-    accepted trade-off, same as BrowserActChannel)."""
-    from types import SimpleNamespace
-
-    from backend.pipeline.channel_runner import run_channel
-    from backend.pipeline.cursor_store import InMemoryCursorStore
-
+async def test_collect_rejects_product_that_conflicts_with_effective_legacy_argument(channel, opencli_manifest_mocks):
     opencli_manifest_mocks["requires_browser"] = False
-    mock_settings = _make_mock_settings(collection_mode="local")
-    source = SimpleNamespace(
-        id="src-opencli-1",
-        channel_type="opencli",
-        channel_config={"site": "bbc", "command": "news", "format": "json"},
-    )
-
-    with (
-        patch("backend.config.get_settings", return_value=mock_settings),
-        patch(
-            "backend.channels.opencli_channel._run_opencli",
-            new=AsyncMock(return_value=(0, '[{"title": "news"}]', "")),
-        ),
-        patch("backend.pipeline.channel_runner.RateLimitedClient") as mock_rlc,
+    opencli_manifest_mocks["named_options"] = frozenset({"format"})
+    emitted = '[{"field":"商品名称","value":"Wrong item"},{"field":"ID","value":"222"},{"field":"链接","value":"https://item.taobao.com/item.htm?id=222"}]'
+    with patch(
+        "backend.channels.opencli_channel._run_opencli",
+        new=AsyncMock(return_value=(0, emitted, "")),
     ):
-        mock_rlc.return_value.aclose = AsyncMock()
-        result = await run_channel(
-            source, {}, channel=OpenCLIChannel(), cursor_store=InMemoryCursorStore()
+        result = await channel.collect(
+            {"site": "taobao", "command": "detail", "format": "json", "args": {"legacy_product_key": "111"}},
+            {},
         )
+    assert result.success is False
+    assert result.items == []
 
-    assert result.items == [{"title": "news"}]
-    mock_rlc.assert_called_once()
-    from backend.pipeline.http_client import TokenBucket, parse_rate
 
-    bucket = mock_rlc.call_args.args[1]
-    assert isinstance(bucket, TokenBucket)
-    assert bucket.rate == parse_rate(OpenCLIChannel().capabilities.default_rate)
-    assert bucket.rate == parse_rate("60/min")
+@pytest.mark.parametrize(
+    ("site", "command", "row"),
+    [
+        ("jd", "item", {"title": "Fixture", "pageState": {"href": 123}}),
+        ("amazon", "product", {"asin": "B000000001", "product_url": "https://www.amazon.com/dp/B000000001", "title": "Fixture", "fetched_at": 123}),
+        ("amazon", "product", {"asin": "B000000001", "product_url": "https://www.amazon.com/dp/B000000001", "title": "Fixture", "fetched_at": "not-a-timestamp"}),
+    ],
+)
+def test_product_malformed_page_identity_or_observation_is_rejected(site, command, row):
+    from backend.channels.ecommerce import adapt_items
+
+    with pytest.raises(ValueError):
+        adapt_items(site, command, [row])
+
+
+@pytest.mark.parametrize(
+    ("site", "row", "requested_url"),
+    [
+        ("amazon", {"asin": "B000000001", "title": "No market evidence"}, None),
+        ("amazon", {"asin": "B000000001", "title": "Conflicting markets", "product_url": "https://www.amazon.com/dp/B000000001", "source_url": "https://www.amazon.de/dp/B000000001"}, None),
+        ("coupang", {"product_id": "123456789", "title": "Duplicate variant", "url": "https://www.coupang.com/vp/products/123456789?itemId=111&itemId=112"}, None),
+        ("coupang", {"product_id": "123456789", "title": "Conflicting variants", "url": "https://www.coupang.com/vp/products/123456789?itemId=111", "source_url": "https://www.coupang.com/vp/products/123456789?itemId=112"}, None),
+        ("coupang", {"product_id": "123456789", "title": "Variant not observed", "url": "https://www.coupang.com/vp/products/123456789"}, "https://www.coupang.com/vp/products/123456789?itemId=111"),
+    ],
+)
+def test_product_market_and_variant_claims_require_consistent_observed_evidence(site, row, requested_url):
+    from backend.channels.ecommerce import adapt_items
+
+    with pytest.raises(ValueError):
+        adapt_items(site, "product", [row], positional_args=[requested_url] if requested_url else None)
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"title": "Sign in", "pageState": {"href": "https://item.jd.com/100291143898.html", "isProductPage": False}},
+        {"pageState": {"href": "https://item.jd.com/100291143898.html", "isProductPage": True}},
+    ],
+)
+def test_jd_product_identity_does_not_turn_nonproduct_or_empty_pages_into_success(row):
+    from backend.channels.ecommerce import adapt_items
+
+    with pytest.raises(ValueError):
+        adapt_items("jd", "item", [row], positional_args=["100291143898"])

@@ -4,11 +4,14 @@ import logging
 import os
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.dialects.postgresql import insert as postgres_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.models.record import CollectedRecord
+from backend.channels.ecommerce import ecommerce_identity
+from backend.models.record import CollectedRecord, PRODUCT_IDENTITY_PREDICATES
 from backend.pipeline import odp_client
 from backend.pipeline.sinks.base import CollectionLineage
 logger = logging.getLogger(__name__)
@@ -63,6 +66,58 @@ async def _existing_by_identity(
             existing[record.identity_key] = record
     return existing
 
+async def _store_product(
+    session: AsyncSession, *, raw: dict, normalized: dict, content_hash: str, identity: str,
+    task_id: str, source_id: str, workflow_id: str | None,
+    workflow_run_id: str | None, lineage: dict | None,
+) -> CollectedRecord | None:
+    """Atomically insert/update one current facet without allowing stale rollback."""
+    dialect = session.get_bind().dialect.name
+    insert = {"sqlite": sqlite_insert, "postgresql": postgres_insert}.get(dialect)
+    if insert is None:
+        raise ValueError(f"Product persistence does not support database dialect {dialect}")
+    values = {
+        "source_id": source_id, "identity_key": identity, "task_id": task_id,
+        "workflow_id": workflow_id, "workflow_run_id": workflow_run_id, "lineage": lineage,
+        "raw_data": raw, "normalized_data": normalized, "content_hash": content_hash,
+    }
+    statement = insert(CollectedRecord).values(**values, status="normalized").on_conflict_do_nothing(
+        index_elements=["source_id", "identity_key"],
+        index_where=PRODUCT_IDENTITY_PREDICATES[dialect],
+    ).returning(CollectedRecord)
+    inserted = (await session.execute(statement, execution_options={"populate_existing": True})).scalar_one_or_none()
+    if inserted is not None:
+        return inserted
+
+    # Classify hash and freshness under one lock. A pair of disjoint
+    # hash-qualified UPDATEs leaves a PostgreSQL READ COMMITTED gap where
+    # another writer can change the hash between the two statements.
+    # SQLite already holds its transaction writer lock after INSERT.
+    current = select(CollectedRecord).where(
+        CollectedRecord.source_id == source_id,
+        CollectedRecord.identity_key == identity,
+        PRODUCT_IDENTITY_PREDICATES[dialect],
+    ).with_for_update()
+    record = (await session.execute(
+        current, execution_options={"populate_existing": True},
+    )).scalar_one()
+    observed_at = normalized["ecommerce"]["observed_at"]
+    stored_observation = record.normalized_data["ecommerce"]["observed_at"]
+    facts_changed = record.content_hash != content_hash
+    if observed_at < stored_observation or (observed_at == stored_observation and not facts_changed):
+        return None
+    if facts_changed:
+        values.update(status="normalized", ai_enrichment=None)
+    statement = update(CollectedRecord).where(
+        CollectedRecord.id == record.id,
+    ).values(**values).returning(CollectedRecord)
+    record = (await session.execute(
+        statement, execution_options={"populate_existing": True, "synchronize_session": False},
+    )).scalar_one()
+    # Same facts with a newer observation refresh evidence, not fact counters.
+    return record if facts_changed else None
+
+
 async def store_records(
     session: AsyncSession,
     task_id: str,
@@ -92,8 +147,8 @@ async def store_records(
 
     ``identities`` (C7), when given, is a list parallel to ``normalized_triples``
     (same length, index-aligned) of each item's channel-provided ``identity()``
-    value, or None for items the channel can't identify. It is a SUPPLEMENTARY
-    key alongside content_hash, not a replacement:
+    value, or None for items the channel can't identify. For non-products it is
+    a SUPPLEMENTARY key alongside content_hash, not a replacement:
       - identity present AND matches an existing row for this source: that's
         the same source-native item seen before. If its content_hash is
         unchanged, it's a plain duplicate (skipped). If the content_hash
@@ -105,9 +160,15 @@ async def store_records(
       - identity present but not matching any existing row: falls through
         to the normal content_hash-based insert path, with identity_key set
         on the new row so future edits can be matched.
-      - identity None (or ``identities`` not given at all): behavior is
-        completely unchanged — content_hash-only dedup, exactly as before
-        C7. This is the only path channels without identity() ever take.
+      - non-product identity None (or ``identities`` not given at all):
+        unchanged content_hash-only dedup, exactly as before C7.
+
+    Recognized products derive required entity/facet identity from their validated
+    metadata regardless of the optional channel hints. A partial unique index and
+    atomic freshness-qualified writes keep one current facet per source. Older
+    observations are skipped; equal-time changed facts remain accepted, while
+    same-fact provenance refresh requires a newer observation. Superseded inputs
+    in the same batch count as skipped and each current product row returns once.
 
 
     Returns (new_records, skipped_count).
@@ -124,6 +185,11 @@ async def store_records(
     if not normalized_triples:
         return [], 0
 
+    if identities is not None and len(identities) != len(normalized_triples):
+        raise ValueError("identities must align with normalized_triples")
+    # Recognize once, then reuse the validated identity through atomic storage.
+    product_identities = [ecommerce_identity(raw) for raw, _, _ in normalized_triples]
+
     if forward_to_odp and odp_client.ingest_url():
         try:
             await odp_client.forward_triples(
@@ -136,6 +202,19 @@ async def store_records(
             if os.environ.get("ODP_INGEST_REQUIRED", "").lower() in ("1", "true", "yes"):
                 raise
             logger.warning("odp ingest forward failed (continuing sqlite path): %s", exc)
+
+    product_triples = []
+    nonproduct_triples = []
+    nonproduct_identities = []
+    for index, triple in enumerate(normalized_triples):
+        product_identity = product_identities[index]
+        if product_identity is not None:
+            product_triples.append((triple, product_identity))
+        else:
+            nonproduct_triples.append(triple)
+            nonproduct_identities.append(identities[index] if identities else None)
+    normalized_triples = nonproduct_triples
+    identities = nonproduct_identities
 
     # Collect all hashes to check for duplicates (chunked, see _existing_hashes)
     hashes = [h for _, _, h in normalized_triples]
@@ -258,5 +337,20 @@ async def store_records(
             except IntegrityError:
                 skipped += 1
         new_records = survivors
+
+    # Run after legacy conflict recovery: its transaction rollback must never
+    # discard a product observation already accepted by the atomic path.
+    returned_product_ids: set[str] = set()
+    for (raw, normalized, content_hash), identity in product_triples:
+        product = await _store_product(
+            session, raw=raw, normalized=normalized, content_hash=content_hash, identity=identity,
+            task_id=task_id, source_id=source_id, workflow_id=workflow_id,
+            workflow_run_id=workflow_run_id, lineage=lineage_payload,
+        )
+        if product is None or product.id in returned_product_ids:
+            skipped += 1
+        else:
+            returned_product_ids.add(product.id)
+            new_records.append(product)
 
     return new_records + updated_records, skipped

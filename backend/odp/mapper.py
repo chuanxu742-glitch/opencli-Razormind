@@ -23,12 +23,12 @@ def provider_for_channel(channel_type: str) -> str:
 
 
 def _source_ts(normalized: dict[str, Any]) -> str:
-    """RFC3339 ``source_ts`` from ``normalized['published_at']``.
+    """RFC3339 source time: product observation, otherwise publication time.
 
-    Falls back to ``now(UTC)`` when the field is absent or unparseable, and
-    assumes UTC for a naive timestamp — identical to the legacy forwarder.
+    Missing/unparseable values fall back to now(UTC); naive timestamps use UTC.
     """
-    published = normalized.get("published_at") or ""
+    product = normalized.get("ecommerce")
+    published = (product.get("observed_at") if product else normalized.get("published_at")) or ""
     try:
         if published:
             ts = datetime.fromisoformat(published.replace("Z", "+00:00"))
@@ -60,7 +60,7 @@ class RecordEventMapper:
         return RecordEvent(
             provider=provider_for_channel(channel_type),
             source_id=str(source_id),
-            event_id=content_hash,
+            event_id=normalized["ecommerce"]["fact_version"] if "ecommerce" in normalized else content_hash,
             source_ts=_source_ts(normalized),
             payload=normalized,
             raw_data=raw,

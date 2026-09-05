@@ -1,9 +1,14 @@
 from typing import TYPE_CHECKING
 
-from sqlalchemy import JSON, ForeignKey, Index, String, Text, UniqueConstraint
+from sqlalchemy import JSON, ForeignKey, Index, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from backend.models.base import TimestampMixin
+
+PRODUCT_IDENTITY_PREDICATES = {
+    "sqlite": text("json_extract(normalized_data, '$.ecommerce.entity_id') IS NOT NULL"),
+    "postgresql": text("(normalized_data -> 'ecommerce' ->> 'entity_id') IS NOT NULL"),
+}
 
 if TYPE_CHECKING:
     from backend.models.task import CollectionTask
@@ -19,6 +24,12 @@ class CollectedRecord(TimestampMixin):
         # replacement for content_hash. Several rows sharing NULL is normal
         # for channels that don't implement identity().
         Index("ix_collected_records_source_identity", "source_id", "identity_key"),
+        Index(
+            "uq_collected_records_product_identity", "source_id", "identity_key",
+            unique=True,
+            sqlite_where=PRODUCT_IDENTITY_PREDICATES["sqlite"],
+            postgresql_where=PRODUCT_IDENTITY_PREDICATES["postgresql"],
+        ),
     )
 
     task_id: Mapped[str] = mapped_column(
@@ -37,8 +48,8 @@ class CollectedRecord(TimestampMixin):
         String(36), nullable=True, index=True
     )
 
-    # Immutable collection provenance envelope. Nullable for pre-envelope rows
-    # and for paths that did not establish optional references.
+    # Provenance of the stored snapshot. Product observations refresh this;
+    # non-product records retain their existing immutable collection envelope.
     lineage: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     # Raw data as returned by the channel

@@ -4,6 +4,8 @@ import hashlib
 import json
 from typing import Any
 
+from backend.channels.ecommerce import product_snapshot
+
 # Field name aliases per semantic meaning, ordered by priority.
 # Covers all known opencli site output fields.
 _TITLE_KEYS = (
@@ -67,6 +69,7 @@ def _first(item: dict, keys: tuple[str, ...]) -> str:
 
 def normalize_item(raw: dict[str, Any], source_id: str) -> tuple[dict[str, Any], str]:
     """Return (normalized_data, content_hash)."""
+    product = product_snapshot(raw)
     normalized = {
         "title": _first(raw, _TITLE_KEYS),
         "url": _first(raw, _URL_KEYS),
@@ -75,15 +78,21 @@ def normalize_item(raw: dict[str, Any], source_id: str) -> tuple[dict[str, Any],
         "published_at": _first(raw, _DATE_KEYS),
         "source_id": source_id,
     }
-    # Carry over any extra fields not captured above (case-insensitive exclusion)
-    for k, v in raw.items():
-        if k.lower() not in _STANDARD_KEYS_LOWER:
-            normalized[f"extra_{k}"] = v
+    if product is not None:
+        normalized["url"] = product["url"]
+        normalized["ecommerce"] = product
+    # Product facts carry native fields once; unrelated records retain extra_*.
+    if product is None:
+        for k, v in raw.items():
+            if k.lower() not in _STANDARD_KEYS_LOWER:
+                normalized[f"extra_{k}"] = v
 
     # Build dedup hash from stable content; fall back to full raw_data
     # when standard fields are all empty (e.g. site-specific key names)
     title_url_content = normalized["title"] + normalized["url"] + normalized["content"]
-    if title_url_content:
+    if product is not None:
+        dedup_str = source_id + "|" + product["fact_version"]
+    elif title_url_content:
         dedup_str = "|".join(
             [normalized["title"], normalized["url"], normalized["content"], source_id]
         )

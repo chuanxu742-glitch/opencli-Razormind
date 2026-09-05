@@ -497,3 +497,101 @@ async def test_store_identity_lookup_chunks_across_batches(db_session, monkeypat
     assert skipped == 0
     assert len(records) == 5
     assert {r.content_hash for r in records} == {f"seed_hash_{i}_v2" for i in range(5)}
+
+
+@pytest.mark.asyncio
+async def test_product_store_derives_identity_and_keeps_source_evidence_separate(db_session):
+    from sqlalchemy import select
+
+    from backend.channels.ecommerce import adapt_items
+    from backend.models.record import CollectedRecord
+    from backend.pipeline.normalizer import normalize_items
+
+    source_a, task_a = await _setup_source_task(db_session, "opencli")
+    source_b, task_b = await _setup_source_task(db_session, "opencli")
+    raw = {
+        "asin": "B000000001", "title": "Fixture",
+        "product_url": "https://www.amazon.com/dp/B000000001",
+        "price_value": 19.99, "currency": "USD",
+    }
+    products = adapt_items("amazon", "product", [raw])
+    for source, task in [(source_a, task_a), (source_b, task_b)]:
+        await store_records(db_session, task.id, source.id, normalize_items(products, source.id))
+    updated = adapt_items("amazon", "product", [{**raw, "price_value": 29.99}])
+    await store_records(db_session, task_a.id, source_a.id, normalize_items(updated, source_a.id))
+    rows = (await db_session.scalars(select(CollectedRecord))).all()
+    assert len(rows) == 2
+    by_source = {row.source_id: row for row in rows}
+    assert by_source[source_a.id].identity_key == by_source[source_b.id].identity_key
+    assert by_source[source_a.id].identity_key is not None
+    assert by_source[source_a.id].normalized_data["ecommerce"]["facts"]["price_value"] == 29.99
+    assert by_source[source_b.id].normalized_data["ecommerce"]["facts"]["price_value"] == 19.99
+
+
+@pytest.mark.asyncio
+async def test_product_snapshot_rejects_stale_observations_and_tracks_accepted_run_provenance(db_session):
+    from sqlalchemy import select
+
+    from backend.channels.ecommerce import adapt_items
+    from backend.models.record import CollectedRecord
+    from backend.models.task import CollectionTask
+    from backend.pipeline.normalizer import normalize_items
+
+    source, initial_task = await _setup_source_task(db_session, "opencli")
+    current_task = CollectionTask(source_id=source.id, trigger_type="manual", parameters={})
+    stale_task = CollectionTask(source_id=source.id, trigger_type="manual", parameters={})
+    db_session.add_all([current_task, stale_task])
+    await db_session.flush()
+    raw = {"asin": "B000000001", "title": "Fixture", "product_url": "https://www.amazon.com/dp/B000000001", "currency": "USD"}
+
+    async def observe(task, price, at, workflow):
+        items = adapt_items("amazon", "product", [{**raw, "price_value": price, "fetched_at": at}])
+        return await store_records(
+            db_session, task.id, source.id, normalize_items(items, source.id),
+            workflow_id=workflow, workflow_run_id=workflow + "-run",
+            lineage={"task_id": task.id, "source_id": source.id, "collection_run_id": workflow + "-run"},
+        )
+
+    await observe(initial_task, 19.99, "2026-09-05T00:00:00Z", "original")
+    await observe(current_task, 29.99, "2026-09-07T00:00:00Z", "current")
+    # Same facts at a newer observation still move provenance to that accepted run.
+    await observe(current_task, 29.99, "2026-09-08T00:00:00Z", "latest")
+    observed = (await db_session.scalars(select(CollectedRecord))).one()
+    assert observed.workflow_id == "latest"
+    assert observed.task_id == current_task.id
+    # Coarse clocks may report changed facts at exactly the same timestamp.
+    await observe(current_task, 39.99, "2026-09-08T00:00:00Z", "same-time-change")
+    for stale_price in (39.99, 9.99):
+        await observe(stale_task, stale_price, "2026-09-06T00:00:00Z", "stale")
+    row = (await db_session.scalars(select(CollectedRecord))).one()
+    assert row.normalized_data["ecommerce"]["facts"]["price_value"] == 39.99
+    assert row.normalized_data["ecommerce"]["observed_at"].startswith("2026-09-08")
+    assert row.task_id == current_task.id
+    assert row.workflow_id == "same-time-change"
+    assert row.workflow_run_id == "same-time-change-run"
+    assert row.lineage["task_id"] == current_task.id
+    assert row.lineage["collection_run_id"] == "same-time-change-run"
+
+
+@pytest.mark.asyncio
+async def test_same_batch_product_updates_account_for_every_input_once(db_session):
+    from sqlalchemy import select
+
+    from backend.channels.ecommerce import adapt_items
+    from backend.models.record import CollectedRecord
+    from backend.pipeline.normalizer import normalize_items
+
+    source, task = await _setup_source_task(db_session, "opencli")
+    raw = {"asin": "B000000001", "title": "Fixture", "product_url": "https://www.amazon.com/dp/B000000001", "currency": "USD"}
+    items = adapt_items("amazon", "product", [
+        {**raw, "price_value": 19.99, "fetched_at": "2026-09-05T00:00:00Z"},
+        {**raw, "price_value": 29.99, "fetched_at": "2026-09-06T00:00:00Z"},
+        {**raw, "price_value": 39.99, "fetched_at": "2026-09-07T00:00:00Z"},
+    ])
+    records, skipped = await store_records(db_session, task.id, source.id, normalize_items(items, source.id))
+    assert len(records) == 1
+    assert skipped == 2
+    assert len(records) + skipped == len(items)
+    rows = (await db_session.scalars(select(CollectedRecord))).all()
+    assert len(rows) == 1
+    assert rows[0].normalized_data["ecommerce"]["facts"]["price_value"] == 39.99

@@ -1,180 +1,154 @@
-"""PR1 seam tests: LegacyDbSink wraps the original normalize+store path, and
-run_pipeline delegates the write through the injected ItemSink.
+"""Real isolated persistence contracts for product and nonproduct records."""
 
-The existing test_pipeline.py + test_storer.py staying green is the
-behavior-unchanged proof; these tests prove the seam itself exists and is wired.
-"""
-
-from unittest.mock import AsyncMock, MagicMock, patch
+from copy import deepcopy
 
 import pytest
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from backend.pipeline.sinks import LegacyDbSink, RunContext, SinkResult
-
-
-def _ctx(**over):
-    base = dict(task_id="t1", source_id="s1", provider="rss")
-    base.update(over)
-    return RunContext(**base)
-
-
-def _session_cm():
-    """A patched AsyncSessionLocal() context manager (storer is mocked, so the
-    session itself is never exercised — only opened/closed/committed)."""
-    sess = AsyncMock()
-    sess.commit = AsyncMock()
-    cm = AsyncMock()
-    cm.__aenter__ = AsyncMock(return_value=sess)
-    cm.__aexit__ = AsyncMock(return_value=False)
-    return cm
+from backend.models.record import CollectedRecord
+from backend.models.source import DataSource
+from backend.models.task import CollectionTask
+from backend.pipeline.sinks import LegacyDbSink, RunContext
 
 
-@pytest.mark.asyncio
-async def test_legacy_sink_normalizes_then_stores():
-    items = [{"title": "A", "url": "https://x/a"}, {"title": "B", "url": "https://x/b"}]
-    rec1, rec2 = MagicMock(), MagicMock()
-    store_mock = AsyncMock(return_value=([rec1, rec2], 1))
-
-    with (
-        patch("backend.pipeline.storer.store_records", new=store_mock),
-        patch("backend.database.AsyncSessionLocal", return_value=_session_cm()),
-    ):
-        result = await LegacyDbSink().write_batch(_ctx(), items)
-
-    assert result.accepted == 2
-    assert result.duplicates == 1
-    assert result.normalized == 2
-    assert result.records == [rec1, rec2]
-
-    # storer was handed the normalized triples and the provider as channel_type.
-    args, kwargs = store_mock.call_args
-    assert kwargs["channel_type"] == "rss"
-    triples = args[3]
-    assert len(triples) == 2
-    # Each triple is (raw, normalized, content_hash).
-    assert triples[0][1]["title"] == "A"
+async def _sink_context(db_engine, monkeypatch, provider="opencli"):
+    factory = async_sessionmaker(db_engine, expire_on_commit=False)
+    monkeypatch.setattr("backend.database.AsyncSessionLocal", factory)
+    async with factory() as session:
+        source = DataSource(name="Isolated fixture", channel_type=provider, channel_config={})
+        session.add(source)
+        await session.flush()
+        task = CollectionTask(source_id=source.id, trigger_type="manual", parameters={})
+        session.add(task)
+        await session.commit()
+        return factory, RunContext(task_id=task.id, source_id=source.id, provider=provider)
 
 
 @pytest.mark.asyncio
-async def test_legacy_sink_resolves_channel_identity_for_c7():
-    """C7: the sink asks the channel for each item's identity() and passes
-    it through to store_records — this is what lets an RSS entry with a
-    stable id be matched across re-fetches even after its title changes."""
-    items = [
-        {"title": "A", "url": "https://x/a", "id": "guid-a"},
-        {"title": "B", "url": "https://x/b"},  # no "id" key: identity() is None for this one
-    ]
-    store_mock = AsyncMock(return_value=([], 0))
+@pytest.mark.parametrize(
+    ("site", "command", "raw", "price_key", "changed_price"),
+    [
+        ("taobao", "search", {"item_id": "827563850178", "title": "Fixture", "url": "https://item.taobao.com/item.htm?id=827563850178", "price": "¥19.90"}, "price", "¥29.90"),
+        ("jd", "search", {"sku": "100291143898", "title": "Fixture", "url": "https://item.jd.com/100291143898.html", "price": "¥19.90"}, "price", "¥29.90"),
+        ("1688", "item", {"offer_id": "887904326744", "title": "Fixture", "item_url": "https://detail.1688.com/offer/887904326744.html", "currency": "CNY", "moq_value": 10, "price_tiers": [{"quantity_min": 10, "price_text": "12", "price": 12, "currency": "CNY"}]}, "price_tiers", [{"quantity_min": 10, "price_text": "11", "price": 11, "currency": "CNY"}]),
+        ("xianyu", "item", {"item_id": "1040754408976", "title": "Fixture", "description": "Used fixture", "item_url": "https://www.goofish.com/item?id=1040754408976", "price": "¥19.90"}, "price", "¥29.90"),
+        ("amazon", "product", {"asin": "B000000001", "title": "Fixture", "product_url": "https://www.amazon.com/dp/B000000001", "price_value": 19.9, "currency": "USD"}, "price_value", 29.9),
+        ("coupang", "product", {"product_id": "123456789", "title": "Fixture", "url": "https://www.coupang.com/vp/products/123456789?itemId=111&vendorItemId=222", "price": 12900}, "price", 13900),
+        ("ebay", "product", {"itemId": "v1|123456789012|0", "title": "Fixture", "itemWebUrl": "https://www.ebay.com/itm/123456789012", "price": {"value": "19.90", "currency": "USD"}, "marketplace": "EBAY_US"}, "price", {"value": "29.90", "currency": "USD"}),
+    ],
+)
+async def test_seven_platform_price_updates_persist_without_duplicate_facts(
+    db_engine, monkeypatch, site, command, raw, price_key, changed_price,
+):
+    from backend.channels.ecommerce import adapt_items
 
-    with (
-        patch("backend.pipeline.storer.store_records", new=store_mock),
-        patch("backend.database.AsyncSessionLocal", return_value=_session_cm()),
-    ):
-        await LegacyDbSink().write_batch(_ctx(), items)
+    factory, ctx = await _sink_context(db_engine, monkeypatch)
+    sink = LegacyDbSink(forward_to_odp=False)
 
-    _, kwargs = store_mock.call_args
-    # RSS's identity() reads item["id"] (real feed fetches populate it via
-    # _entry_to_dict's fallback-to-link — out of scope here, this test is
-    # at the sink layer with hand-built raw dicts): present for item 1,
-    # absent for item 2.
-    assert kwargs["identities"] == ["guid-a", None]
+    def items(value, observed):
+        row = {**deepcopy(raw), price_key: deepcopy(value), "fetched_at": observed}
+        return adapt_items(site, command, [row])
 
-
-@pytest.mark.asyncio
-async def test_legacy_sink_falls_back_when_channel_has_no_identity():
-    """A channel_type with no identity() override (or unresolvable) passes
-    identities=None through — store_records' documented content_hash-only
-    fallback, unchanged from before C7."""
-    items = [{"title": "A", "url": "https://x/a"}]
-    store_mock = AsyncMock(return_value=([], 0))
-
-    with (
-        patch("backend.pipeline.storer.store_records", new=store_mock),
-        patch("backend.database.AsyncSessionLocal", return_value=_session_cm()),
-    ):
-        await LegacyDbSink().write_batch(_ctx(provider="cli"), items)
-
-    _, kwargs = store_mock.call_args
-    assert kwargs["identities"] == [None]
-
-
-@pytest.mark.asyncio
-async def test_legacy_sink_unknown_provider_degrades_to_no_identities():
-    """An unregistered channel_type (get_channel raises) must not break
-    storage — it degrades to identities=None, the unchanged pre-C7 path."""
-    items = [{"title": "A", "url": "https://x/a"}]
-    store_mock = AsyncMock(return_value=([], 0))
-
-    with (
-        patch("backend.pipeline.storer.store_records", new=store_mock),
-        patch("backend.database.AsyncSessionLocal", return_value=_session_cm()),
-    ):
-        result = await LegacyDbSink().write_batch(_ctx(provider="no-such-channel"), items)
-
-    assert result.accepted == 0  # ran to completion, no exception raised
-    _, kwargs = store_mock.call_args
-    assert kwargs["identities"] is None
+    initial = await sink.write_batch(ctx, items(raw[price_key], "2026-09-05T00:00:00Z"))
+    record_id = initial.records[0].id
+    initial_version = initial.records[0].normalized_data["ecommerce"]["fact_version"]
+    updated = await sink.write_batch(ctx, items(changed_price, "2026-09-06T00:00:00Z"))
+    assert updated.accepted == 1
+    assert updated.records[0].id == record_id
+    changed_version = updated.records[0].normalized_data["ecommerce"]["fact_version"]
+    assert changed_version != initial_version
+    repeated = await sink.write_batch(ctx, items(changed_price, "2026-09-07T00:00:00Z"))
+    assert repeated.duplicates == 1
+    async with factory() as session:
+        rows = (await session.scalars(select(CollectedRecord).where(CollectedRecord.source_id == ctx.source_id))).all()
+        assert len(rows) == 1
+        product = rows[0].normalized_data["ecommerce"]
+        assert product["facts"][price_key] == changed_price
+        assert product["fact_version"] == changed_version
+        assert product["observed_at"].startswith("2026-09-07")
+        if site == "coupang":
+            assert "itemId=111" in rows[0].normalized_data["url"]
+            assert "vendorItemId=222" in rows[0].normalized_data["url"]
 
 
 @pytest.mark.asyncio
-async def test_legacy_sink_empty_items():
-    store_mock = AsyncMock(return_value=([], 0))
-    with (
-        patch("backend.pipeline.storer.store_records", new=store_mock),
-        patch("backend.database.AsyncSessionLocal", return_value=_session_cm()),
-    ):
-        result = await LegacyDbSink().write_batch(_ctx(), [])
+async def test_product_facets_and_same_title_entities_survive_independent_updates(db_engine, monkeypatch):
+    from backend.channels.ecommerce import adapt_items
 
-    assert result.accepted == 0
-    assert result.duplicates == 0
-    assert result.normalized == 0
-    assert result.records == []
+    factory, ctx = await _sink_context(db_engine, monkeypatch)
+    sink = LegacyDbSink(forward_to_odp=False)
+    product = {"asin": "B000000001", "title": "Same title", "product_url": "https://www.amazon.com/dp/B000000001", "price_value": 19.9, "currency": "USD"}
+    other = {**product, "asin": "B000000002", "product_url": "https://www.amazon.com/dp/B000000002"}
+    await sink.write_batch(ctx, adapt_items("amazon", "product", [product, other]))
+    await sink.write_batch(ctx, adapt_items("amazon", "offer", [{"asin": product["asin"], "product_url": product["product_url"], "sold_by": "Seller one"}]))
+    await sink.write_batch(ctx, adapt_items("amazon", "discussion", [{"asin": product["asin"], "product_url": product["product_url"], "average_rating_value": 4.5, "review_samples": []}]))
+    await sink.write_batch(ctx, adapt_items("amazon", "search", [product]))
+    await sink.write_batch(ctx, adapt_items("amazon", "offer", [{"asin": product["asin"], "product_url": product["product_url"], "sold_by": "Seller two"}]))
+    async with factory() as session:
+        rows = (await session.scalars(select(CollectedRecord).where(CollectedRecord.source_id == ctx.source_id))).all()
+        assert len(rows) == 5
+        assert len({r.identity_key for r in rows}) == 5
+        product_rows = [r for r in rows if r.normalized_data["ecommerce"]["facet"] == "product"]
+        assert len(product_rows) == 2
+        assert all(r.normalized_data["title"] == "Same title" for r in product_rows)
+        offer = next(r for r in rows if r.normalized_data["ecommerce"]["facet"] == "offer")
+        assert offer.normalized_data["ecommerce"]["facts"]["sold_by"] == "Seller two"
+        assert all(r.normalized_data["ecommerce"]["facts"]["price_value"] == 19.9 for r in product_rows)
 
 
 @pytest.mark.asyncio
-async def test_run_pipeline_routes_through_injected_sink(db_session):
-    """The seam is wired: run_pipeline delegates the write to the injected sink
-    instead of touching normalizer/storer directly."""
-    from backend.channels.base import ChannelResult
-    from backend.models.source import DataSource
-    from backend.models.task import CollectionTask
-    from backend.pipeline.pipeline import run_pipeline
+async def test_legacy_sink_nonproduct_native_identity_still_updates_in_place(db_engine, monkeypatch):
+    factory, ctx = await _sink_context(db_engine, monkeypatch, provider="rss")
+    sink = LegacyDbSink(forward_to_odp=False)
+    first = await sink.write_batch(ctx, [{"id": "feed-entry-1", "title": "Original", "url": "https://example.com/1"}])
+    second = await sink.write_batch(ctx, [{"id": "feed-entry-1", "title": "Corrected", "url": "https://example.com/1"}])
+    assert second.records[0].id == first.records[0].id
+    async with factory() as session:
+        rows = (await session.scalars(select(CollectedRecord))).all()
+        assert len(rows) == 1
+        assert rows[0].normalized_data["title"] == "Corrected"
+        assert "ecommerce" not in rows[0].normalized_data
 
-    source = DataSource(
-        name="Seam Source",
-        channel_type="rss",
-        channel_config={"feed_url": "https://x/f"},
+
+@pytest.mark.asyncio
+async def test_concurrent_product_writers_keep_one_identity_and_newest_observation(tmp_path, monkeypatch):
+    import asyncio
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from backend.channels.ecommerce import adapt_items
+    from backend.database import Base
+
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///" + (tmp_path / "concurrent-products.sqlite").as_posix(),
+        connect_args={"timeout": 30},
     )
-    db_session.add(source)
-    await db_session.flush()
-    task = CollectionTask(source_id=source.id, trigger_type="manual", parameters={})
-    db_session.add(task)
-    await db_session.flush()
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        factory, ctx = await _sink_context(engine, monkeypatch)
+        sink = LegacyDbSink(forward_to_odp=False)
+        start = asyncio.Event()
+        raw = {"asin": "B000000001", "title": "Fixture", "product_url": "https://www.amazon.com/dp/B000000001", "currency": "USD"}
 
-    fake_sink = MagicMock()
-    fake_sink.write_batch = AsyncMock(
-        return_value=SinkResult(
-            accepted=3, duplicates=1, normalized=4,
-            records=[MagicMock(), MagicMock(), MagicMock()],
-        )
-    )
+        async def writer(price, observed_at):
+            await start.wait()
+            return await sink.write_batch(ctx, adapt_items(
+                "amazon", "product", [{**raw, "price_value": price, "fetched_at": observed_at}],
+            ))
 
-    with patch(
-        "backend.pipeline.collector.collect",
-        return_value=ChannelResult.ok([{"title": "x"}]),
-    ):
-        result = await run_pipeline(
-            task.id, source,
-            enable_ai=False, enable_notifications=False,
-            sink=fake_sink,
-        )
-
-    fake_sink.write_batch.assert_awaited_once()
-    # The RunContext carried the run identity into the sink.
-    ctx_arg = fake_sink.write_batch.call_args.args[0]
-    assert ctx_arg.source_id == source.id
-    assert ctx_arg.provider == "rss"
-
-    assert result.success is True
-    assert result.stored == 3
-    assert result.skipped == 1
+        writers = [
+            asyncio.create_task(writer(19.99, "2026-09-05T00:00:00Z")),
+            asyncio.create_task(writer(29.99, "2026-09-07T00:00:00Z")),
+            asyncio.create_task(writer(9.99, "2026-09-06T00:00:00Z")),
+        ]
+        start.set()
+        await asyncio.gather(*writers)
+        async with factory() as session:
+            rows = (await session.scalars(select(CollectedRecord))).all()
+            assert len(rows) == 1
+            assert rows[0].normalized_data["ecommerce"]["facts"]["price_value"] == 29.99
+            assert rows[0].normalized_data["ecommerce"]["observed_at"].startswith("2026-09-07")
+    finally:
+        await engine.dispose()

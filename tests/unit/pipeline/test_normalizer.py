@@ -191,3 +191,104 @@ def test_no_standard_fields_uses_raw_hash():
     _, hash1 = normalize_item(raw1, "src")
     _, hash2 = normalize_item(raw2, "src")
     assert hash1 != hash2
+
+
+def test_product_facts_change_without_conflating_entity_source_or_observation():
+    from backend.channels.ecommerce import adapt_items
+
+    raw = {
+        "asin": "B000000001", "title": "Same title",
+        "product_url": "https://www.amazon.com/dp/B000000001",
+        "price_value": 19.99, "currency": "USD",
+        "fetched_at": "2026-09-05T00:00:00Z", "rank": 1,
+    }
+
+    def normalized(overrides=None, source="source-a"):
+        item = adapt_items("amazon", "search", [{**raw, **(overrides or {})}])[0]
+        return normalize_item(item, source)
+
+    first, first_hash = normalized()
+    observed, observed_hash = normalized({"fetched_at": "2026-09-06T00:00:00Z", "rank": 7})
+    changed, changed_hash = normalized({"price_value": 29.99})
+    other_source, other_source_hash = normalized(source="source-b")
+    _, other_asin_hash = normalized({
+        "asin": "B000000002", "product_url": "https://www.amazon.com/dp/B000000002",
+    })
+
+    assert observed_hash == first_hash
+    assert observed["ecommerce"]["fact_version"] == first["ecommerce"]["fact_version"]
+    assert observed["ecommerce"]["observed_at"] != first["ecommerce"]["observed_at"]
+    assert changed_hash != first_hash
+    assert changed["ecommerce"]["fact_version"] != first["ecommerce"]["fact_version"]
+    assert other_source_hash != first_hash
+    assert other_source["ecommerce"]["fact_version"] == first["ecommerce"]["fact_version"]
+    assert other_asin_hash != first_hash
+
+
+def test_offer_observation_does_not_create_a_new_fact_version():
+    from backend.channels.ecommerce import adapt_items
+
+    raw = {
+        "asin": "B000000001", "product_url": "https://www.amazon.com/dp/B000000001",
+        "sold_by": "Fixture seller", "price_value": 19.99, "currency": "USD",
+        "fetched_at": "2026-09-05T00:00:00Z",
+    }
+    first, first_hash = normalize_item(adapt_items("amazon", "offer", [raw])[0], "source")
+    observed, observed_hash = normalize_item(adapt_items(
+        "amazon", "offer", [{**raw, "fetched_at": "2026-09-06T00:00:00Z"}],
+    )[0], "source")
+    assert observed_hash == first_hash
+    assert observed["ecommerce"]["fact_version"] == first["ecommerce"]["fact_version"]
+
+
+def test_1688_quantity_tiers_and_missing_price_remain_distinct_facts():
+    from backend.channels.ecommerce import adapt_items
+
+    raw = {
+        "offer_id": "887904326744", "title": "Fixture",
+        "item_url": "https://detail.1688.com/offer/887904326744.html",
+        "price_tiers": [{"quantity_min": 10, "price_text": "12", "price": 12, "currency": "CNY"}, {"quantity_min": 100, "price_text": "9", "price": 9, "currency": "CNY"}],
+        "currency": "CNY", "moq_value": 10,
+    }
+    first, first_hash = normalize_item(adapt_items("1688", "item", [raw])[0], "source")
+    changed_raw = {**raw, "price_tiers": [{"quantity_min": 10, "price_text": "12", "price": 12, "currency": "CNY"}, {"quantity_min": 100, "price_text": "8", "price": 8, "currency": "CNY"}]}
+    _, changed_hash = normalize_item(adapt_items("1688", "item", [changed_raw])[0], "source")
+    assert first["ecommerce"]["facts"]["price_tiers"] == raw["price_tiers"]
+    assert changed_hash != first_hash
+
+    missing = {"asin": "B000000001", "title": "Fixture", "product_url": "https://www.amazon.com/dp/B000000001", "price_value": None}
+    _, missing_hash = normalize_item(adapt_items("amazon", "product", [missing])[0], "source")
+    _, zero_hash = normalize_item(adapt_items("amazon", "product", [{**missing, "price_value": 0}])[0], "source")
+    assert missing_hash != zero_hash
+
+
+def test_unrelated_ecommerce_named_dictionary_remains_ordinary_source_data():
+    from backend.channels.ecommerce import adapt_items, ecommerce_identity
+
+    raw = {"title": "Social post", "url": "https://example.com/post/1", "_ecommerce": {"campaign": "summer"}}
+    item = adapt_items("twitter", "search", [raw])[0]
+    normalized, content_hash = normalize_item(item, "source")
+    _, original_hash = normalize_item({"title": raw["title"], "url": raw["url"]}, "source")
+    assert ecommerce_identity(item) is None
+    assert "ecommerce" not in normalized
+    assert normalized["extra__ecommerce"] == raw["_ecommerce"]
+    assert content_hash == original_hash
+
+
+def test_product_link_tracking_does_not_create_fact_versions():
+    from backend.channels.ecommerce import adapt_items
+
+    raw = {
+        "asin": "B000000001", "title": "Fixture",
+        "product_url": "https://www.amazon.com/dp/B000000001",
+        "review_url": "https://www.amazon.com/product-reviews/B000000001?ref=first",
+        "qa_url": "https://www.amazon.com/ask/questions/asin/B000000001?ref=first",
+    }
+
+    def version(values):
+        item = adapt_items("amazon", "product", [values])[0]
+        return normalize_item(item, "source")[1]
+
+    tracked = {**raw, "review_url": raw["review_url"].replace("first", "second"),
+               "qa_url": raw["qa_url"].replace("first", "second")}
+    assert version(tracked) == version(raw)

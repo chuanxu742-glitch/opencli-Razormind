@@ -1,20 +1,18 @@
 """LegacyDbSink — the original write path, now behind the ItemSink seam.
 
-Normalizes items (``content_hash`` dedup) and stores them in
-``collected_records``, exactly as the pipeline did inline before the seam
-existed. Extracting it changes no behavior: it still calls
-``normalizer.normalize_items`` then ``storer.store_records`` inside a
-short-lived session.
+Normalizes items and stores them in ``collected_records`` inside a short-lived
+session. Products retain a current snapshot per source/entity/facet; other
+channels retain their existing content-hash and optional native-identity rules.
 
-Two things stay where they were on purpose, to keep this slice behavior-only:
+Two write-routing responsibilities remain unchanged:
   * The ODP forward still lives inside ``storer.store_records`` (fires only
     when ``ODP_INGEST_URL`` is set AND ``forward_to_odp`` is True), now behind
     a ``forward_to_odp`` gate so DualSink can suppress it on the legacy leg.
     The dedicated ``OdpSink`` owns the forward going forward; ``write_strategy``
     (``backend/pipeline/sinks/strategy.py``) picks the destination explicitly.
-  * Dedup here remains ``content_hash`` (title|url|content|source_id). The ODP
-    path keys on ``(source_id, event_id)`` instead; the two will disagree, and
-    surfacing that disagreement under shadow is the point of the migration.
+  * Non-product dedup remains ``content_hash`` (title|url|content|source_id).
+    Products use source-scoped entity/facet identity and stable fact versions;
+    ODP stores version snapshots, not a cross-source materialized product table.
 """
 
 from __future__ import annotations
@@ -55,6 +53,7 @@ class LegacyDbSink:
         from backend.database import AsyncSessionLocal
         from backend.pipeline import normalizer, storer
 
+        from backend.channels.ecommerce import ecommerce_identity
         triples = normalizer.normalize_items(list(items), ctx.source_id)
 
         # C7: ask the channel for each item's stable native id (RSS entry id,
@@ -77,6 +76,12 @@ class LegacyDbSink:
                 ctx.provider, exc,
             )
             identities = None
+        # A malformed/unavailable channel must not erase a product's required
+        # identity and silently turn a price change into another current row.
+        identities = [
+            ecommerce_identity(raw) or (identities[index] if identities else None)
+            for index, (raw, _, _) in enumerate(triples)
+        ]
 
         # The ODP shadow-forward still fires inside storer.store_records; the
         # forward_to_odp gate lets DualSink(LegacyDbSink + OdpSink) turn it off on
