@@ -82,7 +82,7 @@ class _ContractModel(BaseModel):
     def to_wire(self) -> dict[str, Any]:
         """Validate, normalize, and serialize one canonical contract value."""
         return type(self).model_validate(self.model_dump(mode="python")).model_dump(
-            mode="json"
+            mode="json", exclude_none=True
         )
 
     @classmethod
@@ -211,6 +211,18 @@ class MigrateCommandPayloadV1(_ContractModel):
     snapshot_ref: str = Field(min_length=1, max_length=255)
 
 
+CommandPayloadV1 = (
+    EmptyCommandPayloadV1
+    | LoginRuleCommandPayloadV1
+    | RefreshLoginCommandPayloadV1
+    | StopAndSaveCommandPayloadV1
+    | ExecuteReferenceCommandPayloadV1
+    | CloseSessionCommandPayloadV1
+    | IsolateCommandPayloadV1
+    | MigrateCommandPayloadV1
+)
+
+
 _COMMAND_PAYLOAD_TYPES: dict[BrowserCommandKind, type[_ContractModel]] = {
     BrowserCommandKind.START_LOGIN: EmptyCommandPayloadV1,
     BrowserCommandKind.APPLY_LOGIN_RULE: LoginRuleCommandPayloadV1,
@@ -239,7 +251,7 @@ class DurableCommandV1(_ContractModel):
     expires_at: datetime
     status: BrowserCommandStatus = BrowserCommandStatus.QUEUED
     session_id: str | None = Field(default=None, min_length=1, max_length=36)
-    payload: _ContractModel | None = None
+    payload: CommandPayloadV1 = Field(default_factory=EmptyCommandPayloadV1)
 
     @model_validator(mode="before")
     @classmethod
@@ -251,14 +263,16 @@ class DurableCommandV1(_ContractModel):
         try:
             kind = BrowserCommandKind(kind_value)
             payload_type = _COMMAND_PAYLOAD_TYPES[kind]
-            values = dict(values)
-            values["payload"] = payload_type.model_validate(payload)
+            payload_type.model_validate(payload)
         except (KeyError, TypeError, ValueError):
             raise ValueError("unsupported command payload")
         return values
 
     @model_validator(mode="after")
-    def validate_deadline(self) -> "DurableCommandV1":
+    def validate_payload_type(self) -> "DurableCommandV1":
+        expected_type = _COMMAND_PAYLOAD_TYPES[self.kind]
+        if not isinstance(self.payload, expected_type):
+            raise ValueError("command payload does not match command kind")
         if self.expires_at <= self.available_at:
             raise ValueError("expires_at must be after available_at")
         return self

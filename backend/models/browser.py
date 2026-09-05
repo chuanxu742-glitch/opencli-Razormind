@@ -3,6 +3,7 @@ from datetime import datetime
 from enum import StrEnum
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -428,7 +429,7 @@ class BrowserProfileManifest(TimestampMixin):
     bundle_name: Mapped[str] = mapped_column(String(100), nullable=False)
     browser_version: Mapped[str] = mapped_column(String(100), nullable=False)
     files_count: Mapped[int] = mapped_column(Integer, nullable=False)
-    total_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    total_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     checksum_manifest_ref: Mapped[str] = mapped_column(String(255), nullable=False)
     complete_marker: Mapped[str] = mapped_column(String(255), nullable=False)
     committed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
