@@ -104,6 +104,9 @@ class SourceBindingRevisionRead(UTCModel):
     revision_number: int
     pinned_source_revision_id: str
     scope_config: dict
+    # Nullable for legacy source-only revisions; account-bound revisions carry
+    # the workspace used by the composite account FK.
+    workspace_id: str | None
     account_id: str | None
     created_by_user_id: str
     created_at: datetime

@@ -20,6 +20,7 @@ from sqlalchemy import (
     CheckConstraint,
     Enum,
     ForeignKey,
+    ForeignKeyConstraint,
     Integer,
     String,
     Text,
@@ -115,6 +116,12 @@ class SourceBindingRevision(TimestampMixin):
     __tablename__ = "source_binding_revisions"
     __table_args__ = (
         UniqueConstraint("source_binding_id", "revision_number"),
+        ForeignKeyConstraint(
+            ["workspace_id", "account_id"],
+            ["browser_accounts.workspace_id", "browser_accounts.id"],
+            ondelete="RESTRICT",
+            name="fk_source_binding_revision_account_workspace",
+        ),
     )
 
     source_binding_id: Mapped[str] = mapped_column(
@@ -125,6 +132,18 @@ class SourceBindingRevision(TimestampMixin):
         ForeignKey("source_revisions.id", ondelete="RESTRICT"), nullable=False
     )
     scope_config: Mapped[dict] = mapped_column(JSON, nullable=False)
+    workspace_id: Mapped[str | None] = mapped_column(
+        # Legacy source-only revisions remain nullable until a selected account
+        # is written by the binding migration consumer.
+        ForeignKey("workspaces.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    # Account selection is immutable at the binding-revision boundary. Runtime
+    # authentication and lease state remain independent mutable account facts.
+    account_id: Mapped[str | None] = mapped_column(
+        ForeignKey("browser_accounts.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
     created_by_user_id: Mapped[str] = mapped_column(
         ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
     )

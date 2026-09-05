@@ -367,6 +367,12 @@ class BrowserDurableCommand(TimestampMixin):
             ["browser_accounts.workspace_id", "browser_accounts.id"],
             ondelete="CASCADE",
         ),
+        ForeignKeyConstraint(
+            ["workspace_id", "session_id"],
+            ["browser_login_sessions.workspace_id", "browser_login_sessions.id"],
+            ondelete="SET NULL",
+            name="fk_browser_commands_session_workspace",
+        ),
     )
 
     workspace_id: Mapped[str] = mapped_column(
@@ -410,6 +416,12 @@ class BrowserProfileManifest(TimestampMixin):
             ["workspace_id", "account_id"],
             ["browser_accounts.workspace_id", "browser_accounts.id"],
             ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "command_id"],
+            ["browser_durable_commands.workspace_id", "browser_durable_commands.id"],
+            ondelete="RESTRICT",
+            name="fk_browser_profile_manifest_command_workspace",
         ),
     )
 
