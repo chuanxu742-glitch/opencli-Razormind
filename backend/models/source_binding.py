@@ -15,7 +15,16 @@ Neither is touched or redefined by this module; both remain as-is.
 
 from enum import StrEnum
 
-from sqlalchemy import JSON, Enum, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    CheckConstraint,
+    Enum,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.models.base import TimestampMixin
@@ -104,7 +113,9 @@ class SourceBindingRevision(TimestampMixin):
     """Immutable pin of an exact SourceRevision plus the frozen scope it authorizes."""
 
     __tablename__ = "source_binding_revisions"
-    __table_args__ = (UniqueConstraint("source_binding_id", "revision_number"),)
+    __table_args__ = (
+        UniqueConstraint("source_binding_id", "revision_number"),
+    )
 
     source_binding_id: Mapped[str] = mapped_column(
         ForeignKey("source_bindings.id", ondelete="CASCADE"), nullable=False, index=True
@@ -116,4 +127,9 @@ class SourceBindingRevision(TimestampMixin):
     scope_config: Mapped[dict] = mapped_column(JSON, nullable=False)
     created_by_user_id: Mapped[str] = mapped_column(
         ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    # Account selection is immutable at the binding-revision boundary. Runtime
+    # authentication and lease state remain independent mutable account facts.
+    account_id: Mapped[str | None] = mapped_column(
+        ForeignKey("browser_accounts.id", ondelete="RESTRICT"), nullable=True, index=True
     )
