@@ -221,6 +221,28 @@ opencli-Razormind (:3010 / :8031)
 
 远端机器默认使用 `19823` 端口。NAT 或跨网环境优先使用 WS 反向通道，无需在 Agent 侧开放入站端口。
 
+
+## 扫码账号集群验收边界
+
+账号登录态与匿名采集槽是两条不同的生命周期。账号任务必须以 `workspace_id`、`account_id`、固定 `SourceBindingRevision` 和真实会话租约执行；不能把未知 endpoint、共享 Profile 或空 Profile 当作账号恢复，也不能因节点失联自动换账号。
+
+跨进程验收使用专用 PostgreSQL 与 Redis。SQLite 只能验证单进程模型，不能证明 claim、租约 fencing、节点停机或双中心竞争。容量实验只接受显式 `TEST_DATABASE_URL_PG`，并在独立、可丢弃数据库中运行：
+
+~~~bash
+uv run python scripts/verify_browser_account_capacity.py \
+  --accounts 10000000 --page-size 100 --claim-size 100
+~~~
+
+脚本只创建临时容量表，输出 keyset 分页和有界 claim 的 `EXPLAIN`、p95、RSS 与进程计数；输出不能冒充真实平台吞吐、浏览器隔离、节点迁移或认证成功。未提供专用 PostgreSQL、节点 Profile 卷加密挂载及运维审查记录时，相关验收必须标记 blocked，不得用数据库布尔字段或节点自报替代。
+
+登录协议回归使用受控真实 HTTP fixture：
+
+~~~bash
+uv run --extra dev pytest --no-cov tests/integration/test_browser_account_login.py
+~~~
+
+该 fixture 仅证明多 Cookie 会话、二维码代际、挑战、跨 origin 候选和敏感表单不回显；它不是任何真实平台的支持声明。Docker daemon 不可用时不重试容器命令，不宣称 Docker 重启、物理扫码、设备绑定或 10M 容量已通过。
+
 ## 架构
 
 ~~~mermaid
