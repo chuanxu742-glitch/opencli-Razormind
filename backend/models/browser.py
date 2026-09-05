@@ -2,7 +2,20 @@ import hashlib
 from datetime import datetime
 from enum import StrEnum
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, event
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    ForeignKeyConstraint,
+    Index,
+    Integer,
+    JSON,
+    String,
+    Text,
+    UniqueConstraint,
+    event,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.models.base import TimestampMixin
@@ -233,6 +246,7 @@ class BrowserAccount(TimestampMixin):
         String(20), nullable=False, default=BrowserAccountStatus.DORMANT.value
     )
     revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    paused: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     status_reason_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
@@ -250,6 +264,11 @@ class BrowserLoginSession(TimestampMixin):
             "status IN ('opening', 'presenting', 'refreshing', 'verifying', 'challenge', "
             "'unknown', 'saving', 'saved', 'expired', 'closed', 'error')",
             name="ck_browser_login_sessions_status",
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "account_id"],
+            ["browser_accounts.workspace_id", "browser_accounts.id"],
+            ondelete="CASCADE",
         ),
     )
 
@@ -294,6 +313,11 @@ class BrowserAccountLease(TimestampMixin):
             "status IN ('active', 'expired', 'released', 'quarantined')",
             name="ck_browser_account_leases_status",
         ),
+        ForeignKeyConstraint(
+            ["workspace_id", "account_id"],
+            ["browser_accounts.workspace_id", "browser_accounts.id"],
+            ondelete="CASCADE",
+        ),
     )
 
     workspace_id: Mapped[str] = mapped_column(
@@ -337,6 +361,11 @@ class BrowserDurableCommand(TimestampMixin):
             "status IN ('queued', 'claimed', 'running', 'succeeded', 'failed', 'expired', 'cancelled')",
             name="ck_browser_commands_status",
         ),
+        ForeignKeyConstraint(
+            ["workspace_id", "account_id"],
+            ["browser_accounts.workspace_id", "browser_accounts.id"],
+            ondelete="CASCADE",
+        ),
     )
 
     workspace_id: Mapped[str] = mapped_column(
@@ -376,6 +405,11 @@ class BrowserProfileManifest(TimestampMixin):
             "password_inventory_status IN ('unknown', 'not_present', 'present', 'blocked', 'verified')",
             name="ck_browser_profile_manifests_password_inventory",
         ),
+        ForeignKeyConstraint(
+            ["workspace_id", "account_id"],
+            ["browser_accounts.workspace_id", "browser_accounts.id"],
+            ondelete="CASCADE",
+        ),
     )
 
     workspace_id: Mapped[str] = mapped_column(
@@ -402,3 +436,25 @@ class BrowserProfileManifest(TimestampMixin):
         String(20), nullable=False, default=ProfileInventoryStatus.UNKNOWN.value
     )
     state: Mapped[str] = mapped_column(String(20), nullable=False, default="committed")
+
+Index(
+    "ix_browser_accounts_workspace_status_id",
+    BrowserAccount.workspace_id,
+    BrowserAccount.status,
+    BrowserAccount.id,
+)
+Index(
+    "ix_browser_durable_commands_node_status_available_id",
+    BrowserDurableCommand.node_id,
+    BrowserDurableCommand.status,
+    BrowserDurableCommand.available_at,
+    BrowserDurableCommand.id,
+)
+Index(
+    "uq_browser_account_leases_active_account",
+    BrowserAccountLease.workspace_id,
+    BrowserAccountLease.account_id,
+    unique=True,
+    sqlite_where=BrowserAccountLease.status == BrowserLeaseStatus.ACTIVE.value,
+    postgresql_where=BrowserAccountLease.status == BrowserLeaseStatus.ACTIVE.value,
+)
