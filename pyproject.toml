@@ -131,3 +131,8 @@ ignore_missing_imports = true
 
 [tool.vercel]
 entrypoint = "backend.main:app"
+
+[dependency-groups]
+dev = [
+    "qrcode>=8.2",
+]
