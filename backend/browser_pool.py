@@ -101,18 +101,14 @@ class LocalBrowserPool:
             or self.get_profile_kind(endpoint) != required_profile_kind
         ):
             raise NoCleanProfileError()
-        if endpoint:
+        if endpoint is not None:
             if endpoint not in self._slots:
-                logger.warning(
-                    "Requested Chrome endpoint %r not in pool; falling back to any instance.",
-                    endpoint,
-                )
-                ep = await self._acquire_any()
-            else:
-                if not self.is_ready(endpoint):
-                    raise NoReadyBrowserSlotError()
-                ep = await self._slots[endpoint].get()
-                logger.debug("Chrome acquired (routed): %s", ep)
+                logger.warning("Requested Chrome endpoint %r is not registered.", endpoint)
+                raise NoReadyBrowserSlotError()
+            if not self.is_ready(endpoint):
+                raise NoReadyBrowserSlotError()
+            ep = await self._slots[endpoint].get()
+            logger.debug("Chrome acquired (routed): %s", ep)
         else:
             ep = await self._acquire_any()
 
@@ -164,20 +160,34 @@ class LocalBrowserPool:
             asyncio.get_event_loop().create_task(slot.get()): ep for ep, slot in ready_slots.items()
         }
         done, pending = await asyncio.wait(tasks.keys(), return_when=asyncio.FIRST_COMPLETED)
+
+        winner = next(iter(done))
+        winner_ep = tasks[winner]
         for task in pending:
             task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        # Multiple queue.get() tasks may complete in the same loop turn.  Keep
+        # exactly one acquired token and put every losing token back immediately.
+        for task in done:
+            if task is winner:
+                continue
             try:
-                await task
-            except asyncio.CancelledError:
-                pass
-        ep = tasks[next(iter(done))]
+                token = task.result()
+            except (asyncio.CancelledError, Exception):
+                continue
+            slot = self._slots.get(tasks[task])
+            if slot is not None and not slot.full():
+                slot.put_nowait(token)
+
         logger.debug(
             "Chrome acquired (any): %s (available: %d/%d)",
-            ep,
+            winner_ep,
             self.available,
             self._total,
         )
-        return ep
+        return winner_ep
 
     @property
     def total(self) -> int:
@@ -296,7 +306,6 @@ class LocalBrowserPool:
         self._total -= 1
         logger.info("BrowserPool: removed endpoint %s (total: %d)", endpoint, self._total)
 
-
 class RedisBrowserPool:
     """Distributed pool backed by Redis lists (BLPOP/RPUSH).
 
@@ -340,6 +349,9 @@ class RedisBrowserPool:
         self._redis_url = redis_url
         self._total = len(endpoints)
         self._modes: dict[str, str] = {ep: "bridge" for ep in endpoints}
+        self._agent_urls: dict[str, str | None] = {ep: None for ep in endpoints}
+        self._agent_protocols: dict[str, str | None] = {ep: None for ep in endpoints}
+        self._node_types: dict[str, str] = {ep: "docker" for ep in endpoints}
         self._profile_kinds: dict[str, str] = {ep: "authenticated" for ep in endpoints}
         self._runtime_states: dict[str, str] = {ep: "LEGACY" for ep in endpoints}
         self._profile_names: dict[str, str] = {ep: ep for ep in endpoints}
@@ -380,6 +392,9 @@ class RedisBrowserPool:
             self._endpoints.append(endpoint)
             self._total += 1
             self._modes.setdefault(endpoint, "bridge")
+            self._agent_urls.setdefault(endpoint, None)
+            self._agent_protocols.setdefault(endpoint, None)
+            self._node_types.setdefault(endpoint, "docker")
             self._profile_kinds.setdefault(endpoint, "authenticated")
 
         async with self._client() as r:
@@ -404,33 +419,48 @@ class RedisBrowserPool:
             or self.get_profile_kind(endpoint) != required_profile_kind
         ):
             raise NoCleanProfileError()
+        if endpoint is not None and endpoint not in self._endpoints:
+            logger.warning("Requested Chrome endpoint %r is not registered.", endpoint)
+            raise NoReadyBrowserSlotError()
         if endpoint is not None and not self.is_ready(endpoint):
             raise NoReadyBrowserSlotError()
-        candidates = [
-            candidate
-            for candidate in ([endpoint] if endpoint else list(self._endpoints))
-            if candidate is not None and self.is_ready(candidate)
-        ]
+
+        candidates = (
+            [endpoint]
+            if endpoint is not None
+            else [candidate for candidate in self._endpoints if self.is_ready(candidate)]
+        )
         if not candidates:
             raise NoReadyBrowserSlotError()
+        queue_key = self._ep_key(endpoint) if endpoint is not None else self._POOL_KEY
         deadline = time.monotonic() + self._ACQUIRE_TIMEOUT_SECONDS
         ep = None
         owner = None
         while time.monotonic() < deadline and ep is None:
-            for candidate in candidates:
-                async with self._client() as r:
-                    fence = await r.incr(self._fence_key(candidate))
-                    candidate_owner = f"{fence}:{uuid4()}"
-                    acquired = await r.set(
-                        self._lease_key(candidate),
-                        candidate_owner,
-                        nx=True,
-                        px=self._LEASE_TTL_MS,
-                    )
+            timeout = max(1, int(deadline - time.monotonic()))
+            async with self._client() as r:
+                popped = await r.blpop(queue_key, timeout=timeout)
+                if not popped:
+                    continue
+                _, candidate = popped
+                if candidate not in candidates:
+                    await r.rpush(queue_key, candidate)
+                    continue
+                fence = await r.incr(self._fence_key(candidate))
+                candidate_owner = f"{fence}:{uuid4()}"
+                acquired = await r.set(
+                    self._lease_key(candidate),
+                    candidate_owner,
+                    nx=True,
+                    px=self._LEASE_TTL_MS,
+                )
                 if acquired:
                     ep = candidate
                     owner = candidate_owner
-                    break
+                else:
+                    # Redis lists are the token transport; restore a token
+                    # whenever the endpoint lease was won by another worker.
+                    await r.rpush(queue_key, candidate)
             if ep is None:
                 await asyncio.sleep(self._RETRY_SECONDS)
         if ep is None or owner is None:
@@ -461,7 +491,6 @@ class RedisBrowserPool:
                     return
 
         renewal_task = asyncio.create_task(renew())
-
         try:
             yield ep
         finally:
@@ -475,7 +504,9 @@ class RedisBrowserPool:
                     self._lease_key(ep),
                     owner,
                 )
+                await r.rpush(queue_key, ep)
             logger.debug("Chrome lease released (Redis): %s", ep)
+
 
     @property
     def total(self) -> int:
@@ -497,6 +528,30 @@ class RedisBrowserPool:
 
     def set_mode(self, endpoint: str, mode: str) -> None:
         self._modes[endpoint] = mode
+
+    def get_agent_url(self, endpoint: str) -> str | None:
+        """Return the agent HTTP base URL for the given endpoint."""
+        return self._agent_urls.get(endpoint)
+
+    def set_agent_url(self, endpoint: str, agent_url: str | None) -> None:
+        """Update the agent URL for an endpoint at runtime."""
+        self._agent_urls[endpoint] = agent_url
+
+    def get_agent_protocol(self, endpoint: str) -> str | None:
+        """Return the agent protocol for the given endpoint ("http", "ws", or None)."""
+        return self._agent_protocols.get(endpoint)
+
+    def set_agent_protocol(self, endpoint: str, protocol: str | None) -> None:
+        """Update the agent protocol for an endpoint at runtime."""
+        self._agent_protocols[endpoint] = protocol
+
+    def get_node_type(self, endpoint: str) -> str:
+        """Return deployment type: 'docker' or 'shell'."""
+        return self._node_types.get(endpoint, "docker")
+
+    def set_node_type(self, endpoint: str, node_type: str) -> None:
+        """Update the node deployment type for an endpoint."""
+        self._node_types[endpoint] = node_type
 
     def get_profile_kind(self, endpoint: str) -> str:
         return self._profile_kinds.get(endpoint, "authenticated")

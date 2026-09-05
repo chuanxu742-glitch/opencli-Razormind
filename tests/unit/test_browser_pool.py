@@ -198,11 +198,9 @@ async def test_acquire_any_concurrent_gets_endpoints():
             await asyncio.sleep(0.01)  # hold briefly
 
     await asyncio.gather(grab(), grab())
-    # Both acquisitions should have succeeded
     assert len(acquired) == 2
-    # Each acquired endpoint should be valid
-    for ep in acquired:
-        assert ep in ["http://chrome:9222", "http://chrome-2:9222"]
+    assert set(acquired) == {"http://chrome:9222", "http://chrome-2:9222"}
+    assert pool.available == 2
 
 
 # ── RedisBrowserPool properties ────────────────────────────────────────────────
@@ -222,6 +220,21 @@ def test_redis_pool_properties():
     assert pool.available_for("http://nonexistent:9222") is False
 
 
+def test_redis_pool_metadata_matches_local_protocol():
+    from backend.browser_pool import RedisBrowserPool
+
+    pool = RedisBrowserPool(["http://chrome:9222"], "redis://localhost:6379")
+    pool.set_agent_url("http://chrome:9222", "http://agent:8080")
+    pool.set_agent_protocol("http://chrome:9222", "http")
+    pool.set_node_type("http://chrome:9222", "shell")
+
+    assert pool.get_agent_url("http://chrome:9222") == "http://agent:8080"
+    assert pool.get_agent_protocol("http://chrome:9222") == "http"
+    assert pool.get_node_type("http://chrome:9222") == "shell"
+
+
+
+
 def test_redis_pool_ep_key():
     """_ep_key generates safe Redis keys from endpoint URLs."""
     from backend.browser_pool import RedisBrowserPool
@@ -231,15 +244,19 @@ def test_redis_pool_ep_key():
     assert key.startswith("browser_pool:ep:")
 
 
-# ── LocalBrowserPool: acquire fallback for unknown endpoint ──────────────────
+# ── LocalBrowserPool: explicit unknown endpoint ───────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_acquire_unknown_endpoint_falls_back_to_any():
-    """Requesting an endpoint not in pool falls back to any available instance."""
+async def test_acquire_unknown_endpoint_fails_closed():
+    """Requesting an unknown endpoint must not acquire another instance."""
+    from backend.browser_pool import NoReadyBrowserSlotError
+
     p = LocalBrowserPool(["http://chrome:9222"])
-    async with p.acquire("http://not-in-pool:9222") as ep:
-        assert ep == "http://chrome:9222"
+    with pytest.raises(NoReadyBrowserSlotError):
+        async with p.acquire("http://not-in-pool:9222"):
+            pass
+    assert p.available == 1
 
 
 @pytest.mark.asyncio
@@ -384,7 +401,10 @@ async def test_redis_pool_acquire_any():
 
     ep = "http://chrome:9222"
     mock_redis = AsyncMock()
-    mock_redis.blpop = AsyncMock(return_value=("browser_pool:available", ep))
+    mock_redis.blpop = AsyncMock(return_value=("browser_pool:endpoints", ep))
+    mock_redis.incr = AsyncMock(return_value=1)
+    mock_redis.set = AsyncMock(return_value=True)
+    mock_redis.eval = AsyncMock(return_value=1)
     mock_redis.rpush = AsyncMock()
     mock_redis_cm = AsyncMock()
     mock_redis_cm.__aenter__ = AsyncMock(return_value=mock_redis)
@@ -405,6 +425,9 @@ async def test_redis_pool_acquire_routed():
     ep = "http://chrome:9222"
     mock_redis = AsyncMock()
     mock_redis.blpop = AsyncMock(return_value=(f"browser_pool:ep:{ep}", ep))
+    mock_redis.incr = AsyncMock(return_value=1)
+    mock_redis.set = AsyncMock(return_value=True)
+    mock_redis.eval = AsyncMock(return_value=1)
     mock_redis.rpush = AsyncMock()
     mock_redis_cm = AsyncMock()
     mock_redis_cm.__aenter__ = AsyncMock(return_value=mock_redis)
@@ -423,6 +446,7 @@ async def test_redis_pool_acquire_timeout(monkeypatch):
     from backend.browser_pool import RedisBrowserPool
 
     mock_redis = AsyncMock()
+    mock_redis.blpop = AsyncMock(return_value=None)
     mock_redis.set = AsyncMock(return_value=False)
     mock_redis_cm = AsyncMock()
     mock_redis_cm.__aenter__ = AsyncMock(return_value=mock_redis)
@@ -444,8 +468,14 @@ async def test_redis_routed_and_unrouted_share_one_endpoint_lease(monkeypatch):
 
     endpoint = "http://chrome:9222"
     redis = AsyncMock()
+    responses = iter([("browser_pool:ep:route", endpoint)])
+    redis.blpop = AsyncMock(
+        side_effect=lambda *_args, **_kwargs: next(responses, None)
+    )
+    redis.incr = AsyncMock(return_value=1)
     redis.set = AsyncMock(side_effect=[True, *([False] * 50)])
     redis.eval = AsyncMock(return_value=1)
+    redis.rpush = AsyncMock()
     redis_cm = AsyncMock()
     redis_cm.__aenter__ = AsyncMock(return_value=redis)
     redis_cm.__aexit__ = AsyncMock(return_value=False)
