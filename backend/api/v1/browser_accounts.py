@@ -1,0 +1,437 @@
+"""Workspace-scoped browser-account and login-session API."""
+
+from __future__ import annotations
+
+from typing import Literal
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from backend.database import get_db
+from backend.models.browser import BrowserAccountStatus
+from backend.schemas.browser_account import (
+    BrowserAccountCreate,
+    BrowserAccountRead,
+    BrowserAccountUpdate,
+    BrowserLoginSessionRead,
+    ExternalIdentityV1,
+    PortalAuthorizationFactsV1,
+)
+from backend.schemas.common import ApiResponse
+from backend.security.identity import RequestIdentity, get_request_identity
+from backend.security.workspace_rbac import (
+    WorkspaceAccess,
+    WorkspacePermission,
+    get_workspace_access,
+    require_permission,
+)
+from backend.services import browser_account_service
+
+
+router = APIRouter(
+    prefix="/workspaces/{workspace_id}/browser-accounts",
+    tags=["browser-accounts"],
+)
+
+
+class LoginSessionCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    purpose: Literal["login", "execution"] = "login"
+    execution_id: str | None = Field(default=None, min_length=1, max_length=128)
+    expires_in_seconds: int = Field(default=1_800, ge=60, le=1_800)
+    takeover: bool = False
+
+
+class LoginSessionRefresh(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_view_generation: int = Field(ge=0)
+
+
+class LoginSessionConfirm(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: int = Field(ge=0)
+    expected_view_generation: int = Field(ge=0)
+    platform_identity: ExternalIdentityV1 | None = None
+
+
+class LoginSessionClose(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: Literal["completed", "cancelled", "expired", "error"] = "cancelled"
+
+
+class AccountControlRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: int = Field(ge=0)
+
+
+class AccountMigrationRequest(AccountControlRequest):
+    target_node_id: str = Field(min_length=1, max_length=36)
+    snapshot_ref: str = Field(min_length=1, max_length=255)
+
+
+def _http_error(exc: browser_account_service.BrowserAccountError) -> HTTPException:
+    return HTTPException(
+        status_code=exc.status_code,
+        detail={"code": exc.code, "message": str(exc)},
+    )
+
+
+def _account_read(account: object) -> BrowserAccountRead:
+    return BrowserAccountRead.model_validate(account)
+
+
+def _session_read(session: object) -> BrowserLoginSessionRead:
+    return BrowserLoginSessionRead.model_validate(session)
+
+
+def _require_operator_or_manager(access: WorkspaceAccess) -> None:
+    role = getattr(access.role, "value", access.role)
+    if role not in {"admin", "maintainer", "operator"}:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Browser account operation permission required")
+
+
+@router.get("", response_model=ApiResponse[list[BrowserAccountRead]])
+async def list_browser_accounts(
+    workspace_id: str,
+    response: Response,
+    limit: int = Query(default=50, ge=1, le=200),
+    after_id: str | None = Query(default=None, min_length=1, max_length=36),
+    cursor: str | None = Query(default=None, min_length=1, max_length=36),
+    status_filter: BrowserAccountStatus | None = Query(default=None, alias="status"),
+    identity: RequestIdentity = Depends(get_request_identity),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse:
+    access = await get_workspace_access(db, workspace_id, identity)
+    require_permission(access, WorkspacePermission.READ)
+    try:
+        accounts, next_cursor = await browser_account_service.list_browser_accounts(
+            db,
+            workspace_id,
+            limit=limit,
+            after_id=after_id or cursor,
+            status=status_filter,
+        )
+    except browser_account_service.BrowserAccountError as exc:
+        raise _http_error(exc) from exc
+    if next_cursor:
+        response.headers["X-Next-Cursor"] = next_cursor
+    return ApiResponse.ok([_account_read(account) for account in accounts])
+
+
+@router.post("", response_model=ApiResponse[BrowserAccountRead], status_code=status.HTTP_201_CREATED)
+async def create_browser_account(
+    workspace_id: str,
+    body: BrowserAccountCreate,
+    identity: RequestIdentity = Depends(get_request_identity),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse:
+    access = await get_workspace_access(db, workspace_id, identity)
+    require_permission(access, WorkspacePermission.MANAGE_CONFIGURATION)
+    try:
+        account = await browser_account_service.create_browser_account(db, workspace_id, body)
+    except browser_account_service.BrowserAccountError as exc:
+        raise _http_error(exc) from exc
+    return ApiResponse.ok(_account_read(account))
+
+
+@router.get("/{account_id}", response_model=ApiResponse[BrowserAccountRead])
+async def get_browser_account(
+    workspace_id: str,
+    account_id: str,
+    identity: RequestIdentity = Depends(get_request_identity),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse:
+    access = await get_workspace_access(db, workspace_id, identity)
+    require_permission(access, WorkspacePermission.READ)
+    try:
+        account = await browser_account_service.get_browser_account(db, workspace_id, account_id)
+    except browser_account_service.BrowserAccountError as exc:
+        raise _http_error(exc) from exc
+    return ApiResponse.ok(_account_read(account))
+
+
+@router.patch("/{account_id}", response_model=ApiResponse[BrowserAccountRead])
+async def update_browser_account(
+    workspace_id: str,
+    account_id: str,
+    body: BrowserAccountUpdate,
+    identity: RequestIdentity = Depends(get_request_identity),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse:
+    access = await get_workspace_access(db, workspace_id, identity)
+    require_permission(access, WorkspacePermission.MANAGE_CONFIGURATION)
+    try:
+        account = await browser_account_service.update_browser_account(
+            db, workspace_id, account_id, body, confirmed_by=access.user_id
+        )
+    except browser_account_service.BrowserAccountError as exc:
+        raise _http_error(exc) from exc
+    return ApiResponse.ok(_account_read(account))
+
+
+@router.post("/{account_id}/auth-required", response_model=ApiResponse[BrowserAccountRead])
+async def set_browser_account_auth_required(
+    workspace_id: str,
+    account_id: str,
+    body: AccountControlRequest,
+    identity: RequestIdentity = Depends(get_request_identity),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse:
+    access = await get_workspace_access(db, workspace_id, identity)
+    require_permission(access, WorkspacePermission.MANAGE_CONFIGURATION)
+    try:
+        account = await browser_account_service.mark_auth_required(
+            db, workspace_id, account_id, body.expected_revision
+        )
+    except browser_account_service.BrowserAccountError as exc:
+        raise _http_error(exc) from exc
+    return ApiResponse.ok(_account_read(account))
+
+
+@router.post("/{account_id}/suspend", response_model=ApiResponse[BrowserAccountRead])
+async def suspend_browser_account(
+    workspace_id: str,
+    account_id: str,
+    body: AccountControlRequest,
+    identity: RequestIdentity = Depends(get_request_identity),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse:
+    access = await get_workspace_access(db, workspace_id, identity)
+    require_permission(access, WorkspacePermission.MANAGE_CONFIGURATION)
+    try:
+        account = await browser_account_service.suspend_browser_account(
+            db, workspace_id, account_id, body.expected_revision
+        )
+    except browser_account_service.BrowserAccountError as exc:
+        raise _http_error(exc) from exc
+    return ApiResponse.ok(_account_read(account))
+
+
+@router.post("/{account_id}/resume", response_model=ApiResponse[BrowserAccountRead])
+async def resume_browser_account(
+    workspace_id: str,
+    account_id: str,
+    body: AccountControlRequest,
+    identity: RequestIdentity = Depends(get_request_identity),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse:
+    access = await get_workspace_access(db, workspace_id, identity)
+    require_permission(access, WorkspacePermission.MANAGE_CONFIGURATION)
+    try:
+        account = await browser_account_service.resume_browser_account(
+            db, workspace_id, account_id, body.expected_revision
+        )
+    except browser_account_service.BrowserAccountError as exc:
+        raise _http_error(exc) from exc
+    return ApiResponse.ok(_account_read(account))
+
+
+@router.post("/{account_id}/migrate", response_model=ApiResponse[BrowserAccountRead])
+async def migrate_browser_account(
+    workspace_id: str,
+    account_id: str,
+    body: AccountMigrationRequest,
+    identity: RequestIdentity = Depends(get_request_identity),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse:
+    """Queue explicit migration; node failure never silently switches ownership."""
+
+    access = await get_workspace_access(db, workspace_id, identity)
+    require_permission(access, WorkspacePermission.MANAGE_CONFIGURATION)
+    try:
+        account = await browser_account_service.queue_account_migration(
+            db,
+            workspace_id,
+            account_id,
+            target_node_id=body.target_node_id,
+            snapshot_ref=body.snapshot_ref,
+            expected_revision=body.expected_revision,
+        )
+    except browser_account_service.BrowserAccountError as exc:
+        raise _http_error(exc) from exc
+    return ApiResponse.ok(_account_read(account))
+
+
+@router.get("/{account_id}/login-sessions", response_model=ApiResponse[list[BrowserLoginSessionRead]])
+async def list_account_login_sessions(
+    workspace_id: str,
+    account_id: str,
+    limit: int = Query(default=50, ge=1, le=200),
+    identity: RequestIdentity = Depends(get_request_identity),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse:
+    access = await get_workspace_access(db, workspace_id, identity)
+    require_permission(access, WorkspacePermission.READ)
+    try:
+        sessions = await browser_account_service.list_login_sessions(
+            db, workspace_id, account_id, limit=limit
+        )
+    except browser_account_service.BrowserAccountError as exc:
+        raise _http_error(exc) from exc
+    return ApiResponse.ok([_session_read(session) for session in sessions])
+
+
+@router.post("/{account_id}/login-sessions", response_model=ApiResponse[BrowserLoginSessionRead], status_code=status.HTTP_201_CREATED)
+async def create_account_login_session(
+    workspace_id: str,
+    account_id: str,
+    body: LoginSessionCreate | None = None,
+    identity: RequestIdentity = Depends(get_request_identity),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse:
+    access = await get_workspace_access(db, workspace_id, identity)
+    _require_operator_or_manager(access)
+    payload = body or LoginSessionCreate()
+    try:
+        session = await browser_account_service.create_login_session(
+            db,
+            workspace_id,
+            account_id,
+            purpose=payload.purpose,
+            execution_id=payload.execution_id,
+            expires_in_seconds=payload.expires_in_seconds,
+            takeover=payload.takeover,
+        )
+    except browser_account_service.BrowserAccountError as exc:
+        raise _http_error(exc) from exc
+    return ApiResponse.ok(_session_read(session))
+
+
+@router.get("/{account_id}/login-sessions/{session_id}", response_model=ApiResponse[BrowserLoginSessionRead])
+async def get_account_login_session(
+    workspace_id: str,
+    account_id: str,
+    session_id: str,
+    identity: RequestIdentity = Depends(get_request_identity),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse:
+    access = await get_workspace_access(db, workspace_id, identity)
+    require_permission(access, WorkspacePermission.READ)
+    try:
+        session = await browser_account_service.get_login_session(
+            db, workspace_id, account_id, session_id
+        )
+    except browser_account_service.BrowserAccountError as exc:
+        raise _http_error(exc) from exc
+    return ApiResponse.ok(_session_read(session))
+
+
+@router.post("/{account_id}/login-sessions/{session_id}/takeover", response_model=ApiResponse[BrowserLoginSessionRead])
+async def takeover_account_login_session(
+    workspace_id: str,
+    account_id: str,
+    session_id: str,
+    identity: RequestIdentity = Depends(get_request_identity),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse:
+    access = await get_workspace_access(db, workspace_id, identity)
+    _require_operator_or_manager(access)
+    try:
+        session = await browser_account_service.takeover_login_session(
+            db, workspace_id, account_id, session_id
+        )
+    except browser_account_service.BrowserAccountError as exc:
+        raise _http_error(exc) from exc
+    return ApiResponse.ok(_session_read(session))
+
+
+@router.post("/{account_id}/login-sessions/{session_id}/refresh", response_model=ApiResponse[BrowserLoginSessionRead])
+async def refresh_account_login_session(
+    workspace_id: str,
+    account_id: str,
+    session_id: str,
+    body: LoginSessionRefresh,
+    identity: RequestIdentity = Depends(get_request_identity),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse:
+    access = await get_workspace_access(db, workspace_id, identity)
+    _require_operator_or_manager(access)
+    try:
+        session = await browser_account_service.refresh_login_session(
+            db,
+            workspace_id,
+            account_id,
+            session_id,
+            expected_view_generation=body.expected_view_generation,
+        )
+    except browser_account_service.BrowserAccountError as exc:
+        raise _http_error(exc) from exc
+    return ApiResponse.ok(_session_read(session))
+
+
+@router.post("/{account_id}/login-sessions/{session_id}/confirm", response_model=ApiResponse[BrowserLoginSessionRead])
+async def confirm_account_login_session(
+    workspace_id: str,
+    account_id: str,
+    session_id: str,
+    body: LoginSessionConfirm,
+    identity: RequestIdentity = Depends(get_request_identity),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse:
+    access = await get_workspace_access(db, workspace_id, identity)
+    _require_operator_or_manager(access)
+    try:
+        session = await browser_account_service.confirm_login_session(
+            db,
+            workspace_id,
+            account_id,
+            session_id,
+            confirmed_by=access.user_id,
+            expected_revision=body.expected_revision,
+            expected_view_generation=body.expected_view_generation,
+            platform_identity=body.platform_identity,
+        )
+    except browser_account_service.BrowserAccountError as exc:
+        raise _http_error(exc) from exc
+    return ApiResponse.ok(_session_read(session))
+
+
+@router.post("/{account_id}/login-sessions/{session_id}/close", response_model=ApiResponse[BrowserLoginSessionRead])
+async def close_account_login_session(
+    workspace_id: str,
+    account_id: str,
+    session_id: str,
+    body: LoginSessionClose,
+    identity: RequestIdentity = Depends(get_request_identity),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse:
+    access = await get_workspace_access(db, workspace_id, identity)
+    _require_operator_or_manager(access)
+    try:
+        session = await browser_account_service.close_login_session(
+            db, workspace_id, account_id, session_id, reason=body.reason
+        )
+    except browser_account_service.BrowserAccountError as exc:
+        raise _http_error(exc) from exc
+    return ApiResponse.ok(_session_read(session))
+
+
+@router.get(
+    "/{account_id}/login-sessions/{session_id}/authorization-facts",
+    response_model=ApiResponse[PortalAuthorizationFactsV1],
+)
+async def get_login_authorization_facts(
+    workspace_id: str,
+    account_id: str,
+    session_id: str,
+    identity: RequestIdentity = Depends(get_request_identity),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse:
+    access = await get_workspace_access(db, workspace_id, identity)
+    require_permission(access, WorkspacePermission.READ)
+    try:
+        facts = await browser_account_service.get_portal_authorization_facts(
+            db, workspace_id, account_id, session_id, subject=identity.subject
+        )
+    except browser_account_service.BrowserAccountError as exc:
+        raise _http_error(exc) from exc
+    return ApiResponse.ok(facts)
+
+
+__all__ = ["router"]

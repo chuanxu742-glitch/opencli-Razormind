@@ -8,6 +8,7 @@ from backend.api.v1 import (
     automations,
     browser_act,
     browser_containers,
+    browser_accounts,
     browser_spaces,
     browsers,
     chat,
@@ -68,6 +69,7 @@ v1_router.include_router(odp_reconciliation.router)
 v1_router.include_router(image_studio.router)
 v1_router.include_router(browser_act.router)
 v1_router.include_router(browser_containers.router)
+v1_router.include_router(browser_accounts.router)
 v1_router.include_router(browsers.router)
 v1_router.include_router(browsers.runtime_router)
 v1_router.include_router(chat.router)
