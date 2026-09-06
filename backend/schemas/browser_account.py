@@ -771,7 +771,7 @@ class PortalClipV1(_ContractModel):
 
 
 class PortalRegionFocusV1(_ContractModel):
-    """L-produced allowlist carried unchanged into the R owner boundary."""
+    """L-produced allowlist consumed unchanged by the R owner boundary."""
 
     contract_version: Literal[1] = QRAC2_CONTRACT_VERSION
     target: SessionTargetV1
@@ -785,6 +785,131 @@ class PortalRegionFocusV1(_ContractModel):
         self.target.require_complete()
         if self.region_kind == "form" and self.focused_field_ref is None:
             raise ValueError("form projection requires a focused field")
+        return self
+
+
+class PortalPerceptionElementV1(_ContractModel):
+    """Common sensitive-mode perception row; values never cross this boundary."""
+
+    ref: str = Field(min_length=1, max_length=64)
+    role: str = Field(min_length=1, max_length=64)
+    name: str = Field(max_length=200)
+    value: None = None
+
+
+class PortalPerceptionV1(_ContractModel):
+    """Frozen perception output shared by the model and record handoff."""
+
+    contract_version: Literal[1] = QRAC2_CONTRACT_VERSION
+    target: SessionTargetV1
+    view_generation: int = Field(ge=0)
+    elements: list[PortalPerceptionElementV1] = Field(max_length=50)
+    region_focus: PortalRegionFocusV1
+
+    @model_validator(mode="after")
+    def validate_perception_lineage(self) -> "PortalPerceptionV1":
+        self.target.require_complete()
+        if self.region_focus.target != self.target:
+            raise ValueError("perception region focus target mismatch")
+        if self.region_focus.view_generation != self.view_generation:
+            raise ValueError("perception region focus generation mismatch")
+        return self
+
+
+class PortalModelDecisionV1(_ContractModel):
+    """Model handoff bound to the exact common perception generation."""
+
+    contract_version: Literal[1] = QRAC2_CONTRACT_VERSION
+    target: SessionTargetV1
+    view_generation: int = Field(ge=0)
+    action: Literal["observe", "focus", "input", "refresh", "takeover", "complete", "challenge"]
+    focused_field_ref: str | None = Field(default=None, min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def validate_model_lineage(self) -> "PortalModelDecisionV1":
+        self.target.require_complete()
+        if self.action in {"focus", "input"} and self.focused_field_ref is None:
+            raise ValueError("focused model action requires a field")
+        return self
+
+
+class PortalRecordSessionContractV1(_ContractModel):
+    """RecordSession registration and completion facts for the same page."""
+
+    contract_version: Literal[1] = QRAC2_CONTRACT_VERSION
+    record_session_id: str = Field(min_length=1, max_length=36)
+    target: SessionTargetV1
+    view_generation: int = Field(ge=0)
+    status: Literal["active", "completed", "aborted"]
+    page_bound: bool
+    listener_installed: bool
+    listener_revoked: bool
+    pending_events_drained: bool
+
+    @model_validator(mode="after")
+    def validate_completion(self) -> "PortalRecordSessionContractV1":
+        self.target.require_complete()
+        if self.status == "active" and (
+            not self.page_bound or not self.listener_installed or self.listener_revoked
+        ):
+            raise ValueError("active record session must have a live page listener")
+        if self.status in {"completed", "aborted"} and (
+            not self.listener_revoked or not self.pending_events_drained
+        ):
+            raise ValueError("record completion requires revoked listener and drained events")
+        return self
+
+
+class PortalPreEntryHandoffV1(_ContractModel):
+    """Formal pre-entry handoff shared by perception, model, record, and R."""
+
+    contract_version: Literal[1] = QRAC2_CONTRACT_VERSION
+    guard: CommandExecutionGuardV1
+    binding: SensitiveSessionBindingV1
+    perception: PortalPerceptionV1
+    model_decision: PortalModelDecisionV1
+    record: PortalRecordSessionContractV1
+
+    @model_validator(mode="after")
+    def validate_handoff_lineage(self) -> "PortalPreEntryHandoffV1":
+        target = self.binding.target
+        if self.guard.session.workspace_id != self.binding.account_ref.workspace_id:
+            raise ValueError("pre-entry guard workspace mismatch")
+        if self.guard.session.account_id != self.binding.account_ref.account_id:
+            raise ValueError("pre-entry guard account mismatch")
+        if self.guard.session.session_id != self.binding.session_id:
+            raise ValueError("pre-entry guard session mismatch")
+        if self.guard.session.epoch != self.binding.epoch:
+            raise ValueError("pre-entry guard epoch mismatch")
+        if self.guard.session.target != target:
+            raise ValueError("pre-entry guard target mismatch")
+        if self.guard.session.view_generation != self.binding.view_generation:
+            raise ValueError("pre-entry guard generation mismatch")
+        revision_id = self.binding.account_ref.source_binding_revision_id
+        if revision_id is not None and self.guard.command.binding_revision_id != revision_id:
+            raise ValueError("pre-entry source binding revision mismatch")
+        if (
+            self.perception.target != target
+            or self.model_decision.target != target
+            or self.record.target != target
+        ):
+            raise ValueError("pre-entry handoff target mismatch")
+        generation = self.binding.view_generation
+        if any(
+            value != generation
+            for value in (
+                self.perception.view_generation,
+                self.model_decision.view_generation,
+                self.record.view_generation,
+            )
+        ):
+            raise ValueError("pre-entry handoff generation mismatch")
+        if self.binding.record_session_id != self.record.record_session_id:
+            raise ValueError("pre-entry record session mismatch")
+        if self.model_decision.action == "input":
+            focus = self.perception.region_focus
+            if self.model_decision.focused_field_ref != focus.focused_field_ref:
+                raise ValueError("model input is outside approved focus")
         return self
 
 
@@ -1043,6 +1168,8 @@ class PortalTicketIssuedV1(_ContractModel):
     account_ref: AccountRef
     session_id: str = Field(min_length=1, max_length=36)
     session_revision: int = Field(ge=0)
+    # Public correlation id; the ticket secret remains body-only and transient.
+    ticket_id: str = Field(min_length=1, max_length=36)
     ticket: SecretStr = Field(min_length=16, max_length=512)
     csrf_token: SecretStr = Field(min_length=16, max_length=512)
     issued_at: datetime
@@ -1057,6 +1184,16 @@ class PortalTicketIssuedV1(_ContractModel):
         if (self.hard_expires_at - self.issued_at).total_seconds() > 1800:
             raise ValueError("portal ticket hard lifetime exceeds thirty minutes")
         return self
+
+
+class PortalTicketConsumeCASV1(_ContractModel):
+    """Atomic redemption predicate owned by the portal persistence service."""
+
+    ticket_id: str = Field(min_length=1, max_length=36)
+    account_ref: AccountRef
+    session_id: str = Field(min_length=1, max_length=36)
+    expected_session_revision: int = Field(ge=0)
+    expected_consumed_at: None = None
 
 
 class PortalTicketRecordV1(_ContractModel):
@@ -1105,6 +1242,7 @@ class PortalTicketGrantV1(_ContractModel):
     http_status: Literal[200] = 200
     workspace_id: str = Field(min_length=1, max_length=36)
     account_id: str = Field(min_length=1, max_length=36)
+    ticket_id: str = Field(min_length=1, max_length=36)
     session_revision: int = Field(ge=0)
     session_id: str = Field(min_length=1, max_length=36)
     issued_at: datetime
@@ -1112,6 +1250,7 @@ class PortalTicketGrantV1(_ContractModel):
     hard_expires_at: datetime
     cookie_name: str = Field(min_length=1, max_length=64)
     websocket_path: str = Field(min_length=1, max_length=512)
+    consume_cas: PortalTicketConsumeCASV1
     # HTTP-only cookie attributes are part of the boundary, not implementation detail.
     cookie_http_only: Literal[True] = True
     cookie_secure: Literal[True] = True
@@ -1125,6 +1264,14 @@ class PortalTicketGrantV1(_ContractModel):
             raise ValueError("invalid portal ticket lifetime")
         if (self.hard_expires_at - self.issued_at).total_seconds() > 1800:
             raise ValueError("portal ticket hard lifetime exceeds thirty minutes")
+        if (
+            self.consume_cas.ticket_id != self.ticket_id
+            or self.consume_cas.account_ref.workspace_id != self.workspace_id
+            or self.consume_cas.account_ref.account_id != self.account_id
+            or self.consume_cas.session_id != self.session_id
+            or self.consume_cas.expected_session_revision != self.session_revision
+        ):
+            raise ValueError("portal grant CAS does not match ticket binding")
         return self
 
 

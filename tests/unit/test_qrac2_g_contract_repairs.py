@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from pydantic import SecretStr
@@ -18,10 +19,15 @@ from backend.schemas.browser_account import (
     PortalClipV1,
     PortalEntryBlockedV1,
     PortalEntryWaitingV1,
+    PortalModelDecisionV1,
     PortalOwnerRouteV1,
+    PortalPerceptionElementV1,
+    PortalPerceptionV1,
     PortalPixelFrameV1,
     PortalRegionFocusV1,
     PortalOuterBindingV1,
+    PortalRecordSessionContractV1,
+    PortalTicketConsumeCASV1,
     PortalTicketGrantV1,
     PortalTicketIssueRequestV1,
     PortalTicketRecordV1,
@@ -34,8 +40,12 @@ from backend.schemas.browser_account import (
 )
 from backend.services.browser_portal_contract import (
     admit_command_before_side_effects,
+    admit_portal_entry,
+    complete_portal_record_session,
+    invoke_portal_owner_transport,
     issue_first_portal_ticket,
     redeem_portal_ticket,
+    register_portal_record_session,
     route_portal_frame,
     ticket_record_from_issue,
 )
@@ -242,6 +252,7 @@ def test_h4_ticket_entry_responses_cannot_be_mistaken_for_grants() -> None:
     grant = PortalTicketGrantV1(
         workspace_id=ref.workspace_id,
         account_id=ref.account_id,
+        ticket_id="ticket-id",
         session_id="session",
         session_revision=3,
         issued_at=now,
@@ -249,6 +260,12 @@ def test_h4_ticket_entry_responses_cannot_be_mistaken_for_grants() -> None:
         hard_expires_at=now + timedelta(minutes=10),
         cookie_name="portal",
         websocket_path="/api/v1/portal",
+        consume_cas=PortalTicketConsumeCASV1(
+            ticket_id="ticket-id",
+            account_ref=ref,
+            session_id="session",
+            expected_session_revision=3,
+        ),
     )
     assert waiting.status == "waiting"
     assert blocked.status == "blocked"
@@ -344,8 +361,10 @@ def test_h3_first_ticket_redeem_binds_csrf_session_and_replay() -> None:
         expires_at=now + timedelta(minutes=5),
         hard_expires_at=now + timedelta(minutes=10),
         session_revision=3,
+        ticket_id="ticket-id",
     )
-    record = ticket_record_from_issue(issue, ticket_id="ticket-id", subject="operator")
+    assert issue.ticket_id == "ticket-id"
+    record = ticket_record_from_issue(issue, subject="operator")
     redeem = PortalTicketRedeemRequestV1(
         first_entry="initial",
         account_ref=ref,
@@ -430,6 +449,25 @@ def test_h5_owner_route_applies_real_wire_binding() -> None:
         view_generation=4,
         record_session_id="record-session",
     )
+    record_session = SimpleNamespace(
+        session_id="record-session",
+        page=object(),
+        stopped=False,
+    )
+    register_portal_record_session(
+        binding,
+        record_session,
+        completion=PortalRecordSessionContractV1(
+            record_session_id="record-session",
+            target=target,
+            view_generation=4,
+            status="active",
+            page_bound=True,
+            listener_installed=True,
+            listener_revoked=False,
+            pending_events_drained=False,
+        ),
+    )
     route = PortalOwnerRouteV1(
         binding=binding,
         node_identity=NodeIdentityV1(node_id="node", boot_id="boot"),
@@ -446,6 +484,26 @@ def test_h5_owner_route_applies_real_wire_binding() -> None:
         max_input_bytes=4_096,
     )
     assert route_portal_frame(route, wire) is wire
+    seen: list[tuple[str, int]] = []
+    assert (
+        invoke_portal_owner_transport(
+            route,
+            wire,
+            now=now,
+            transport=lambda owner, value: (
+                seen.append((owner.node_identity.node_id, value.sequence)) or value
+            ),
+        )
+        is wire
+    )
+    assert seen == [("node", 2)]
+    with pytest.raises(ValueError):
+        invoke_portal_owner_transport(
+            route.model_copy(update={"route_expires_at": now - timedelta(seconds=1)}),
+            wire,
+            now=now,
+            transport=lambda *_: pytest.fail("expired route reached owner transport"),
+        )
     with pytest.raises(ValueError):
         route_portal_frame(
             route,
@@ -456,4 +514,71 @@ def test_h5_owner_route_applies_real_wire_binding() -> None:
                     )
                 }
             ),
+        )
+    record_session.stopped = True
+    completed = complete_portal_record_session(
+        binding,
+        listener_revoked=True,
+        pending_events_drained=True,
+    )
+    assert completed.status == "completed"
+    with pytest.raises(ValueError):
+        route_portal_frame(route, wire, now=now)
+
+
+def test_h1_pre_entry_freezes_perception_model_and_record_tuple() -> None:
+    now, ref, target, session, command, claim = _context()
+    binding = SensitiveSessionBindingV1(
+        account_ref=ref,
+        session_id="session",
+        epoch=2,
+        target=target,
+        view_generation=4,
+        record_session_id="record-session",
+    )
+    focus = PortalRegionFocusV1(
+        target=target,
+        view_generation=4,
+        region_kind="form",
+        approved_regions=[PortalClipV1(x=0, y=0, width=10, height=10)],
+        focused_field_ref="otp",
+    )
+    handoff = admit_portal_entry(
+        command,
+        claim,
+        session,
+        binding=binding,
+        perception=PortalPerceptionV1(
+            target=target,
+            view_generation=4,
+            elements=[PortalPerceptionElementV1(ref="0", role="input", name="OTP")],
+            region_focus=focus,
+        ),
+        model_decision=PortalModelDecisionV1(
+            target=target,
+            view_generation=4,
+            action="input",
+            focused_field_ref="otp",
+        ),
+        record=PortalRecordSessionContractV1(
+            record_session_id="record-session",
+            target=target,
+            view_generation=4,
+            status="active",
+            page_bound=True,
+            listener_installed=True,
+            listener_revoked=False,
+            pending_events_drained=False,
+        ),
+    )
+    assert handoff.guard.command.command_id == "command"
+    with pytest.raises(ValueError):
+        admit_portal_entry(
+            command,
+            claim,
+            session,
+            binding=binding,
+            perception=handoff.perception,
+            model_decision=handoff.model_decision.model_copy(update={"view_generation": 3}),
+            record=handoff.record,
         )

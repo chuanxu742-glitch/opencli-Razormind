@@ -5,11 +5,12 @@ The owning service must call these gates before its transaction/transport work,
 then atomically consume a validated ticket in the same database transaction.
 """
 
-from __future__ import annotations
-
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Callable, TypeVar
 import hashlib
 import hmac
+import secrets
 
 from pydantic import SecretStr
 
@@ -21,7 +22,12 @@ from backend.schemas.browser_account import (
     NodeClaimV1,
     PortalEntryBlockedV1,
     PortalEntryResponseV1,
+    PortalModelDecisionV1,
     PortalOwnerRouteV1,
+    PortalPerceptionV1,
+    PortalPreEntryHandoffV1,
+    PortalRecordSessionContractV1,
+    PortalTicketConsumeCASV1,
     PortalTicketGrantV1,
     PortalTicketIssueRequestV1,
     PortalTicketIssuedV1,
@@ -29,7 +35,11 @@ from backend.schemas.browser_account import (
     PortalTicketRedeemRequestV1,
     PortalWireFrameV1,
     SessionEnvelopeV1,
+    SensitiveSessionBindingV1,
 )
+
+
+_TransportResult = TypeVar("_TransportResult")
 
 
 def admit_command_before_side_effects(
@@ -47,6 +57,124 @@ def admit_command_before_side_effects(
     return CommandExecutionGuardV1(command=command, claim=claim, session=session)
 
 
+@dataclass
+class _RegisteredRecordSession:
+    session: Any
+    page: Any
+    binding: SensitiveSessionBindingV1
+    contract: PortalRecordSessionContractV1
+
+
+_RECORD_SESSIONS: dict[str, _RegisteredRecordSession] = {}
+
+
+def admit_portal_entry(
+    command: DurableCommandV1,
+    claim: NodeClaimV1,
+    session: SessionEnvelopeV1,
+    *,
+    binding: SensitiveSessionBindingV1,
+    perception: PortalPerceptionV1,
+    model_decision: PortalModelDecisionV1,
+    record: PortalRecordSessionContractV1,
+) -> PortalPreEntryHandoffV1:
+    """Freeze the common perception/model/record tuple before portal entry.
+
+    Command admission alone is insufficient: this handoff is the only value
+    an owner should pass to the model, record listener, or browser transport.
+    """
+
+    guard = admit_command_before_side_effects(command, claim, session)
+    handoff = PortalPreEntryHandoffV1(
+        guard=guard,
+        binding=binding,
+        perception=perception,
+        model_decision=model_decision,
+        record=record,
+    )
+    if record.status != "active":
+        raise ValueError("portal pre-entry requires an active record session")
+    return handoff
+
+
+def register_portal_record_session(
+    binding: SensitiveSessionBindingV1,
+    record_session: Any,
+    *,
+    completion: PortalRecordSessionContractV1,
+    page: Any | None = None,
+) -> PortalRecordSessionContractV1:
+    """Register a real RecordSession and its live page for one portal binding."""
+
+    record_id = binding.record_session_id
+    if record_id is None or completion.record_session_id != record_id:
+        raise ValueError("record session registration does not match binding")
+    actual_id = getattr(record_session, "session_id", None)
+    actual_page = getattr(record_session, "page", None)
+    if actual_id != record_id or actual_page is None:
+        raise ValueError("record session must expose its real id and page")
+    if page is not None and page is not actual_page:
+        raise ValueError("record session page does not match registration")
+    if getattr(record_session, "stopped", False):
+        raise ValueError("stopped record session cannot be registered")
+    if completion.status != "active" or not completion.page_bound:
+        raise ValueError("record registration requires an active page binding")
+    if completion.target != binding.target or completion.view_generation != binding.view_generation:
+        raise ValueError("record registration target or generation mismatch")
+    _RECORD_SESSIONS[record_id] = _RegisteredRecordSession(
+        session=record_session,
+        page=actual_page,
+        binding=binding,
+        contract=completion,
+    )
+    return completion
+
+
+def resolve_portal_record_session(
+    binding: SensitiveSessionBindingV1,
+) -> Any:
+    """Resolve the registered RecordSession, rejecting stale or stopped pages."""
+
+    record_id = binding.record_session_id
+    registration = _RECORD_SESSIONS.get(record_id or "")
+    if registration is None or registration.binding != binding:
+        raise ValueError("portal record session is not registered for this binding")
+    if registration.contract.status != "active" or getattr(registration.session, "stopped", False):
+        raise ValueError("portal record session is no longer active")
+    if getattr(registration.session, "page", None) is not registration.page:
+        raise ValueError("portal record session page changed")
+    return registration.session
+
+
+def complete_portal_record_session(
+    binding: SensitiveSessionBindingV1,
+    *,
+    aborted: bool = False,
+    listener_revoked: bool,
+    pending_events_drained: bool,
+) -> PortalRecordSessionContractV1:
+    """Record the explicit listener-drained completion required before close."""
+
+    registration = _RECORD_SESSIONS.get(binding.record_session_id or "")
+    if registration is None or registration.binding != binding:
+        raise ValueError("portal record session is not registered for this binding")
+    if not getattr(registration.session, "stopped", False):
+        raise ValueError("record completion requires RecordSession.stop")
+    status = "aborted" if aborted else "completed"
+    completed = PortalRecordSessionContractV1(
+        record_session_id=binding.record_session_id or "",
+        target=binding.target,
+        view_generation=binding.view_generation,
+        status=status,
+        page_bound=True,
+        listener_installed=True,
+        listener_revoked=listener_revoked,
+        pending_events_drained=pending_events_drained,
+    )
+    registration.contract = completed
+    return completed
+
+
 def _digest(value: SecretStr) -> str:
     return hashlib.sha256(value.get_secret_value().encode("utf-8")).hexdigest()
 
@@ -59,19 +187,21 @@ def issue_first_portal_ticket(
     expires_at: datetime,
     hard_expires_at: datetime,
     session_revision: int,
+    ticket_id: str | None = None,
 ) -> PortalTicketIssuedV1:
-    """Build the first body-only ticket response after the caller's auth check.
-
-    The caller persists :class:`PortalTicketRecordV1` using the returned secret
-    digests; this response never places either secret in a URL.
-    """
+    """Issue the first ticket and freeze its public id for persistence/CAS."""
 
     if request.expected_session_revision != session_revision:
         raise ValueError("ticket issue session revision mismatch")
+    if now >= expires_at or expires_at > hard_expires_at:
+        raise ValueError("ticket issue expiry is invalid")
+    if ticket_id is None:
+        ticket_id = secrets.token_urlsafe(24)
     return PortalTicketIssuedV1(
         account_ref=request.account_ref,
         session_id=request.session_id,
         session_revision=session_revision,
+        ticket_id=ticket_id,
         ticket=ticket,
         csrf_token=request.csrf_token,
         issued_at=now,
@@ -79,16 +209,19 @@ def issue_first_portal_ticket(
         hard_expires_at=hard_expires_at,
     )
 
+
 def ticket_record_from_issue(
     issued: PortalTicketIssuedV1,
     *,
-    ticket_id: str,
     subject: str,
+    ticket_id: str | None = None,
 ) -> PortalTicketRecordV1:
-    """Create the durable digest-only record for one issued ticket."""
+    """Create the digest-only record for the exact issued ticket id."""
 
+    if ticket_id is not None and ticket_id != issued.ticket_id:
+        raise ValueError("ticket record id does not match issued ticket")
     return PortalTicketRecordV1(
-        ticket_id=ticket_id,
+        ticket_id=issued.ticket_id,
         ticket_digest=_digest(issued.ticket),
         csrf_digest=_digest(issued.csrf_token),
         subject=subject,
@@ -123,11 +256,11 @@ def redeem_portal_ticket(
     cookie_name: str,
     websocket_path: str,
 ) -> PortalEntryResponseV1:
-    """Validate one ticket and return a typed HTTP outcome.
+    """Validate a ticket and return HTTP outcome plus an atomic CAS predicate.
 
-    The function has no persistence side effect. The owner must atomically set
-    ``consumed_at`` only after a grant is returned; a non-null value is rejected
-    as replay on every subsequent attempt.
+    This function never marks the record consumed. The owner must execute the
+    returned grant's ``consume_cas`` as ``WHERE consumed_at IS NULL`` in the
+    same database transaction that creates the session cookie.
     """
 
     if record.ticket_id != request.ticket_id:
@@ -145,9 +278,16 @@ def redeem_portal_ticket(
     if not hmac.compare_digest(record.csrf_digest, _digest(request.csrf_token)):
         return _blocked(request, BrowserAccountErrorCode.PERMISSION_DENIED)
 
+    cas = PortalTicketConsumeCASV1(
+        ticket_id=record.ticket_id,
+        account_ref=record.account_ref,
+        session_id=record.session_id,
+        expected_session_revision=record.session_revision,
+    )
     return PortalTicketGrantV1(
         workspace_id=request.account_ref.workspace_id,
         account_id=request.account_ref.account_id,
+        ticket_id=record.ticket_id,
         session_revision=record.session_revision,
         session_id=record.session_id,
         issued_at=record.issued_at,
@@ -155,15 +295,31 @@ def redeem_portal_ticket(
         hard_expires_at=record.hard_expires_at,
         cookie_name=cookie_name,
         websocket_path=websocket_path,
+        consume_cas=cas,
+    )
+
+
+def _clip_contains(container: Any, candidate: Any) -> bool:
+    return (
+        container.x <= candidate.x
+        and container.y <= candidate.y
+        and container.x + container.width >= candidate.x + candidate.width
+        and container.y + container.height >= candidate.y + candidate.height
     )
 
 
 def route_portal_frame(
     owner_route: PortalOwnerRouteV1,
     frame: PortalWireFrameV1,
+    *,
+    now: datetime | None = None,
 ) -> PortalWireFrameV1:
-    """Apply the A-owned session/page/record route to an R wire frame."""
+    """Validate expiry, page/record lineage, focus, and bounded frame bytes."""
 
+    resolve_portal_record_session(owner_route.binding)
+    checked_at = now or datetime.now(timezone.utc)
+    if owner_route.route_expires_at <= checked_at:
+        raise ValueError("portal owner route has expired")
     binding = frame.transient.binding
     route_binding = owner_route.binding
     if (
@@ -177,6 +333,44 @@ def route_portal_frame(
         raise ValueError("portal frame is outside the owner route binding")
     if frame.contract_version != owner_route.contract_version:
         raise ValueError("portal frame and owner route contract versions differ")
-    if frame.byte_length is not None and frame.byte_length > owner_route.max_frame_bytes:
-        raise ValueError("portal frame exceeds owner route byte limit")
+    if frame.encoding == "pixel-binary":
+        pixel = frame.transient.pixel
+        assert pixel is not None
+        if pixel.expires_at <= checked_at:
+            raise ValueError("portal pixel frame has expired")
+        if pixel.byte_length > owner_route.max_frame_bytes:
+            raise ValueError("portal frame exceeds owner route byte limit")
+        focus = owner_route.region_focus
+        if pixel.region_kind != focus.region_kind and focus.region_kind != "approved":
+            raise ValueError("portal pixel region is outside approved focus")
+        if not any(_clip_contains(region, pixel.clip) for region in focus.approved_regions):
+            raise ValueError("portal pixel clip is outside approved regions")
+        if any(
+            not any(_clip_contains(region, masked) for region in focus.approved_regions)
+            for masked in pixel.masked_regions
+        ):
+            raise ValueError("portal pixel mask is outside approved regions")
+    else:
+        control = frame.transient.control
+        assert control is not None
+        payload = control.sensitive_payload
+        if payload is not None and payload.value is not None:
+            if len(payload.value.get_secret_value()) > owner_route.max_input_bytes:
+                raise ValueError("portal input exceeds owner route byte limit")
+        if control.kind == "field_input":
+            if control.field_ref != owner_route.region_focus.focused_field_ref:
+                raise ValueError("portal input is outside approved focus")
     return frame
+
+
+def invoke_portal_owner_transport(
+    owner_route: PortalOwnerRouteV1,
+    frame: PortalWireFrameV1,
+    *,
+    transport: Callable[[PortalOwnerRouteV1, PortalWireFrameV1], _TransportResult],
+    now: datetime | None = None,
+) -> _TransportResult:
+    """Invoke the R owner transport only after A-side route validation."""
+
+    validated = route_portal_frame(owner_route, frame, now=now)
+    return transport(owner_route, validated)
