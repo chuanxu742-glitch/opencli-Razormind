@@ -222,6 +222,7 @@ async function verifyLoginTarget(tabId, target, pack) {
       type: "opencli-script-host.login-target",
       pack: pack.id,
       version: pack.version,
+      rule: pack.ruleManifest,
     },
     { frameId: target.frameId },
   );
@@ -320,6 +321,7 @@ async function refreshLogin(tabId, target, args, pack) {
       type: "opencli-script-host.login-target",
       pack: pack.id,
       version: pack.version,
+      rule: pack.ruleManifest,
     },
     { frameId: target.frameId },
   );

@@ -19,14 +19,14 @@
   "refresh": { "trigger": "qr_expired", "interval": 30, "max_attempts": 3 },
   "auth": { "identity_path": "/identity", "status_path": "/auth-status" },
   "mode_selectors": {
-    "qr": "[data-login-mode='qr']",
-    "form": "[data-login-mode='form']",
-    "native": "[data-login-mode='native']"
+    "qr": "#qr-region img#login-qr",
+    "form": "#login-form",
+    "native": "#login-form"
   },
   "mode_evidence": {
     "qr": "#qr-region img#login-qr",
     "form": "#login-form",
-    "native": "[data-login-mode='native'][aria-current='true']"
+    "native": "#login-form"
   },
   "success": {
     "authenticated_evidence": ["identity_endpoint", "auth_status"],

@@ -53,20 +53,16 @@ function targetWire(target) {
   };
 }
 
-function currentGeneration() {
-  const root = document.documentElement;
-  const documentMarker = root.dataset.documentId ?? root.dataset.documentGeneration;
-  const viewMarker = root.dataset.viewGeneration;
-  if (documentMarker == null || viewMarker == null) return null;
-  return { documentId: documentMarker, viewGeneration: viewMarker };
+function generationValue(value) {
+  return Number.isInteger(value) && value >= 0 ? value : null;
 }
 
-function targetGenerationIsCurrent(target) {
-  const current = currentGeneration();
+function sameGeneration(left, right) {
   return (
-    current !== null &&
-    String(current.documentId) === String(target.documentId) &&
-    String(current.viewGeneration) === String(target.viewGeneration)
+    left !== null &&
+    right !== null &&
+    String(left.documentId) === String(right.documentId) &&
+    String(left.viewGeneration) === String(right.viewGeneration)
   );
 }
 
@@ -112,6 +108,16 @@ function fixedRule(message) {
     rule.refresh.trigger !== "qr_expired" ||
     rule.refresh.interval !== 30 ||
     rule.refresh.max_attempts !== 3
+  ) return null;
+  if (
+    !rule.mode_selectors ||
+    rule.mode_selectors.qr !== "#qr-region img#login-qr" ||
+    rule.mode_selectors.form !== "#login-form" ||
+    rule.mode_selectors.native !== "#login-form" ||
+    !rule.mode_evidence ||
+    rule.mode_evidence.qr !== "#qr-region img#login-qr" ||
+    rule.mode_evidence.form !== "#login-form" ||
+    rule.mode_evidence.native !== "#login-form"
   ) return null;
   return rule;
 }
@@ -186,33 +192,47 @@ async function fetchJson(path) {
   return value;
 }
 
-function matchingGeneration(value, target) {
-  return (
-    value !== null &&
-    String(value.document_generation) === String(target.documentId) &&
-    String(value.view_generation) === String(target.viewGeneration)
-  );
-}
-
-async function trustedAuthEvidence(rule, target) {
+async function readTrustedEvidence(rule) {
   const auth = rule.auth;
   if (!auth || typeof auth !== "object") return null;
   try {
     const identity = await fetchJson(auth.identity_path);
     const status = await fetchJson(auth.status_path);
     const authEvidence = status.evidence;
+    if (!authEvidence || typeof authEvidence !== "object" || Array.isArray(authEvidence)) {
+      return null;
+    }
     const identityValue = identity.identity;
     const statusValue = status.identity;
     const identityValid = typeof identityValue === "string" && SAFE_IDENTITY.test(identityValue);
     const statusValid = typeof statusValue === "string" && SAFE_IDENTITY.test(statusValue);
+    const identityGeneration = {
+      documentId: generationValue(identity.document_generation),
+      viewGeneration: generationValue(identity.view_generation),
+    };
+    const statusGeneration = {
+      documentId: generationValue(authEvidence.document_generation),
+      viewGeneration: generationValue(authEvidence.view_generation),
+    };
+    if (
+      identity.authenticated !== status.authenticated ||
+      identity.identity_status !== status.identity_status ||
+      !sameGeneration(identityGeneration, statusGeneration) ||
+      authEvidence.identity_endpoint !== auth.identity_path ||
+      authEvidence.state_endpoint !== auth.status_path ||
+      typeof authEvidence.frame_label !== "string" ||
+      authEvidence.frame_label.length === 0 ||
+      authEvidence.frame_label.length > 255
+    ) {
+      return null;
+    }
     return {
       authenticated: identity.authenticated === true && status.authenticated === true,
       trusted: status.trusted === true,
       identityStatus:
         identity.identity_status === "valid" && status.identity_status === "valid",
       identity: identityValid && statusValid && identityValue === statusValue ? identityValue : null,
-      generation:
-        matchingGeneration(identity, target) && matchingGeneration(authEvidence, target),
+      generation: identityGeneration,
       mismatch:
         identity.identity_status === "mismatch" || status.identity_status === "mismatch" ||
         (identityValid && statusValid && identityValue !== statusValue),
@@ -222,8 +242,33 @@ async function trustedAuthEvidence(rule, target) {
   }
 }
 
+async function trustedGeneration(rule) {
+  const evidence = await readTrustedEvidence(rule);
+  return evidence?.generation ?? null;
+}
+
+async function targetGenerationIsCurrent(target, rule) {
+  const current = await trustedGeneration(rule);
+  return sameGeneration(current, {
+    documentId: target.documentId,
+    viewGeneration: target.viewGeneration,
+  });
+}
+
+async function trustedAuthEvidence(rule, target) {
+  const evidence = await readTrustedEvidence(rule);
+  if (!evidence) return null;
+  return {
+    ...evidence,
+    generation: sameGeneration(evidence.generation, {
+      documentId: target.documentId,
+      viewGeneration: target.viewGeneration,
+    }),
+  };
+}
+
 async function observe(message, args, target, rule) {
-  if (!targetGenerationIsCurrent(target)) return fail("stale_generation");
+  if (!(await targetGenerationIsCurrent(target, rule))) return fail("stale_generation");
   if (
     typeof args.session_id !== "string" || args.session_id.length === 0 ||
     !Number.isInteger(args.epoch) || args.epoch < 0
@@ -302,7 +347,7 @@ async function observe(message, args, target, rule) {
 }
 
 async function switchMode(message, args, target, rule) {
-  if (!targetGenerationIsCurrent(target)) return fail("stale_generation");
+  if (!(await targetGenerationIsCurrent(target, rule))) return fail("stale_generation");
   const requestedMode = args.mode;
   if (!Array.isArray(rule.modes) || !rule.modes.includes(requestedMode)) {
     return fail("login_rule_unknown");
@@ -321,7 +366,7 @@ async function switchMode(message, args, target, rule) {
   }
   controls[0].click();
   await new Promise((resolve) => setTimeout(resolve, 0));
-  if (!targetGenerationIsCurrent(target)) return fail("stale_generation");
+  if (!(await targetGenerationIsCurrent(target, rule))) return fail("stale_generation");
   if (typeof evidenceSelector !== "string" || nodesFor(evidenceSelector).length !== 1) {
     return fail("capability_missing");
   }
@@ -335,8 +380,8 @@ async function switchMode(message, args, target, rule) {
   };
 }
 
-function targetProbe() {
-  const current = currentGeneration();
+async function targetProbe(rule) {
+  const current = await trustedGeneration(rule);
   if (current === null) return fail("stale_generation");
   const qr = document.querySelector("#qr-region img#login-qr");
   const qrGeneration = qr && Number.isInteger(Number(qr.dataset.qrGeneration))
@@ -346,7 +391,7 @@ function targetProbe() {
     ok: true,
     target: {
       documentId: current.documentId,
-      viewGeneration: Number(current.viewGeneration),
+      viewGeneration: current.viewGeneration,
       origin: window.location.origin,
       qrGeneration,
     },
@@ -367,7 +412,7 @@ async function invoke(message) {
   const args = message.args && typeof message.args === "object" ? message.args : {};
   const target = targetFor(message);
   if (!target) return fail("stale_generation");
-  if (!targetGenerationIsCurrent(target)) return fail("stale_generation");
+  if (!(await targetGenerationIsCurrent(target, rule))) return fail("stale_generation");
   if (message.action === "login.observe") return observe(message, args, target, rule);
   if (message.action === "login.refresh") {
     // Refresh is controlled by the background worker so it can verify that a
@@ -387,8 +432,16 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     message.pack === PACK_ID &&
     message.version === PACK_VERSION
   ) {
-    sendResponse(targetProbe());
-    return false;
+    const rule = fixedRule(message);
+    if (!rule) {
+      sendResponse(fail("login_rule_unknown"));
+      return false;
+    }
+    Promise.resolve(targetProbe(rule)).then(
+      (result) => sendResponse(result),
+      () => sendResponse(fail("stale_generation")),
+    );
+    return true;
   }
   // Messages for another Script Host pack must be ignored so this listener
   // cannot race its response with page-basics or future packs.

@@ -314,6 +314,69 @@ class RecordSession:
             await self._drain_event.wait()
         self._pending_events_drained = True
 
+    def _capture_targets(self) -> list[Any]:
+        """Return every live document that may own a capture listener.
+
+        ``Page.add_init_script`` runs for child frames as well as the main
+        document, so changing the guard in only ``page.evaluate`` leaves an
+        existing iframe collecting events.  A browser-free fake page has no
+        ``frames`` property; retaining the page fallback keeps the existing
+        unit-test seam while real Playwright uses ``Frame.evaluate``.
+        """
+        frames = getattr(self.page.page, "frames", None)
+        if frames:
+            try:
+                targets = list(frames)
+            except TypeError:
+                targets = []
+            if targets:
+                return targets
+        return [self.page.page]
+
+    async def _evaluate_capture(self, options: dict[str, Any]) -> None:
+        """Apply a capture state to every current frame, then report failures.
+
+        Continue after one frame fails so a detached/closing frame cannot
+        prevent cleanup in the remaining documents.  Callers keep the
+        process-side guard enabled whenever any frame reports an error.
+        """
+        failures: list[BaseException] = []
+        for target in self._capture_targets():
+            evaluate = getattr(target, "evaluate", None)
+            if not callable(evaluate):
+                failures.append(TypeError("capture target has no evaluate"))
+                continue
+            try:
+                await evaluate(CAPTURE_JS, options)
+            except BaseException as exc:  # pragma: no cover - browser failure
+                failures.append(exc)
+        if failures:
+            raise failures[0]
+
+    async def _add_guarded_init_script(self) -> None:
+        guarded_arg = json.dumps(
+            {"sessionId": self.session_id, "sensitive": True, "preserve": True},
+            separators=(",", ":"),
+        )
+        await self.page.page.add_init_script(f"({CAPTURE_JS})({guarded_arg})")
+
+    def _remove_listener(self, event: str, handler: Any) -> None:
+        remove_listener = getattr(self.page.page, "remove_listener", None)
+        if not callable(remove_listener):
+            return
+        try:
+            remove_listener(event, handler)
+        except Exception:  # pragma: no cover - browser teardown race
+            logger.debug("record listener removal failed | event=%s", event, exc_info=True)
+
+    def _remove_page_handlers(self) -> None:
+        if self._navigation_handler_installed:
+            self._remove_listener("framenavigated", self._on_navigate)
+            self._navigation_handler_installed = False
+        if self._close_handler_installed:
+            self._remove_listener("close", self._on_page_close)
+            self._close_handler_installed = False
+
     async def start(self) -> None:
         """Wire the capture binding and listener onto every live frame."""
         set_session_sensitive(self.session_id, False)
@@ -342,13 +405,6 @@ class RecordSession:
         raw_page.on("framenavigated", self._on_navigate)
         self._navigation_handler_installed = True
 
-    def _on_page_close(self, *_args: Any) -> None:
-        """A browser/page teardown is an ownership boundary, not a normal exit."""
-        self.sensitive = True
-        self.stopped = True
-        self._navigation_handler_installed = False
-        self._close_handler_installed = False
-        clear_session_sensitive(self.session_id)
     def _frame_for_target(self, frame_id: Any | None) -> Any:
         frames = self._frames()
         if frame_id is None:
@@ -490,12 +546,7 @@ class RecordSession:
         finally:
             self.stopped = True
             set_session_sensitive(self.session_id, False)
-            remove_listener = getattr(self._raw_page(), "remove_listener", None)
-            if callable(remove_listener):
-                remove_listener("framenavigated", self._on_navigate)
-            if self._close_handler_installed:
-                remove_listener("close", self._on_page_close)
-                self._close_handler_installed = False
+            self._remove_page_handlers()
         self._append(
             verb="done",
             args={"status": status, "note": note},
@@ -528,7 +579,7 @@ async def start_recording(cdp_endpoint: str, *, domain: str, capability: str) ->
     )
     try:
         await session.start()
-    except Exception:
+    except BaseException:
         # Never leak the already-opened page/CDP connection if wiring the
         # capture listener fails — same "never leak a held Chrome on
         # failure" rule the API layer's own record_start applies.
