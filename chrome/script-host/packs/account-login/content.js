@@ -7,25 +7,132 @@ const ALLOWED_ACTIONS = new Set([
   "login.switch-mode",
 ]);
 const SAFE_IDENTITY = /^[A-Za-z0-9_.:@-]{1,80}$/;
+const LOGIN_ERROR_CODES = new Set([
+  "auth_required",
+  "account_identity_mismatch",
+  "stale_generation",
+  "login_rule_unknown",
+  "ambiguous_login_region",
+  "capability_missing",
+  "session_expired",
+]);
 
 function fail(code) {
-  return { ok: false, error_code: code };
+  return {
+    ok: false,
+    error_code: LOGIN_ERROR_CODES.has(code) ? code : "login_rule_unknown",
+  };
+}
+
+function validDocumentId(value) {
+  return (
+    (Number.isInteger(value) && value >= 0) ||
+    (typeof value === "string" && value.length > 0 && value.length <= 255)
+  );
 }
 
 function targetFor(message) {
   const target = message?.target;
-  if (!target || !Number.isInteger(Number(target.frameId))) return null;
-  if (!Number.isInteger(Number(target.viewGeneration)) || Number(target.viewGeneration) < 0) {
-    return null;
-  }
+  if (!target || typeof target !== "object") return null;
+  const keys = Object.keys(target).sort().join(",");
+  if (keys !== "documentId,frameId,origin,tabId,viewGeneration") return null;
+  if (!Number.isInteger(target.tabId) || target.tabId < 0) return null;
+  if (!Number.isInteger(target.frameId) || target.frameId < 0) return null;
+  if (!validDocumentId(target.documentId)) return null;
+  if (!Number.isInteger(target.viewGeneration) || target.viewGeneration < 0) return null;
   if (typeof target.origin !== "string" || target.origin !== window.location.origin) return null;
   return target;
 }
 
-function targetGenerationIsCurrent(target) {
+function targetWire(target) {
+  return {
+    tab_id: target.tabId,
+    frame_id: target.frameId,
+    document_id: target.documentId,
+    origin: target.origin,
+  };
+}
+
+function currentGeneration() {
   const root = document.documentElement;
   const documentMarker = root.dataset.documentId ?? root.dataset.documentGeneration;
-  return documentMarker == null || String(documentMarker) === String(target.documentId);
+  const viewMarker = root.dataset.viewGeneration;
+  if (documentMarker == null || viewMarker == null) return null;
+  return { documentId: documentMarker, viewGeneration: viewMarker };
+}
+
+function targetGenerationIsCurrent(target) {
+  const current = currentGeneration();
+  return (
+    current !== null &&
+    String(current.documentId) === String(target.documentId) &&
+    String(current.viewGeneration) === String(target.viewGeneration)
+  );
+}
+
+function fixedRule(message) {
+  const rule = message?.rule;
+  if (!rule || typeof rule !== "object") return null;
+  if (rule.id !== "controlled-login-fixture" || rule.version !== "1.0.0") return null;
+  const fixedOrigins = ["http://127.0.0.1:49906", "http://localhost:49906"];
+  if (
+    !Array.isArray(rule.allowed_origins) ||
+    rule.allowed_origins.length !== fixedOrigins.length ||
+    new Set(rule.allowed_origins).size !== fixedOrigins.length ||
+    !rule.allowed_origins.every((origin) => fixedOrigins.includes(origin)) ||
+    !rule.allowed_origins.includes(window.location.origin)
+  ) {
+    return null;
+  }
+  if (
+    !Array.isArray(rule.allowed_redirect_origins) ||
+    rule.allowed_redirect_origins.length !== fixedOrigins.length ||
+    new Set(rule.allowed_redirect_origins).size !== fixedOrigins.length ||
+    !rule.allowed_redirect_origins.every((origin) => fixedOrigins.includes(origin)) ||
+    rule.platform !== "controlled-login-fixture"
+  ) return null;
+  if (typeof rule.login_url !== "string") return null;
+  let loginUrl;
+  try {
+    loginUrl = new URL(rule.login_url, window.location.origin);
+  } catch {
+    return null;
+  }
+  if (
+    loginUrl.origin !== window.location.origin ||
+    loginUrl.pathname !== "/login" ||
+    loginUrl.search ||
+    loginUrl.hash
+  ) return null;
+  if (
+    !rule.auth ||
+    rule.auth.identity_path !== "/identity" ||
+    rule.auth.status_path !== "/auth-status" ||
+    !rule.refresh ||
+    rule.refresh.trigger !== "qr_expired" ||
+    rule.refresh.interval !== 30 ||
+    rule.refresh.max_attempts !== 3
+  ) return null;
+  return rule;
+}
+
+function selectorFor(rule, kind) {
+  const selectors = Array.isArray(rule.selectors) ? rule.selectors : [];
+  const entry = selectors.find((candidate) => candidate?.kind === kind);
+  return typeof entry?.selector === "string" ? entry.selector : null;
+}
+
+function nodesFor(selector) {
+  if (!selector) return [];
+  try {
+    return [...document.querySelectorAll(selector)];
+  } catch {
+    return [];
+  }
+}
+
+function formPresent(rule) {
+  return nodesFor(selectorFor(rule, "form")).length === 1;
 }
 
 function rectFor(node) {
@@ -40,133 +147,261 @@ function rectFor(node) {
   };
 }
 
-function observe(message, args, target) {
-  if (!targetGenerationIsCurrent(target)) return fail("target_generation_changed");
-  const root = document.documentElement;
-  const state = root.dataset.flowState || "unknown";
-  const ruleId = typeof args.rule_id === "string" ? args.rule_id : "controlled-login-fixture";
-  const ruleVersion = typeof args.rule_version === "string" ? args.rule_version : PACK_VERSION;
-  const qrNodes = [...document.querySelectorAll('[data-qr-generation] img')];
-  const approvedQrNodes = qrNodes.filter((node) => {
+function uniqueQrCandidates(rule) {
+  const configured = nodesFor(selectorFor(rule, "qr"));
+  const allQrImages = [...document.querySelectorAll("img[data-qr-generation], img[data-qr-origin]")];
+  const qrNodes = [...new Set([...configured, ...allQrImages])];
+  const approved = qrNodes.filter((node) => {
     const region = node.closest("[data-qr-origin]");
     if (!region || region.dataset.qrOrigin !== window.location.origin) return false;
-    const imageUrl = new URL(node.currentSrc || node.src || "", window.location.href);
+    let imageUrl;
+    try {
+      imageUrl = new URL(node.currentSrc || node.src || "", window.location.href);
+    } catch {
+      return false;
+    }
     return imageUrl.origin === window.location.origin;
   });
+  return { qrNodes, approved };
+}
+
+async function fetchJson(path) {
+  if (typeof path !== "string" || !path.startsWith("/") || path.includes("//")) {
+    throw new Error("invalid auth endpoint");
+  }
+  const url = new URL(path, window.location.origin);
+  if (url.origin !== window.location.origin || url.search || url.hash) {
+    throw new Error("auth endpoint origin changed");
+  }
+  const response = await fetch(url.href, {
+    credentials: "same-origin",
+    cache: "no-store",
+    headers: { Accept: "application/json" },
+  });
+  if (!response.ok) throw new Error("auth endpoint unavailable");
+  const value = await response.json();
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("auth endpoint returned invalid data");
+  }
+  return value;
+}
+
+function matchingGeneration(value, target) {
+  return (
+    value !== null &&
+    String(value.document_generation) === String(target.documentId) &&
+    String(value.view_generation) === String(target.viewGeneration)
+  );
+}
+
+async function trustedAuthEvidence(rule, target) {
+  const auth = rule.auth;
+  if (!auth || typeof auth !== "object") return null;
+  try {
+    const identity = await fetchJson(auth.identity_path);
+    const status = await fetchJson(auth.status_path);
+    const authEvidence = status.evidence;
+    const identityValue = identity.identity;
+    const statusValue = status.identity;
+    const identityValid = typeof identityValue === "string" && SAFE_IDENTITY.test(identityValue);
+    const statusValid = typeof statusValue === "string" && SAFE_IDENTITY.test(statusValue);
+    return {
+      authenticated: identity.authenticated === true && status.authenticated === true,
+      trusted: status.trusted === true,
+      identityStatus:
+        identity.identity_status === "valid" && status.identity_status === "valid",
+      identity: identityValid && statusValid && identityValue === statusValue ? identityValue : null,
+      generation:
+        matchingGeneration(identity, target) && matchingGeneration(authEvidence, target),
+      mismatch:
+        identity.identity_status === "mismatch" || status.identity_status === "mismatch" ||
+        (identityValid && statusValid && identityValue !== statusValue),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function observe(message, args, target, rule) {
+  if (!targetGenerationIsCurrent(target)) return fail("stale_generation");
+  if (
+    typeof args.session_id !== "string" || args.session_id.length === 0 ||
+    !Number.isInteger(args.epoch) || args.epoch < 0
+  ) {
+    return fail("login_rule_unknown");
+  }
+  const root = document.documentElement;
+  const pageState = root.dataset.flowState || "unknown";
+  const challenge = nodesFor("[data-challenge-state='required']").length > 0;
+  const authMarker = nodesFor("[data-authenticated='true']").length > 0;
+  const pageClaimsAuthenticated = pageState === "authenticated" || authMarker;
+  const { qrNodes, approved } = uniqueQrCandidates(rule);
   const expectedQrGeneration = args.expected_qr_generation;
-  const currentQrNodes = approvedQrNodes.filter(
+  const currentQr = approved.filter(
     (node) => String(node.dataset.qrGeneration) === String(expectedQrGeneration),
   );
-  const ambiguousQr = qrNodes.length !== 1 || approvedQrNodes.length !== 1 || currentQrNodes.length !== 1;
-  const qrRegion = currentQrNodes.length === 1
-    ? rectFor(currentQrNodes[0].closest("[data-qr-origin]"))
-    : null;
+  const ambiguousQr =
+    qrNodes.length !== 1 || approved.length !== 1 || currentQr.length !== 1;
+  const auth = await trustedAuthEvidence(rule, target);
 
-  const identityEvidence = document.querySelector("#identity-evidence");
-  const identityStatus = identityEvidence?.dataset.identityStatus;
-  const authenticated = document.querySelector("[data-authenticated='true']");
-  const identity = authenticated?.dataset.authenticatedIdentity;
-  const safeIdentity = typeof identity === "string" && SAFE_IDENTITY.test(identity) ? identity : null;
-  const challenge = document.querySelector("[data-challenge-state='required']");
-  const form = document.querySelector("form[data-sensitive-form], #login-form");
-  const sensitiveFields = [...document.querySelectorAll("[data-sensitive-field]")];
-  const identityFields = [...document.querySelectorAll("[data-identity-field='true']")];
-  const regions = [];
-  if (qrRegion) regions.push({ ...qrRegion, kind: "qr" });
-  const formRegion = rectFor(form);
-  if (formRegion) regions.push({ ...formRegion, kind: "form" });
-  const sensitiveRegions = sensitiveFields.map(rectFor).filter(Boolean);
-
-  let observedState = "unknown";
+  let state = "unknown";
   let evidenceKind = "unknown";
   let errorCode = null;
+  let externalIdentity = null;
   if (challenge) {
-    observedState = "challenge";
-  } else if (state === "expired" || root.dataset.qrStatus === "expired") {
-    observedState = "error";
-    errorCode = "qr_expired";
-  } else if (authenticated && identityStatus === "mismatch") {
-    observedState = "error";
+    state = "challenge";
+  } else if (pageState === "expired" || root.dataset.qrStatus === "expired") {
+    state = "error";
+    errorCode = "auth_required";
+  } else if (auth?.mismatch) {
+    state = "error";
     evidenceKind = "invalid";
     errorCode = "account_identity_mismatch";
-  } else if (authenticated && identityStatus === "valid" && safeIdentity) {
-    observedState = "verifying";
+  } else if (pageClaimsAuthenticated && !auth?.trusted) {
+    state = "unknown";
+    errorCode = "auth_required";
+  } else if (
+    auth?.authenticated && auth.trusted && auth.identityStatus && auth.identity && auth.generation &&
+    pageState === "authenticated" && authMarker
+  ) {
+    state = "verifying";
     evidenceKind = "valid";
-  } else if (qrNodes.length > 0 && ambiguousQr) {
-    observedState = "unknown";
-    errorCode = "ambiguous_qr";
-  } else if (currentQrNodes.length === 1) {
-    observedState = "presenting";
-  } else if (form) {
-    observedState = "presenting";
-  } else if (state === "refreshing" || state === "verifying") {
-    observedState = state;
+    externalIdentity = {
+      provider: rule.platform,
+      subject: auth.identity,
+      label: auth.identity,
+    };
+  } else if (ambiguousQr && qrNodes.length > 0) {
+    state = "unknown";
+    errorCode = "ambiguous_login_region";
+  } else if (currentQr.length === 1 && approved.length === 1) {
+    state = "presenting";
+  } else if (nodesFor(selectorFor(rule, "form")).length === 1) {
+    state = "presenting";
+  } else if (pageState === "refreshing" || pageState === "verifying") {
+    state = pageState;
+  } else if (pageClaimsAuthenticated) {
+    state = "unknown";
+    errorCode = "auth_required";
   }
 
   const result = {
     session_id: args.session_id,
     epoch: args.epoch,
-    rule_id: ruleId,
-    rule_version: ruleVersion,
-    target,
+    rule_id: rule.id,
+    rule_version: rule.version,
+    target: targetWire(target),
     view_generation: target.viewGeneration,
-    state: observedState,
+    state,
     evidence_kind: evidenceKind,
     observed_at: new Date().toISOString(),
-    regions,
-    focus: identityFields.map((node) => rectFor(node)).filter(Boolean),
-    sensitive_regions: sensitiveRegions,
   };
-  if (safeIdentity && evidenceKind === "valid") {
-    result.external_identity = {
-      provider: "controlled-login-fixture",
-      subject: safeIdentity,
-      label: safeIdentity,
-    };
-  }
+  if (externalIdentity) result.external_identity = externalIdentity;
   if (errorCode) result.error_code = errorCode;
   return { ok: true, result };
 }
 
-function invoke(message) {
+async function switchMode(message, args, target, rule) {
+  if (!targetGenerationIsCurrent(target)) return fail("stale_generation");
+  const requestedMode = args.mode;
+  if (!Array.isArray(rule.modes) || !rule.modes.includes(requestedMode)) {
+    return fail("login_rule_unknown");
+  }
+  const selectors = rule.mode_selectors;
+  const selector = selectors && typeof selectors === "object" ? selectors[requestedMode] : null;
+  const controls = nodesFor(selector);
+  if (controls.length !== 1) {
+    return fail(controls.length > 1 ? "ambiguous_login_region" : "capability_missing");
+  }
+  const evidenceSelector = rule.mode_evidence?.[requestedMode];
+  if (typeof evidenceSelector !== "string") return fail("capability_missing");
+  const beforeEvidence = nodesFor(evidenceSelector).length;
+  if (beforeEvidence !== 0) {
+    return fail(beforeEvidence > 1 ? "ambiguous_login_region" : "capability_missing");
+  }
+  controls[0].click();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  if (!targetGenerationIsCurrent(target)) return fail("stale_generation");
+  if (typeof evidenceSelector !== "string" || nodesFor(evidenceSelector).length !== 1) {
+    return fail("capability_missing");
+  }
+  return {
+    ok: true,
+    result: {
+      state: "presenting",
+      mode: requestedMode,
+      view_generation: target.viewGeneration,
+    },
+  };
+}
+
+function targetProbe() {
+  const current = currentGeneration();
+  if (current === null) return fail("stale_generation");
+  const qr = document.querySelector("#qr-region img#login-qr");
+  const qrGeneration = qr && Number.isInteger(Number(qr.dataset.qrGeneration))
+    ? Number(qr.dataset.qrGeneration)
+    : null;
+  return {
+    ok: true,
+    target: {
+      documentId: current.documentId,
+      viewGeneration: Number(current.viewGeneration),
+      origin: window.location.origin,
+      qrGeneration,
+    },
+  };
+}
+
+async function invoke(message) {
   if (
     message?.type !== "opencli-script-host.invoke" ||
     message.pack !== PACK_ID ||
     message.version !== PACK_VERSION ||
     !ALLOWED_ACTIONS.has(message.action)
   ) {
-    return fail("invalid_action");
+    return fail("login_rule_unknown");
   }
+  const rule = fixedRule(message);
+  if (!rule) return fail("login_rule_unknown");
   const args = message.args && typeof message.args === "object" ? message.args : {};
   const target = targetFor(message);
-  if (!target) return fail("incomplete_target");
-  if (message.action !== "login.open" && !targetGenerationIsCurrent(target)) {
-    return fail("target_generation_changed");
-  }
-  if (message.action === "login.observe") return observe(message, args, target);
+  if (!target) return fail("stale_generation");
+  if (!targetGenerationIsCurrent(target)) return fail("stale_generation");
+  if (message.action === "login.observe") return observe(message, args, target, rule);
   if (message.action === "login.refresh") {
-    if (args.expected_view_generation !== target.viewGeneration) return fail("stale_generation");
-    window.location.reload();
-    return { ok: true, result: { state: "refreshing", view_generation: target.viewGeneration } };
+    // Refresh is controlled by the background worker so it can verify that a
+    // real document/view generation changed before claiming success.
+    return fail("capability_missing");
   }
   if (message.action === "login.switch-mode") {
-    return { ok: true, result: { state: "presenting", mode: "native", view_generation: target.viewGeneration } };
+    return switchMode(message, args, target, rule);
   }
-  if (typeof args.login_url !== "string") return fail("login_url_required");
-  let loginUrl;
-  try {
-    loginUrl = new URL(args.login_url);
-  } catch {
-    return fail("invalid_login_url");
-  }
-  if (loginUrl.origin !== target.origin || !["/", "/login"].includes(loginUrl.pathname) || loginUrl.search || loginUrl.hash) {
-    return fail("login_url_not_allowed");
-  }
-  window.location.assign(loginUrl.href);
+  window.location.assign(new URL(rule.login_url, window.location.origin).href);
   return { ok: true, result: { state: "opening", view_generation: target.viewGeneration } };
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  sendResponse(invoke(message));
-  return false;
+  if (
+    message?.type === "opencli-script-host.login-target" &&
+    message.pack === PACK_ID &&
+    message.version === PACK_VERSION
+  ) {
+    sendResponse(targetProbe());
+    return false;
+  }
+  // Messages for another Script Host pack must be ignored so this listener
+  // cannot race its response with page-basics or future packs.
+  if (
+    message?.type !== "opencli-script-host.invoke" ||
+    message.pack !== PACK_ID ||
+    message.version !== PACK_VERSION
+  ) {
+    return false;
+  }
+  Promise.resolve(invoke(message)).then(
+    (result) => sendResponse(result),
+    () => sendResponse(fail("login_rule_unknown")),
+  );
+  return true;
 });

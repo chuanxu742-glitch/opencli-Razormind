@@ -25,6 +25,7 @@ from typing import Any
 
 # Token bound for the ordinary (non-sensitive) model projection.
 DEFAULT_MAX_ELEMENTS = 50
+SNAPSHOT_KEYS = ("ref", "role", "name", "value")
 
 # Login sessions opt into this process-local guard before any generic skill
 # perception runs.  The guard is deliberately fail-closed at the projection
@@ -43,13 +44,20 @@ def set_session_sensitive(session_id: str, enabled: bool) -> None:
         _SENSITIVE_SESSION_IDS.discard(session_id)
 
 
+def clear_session_sensitive(session_id: str) -> None:
+    """Clear a guard after the owning session has completed teardown."""
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError("session_id is required")
+    _SENSITIVE_SESSION_IDS.discard(session_id)
+
+
 def is_session_sensitive(session_id: str | None) -> bool:
     return bool(session_id and session_id in _SENSITIVE_SESSION_IDS)
 
 
 def _sensitive_snapshot_rows(raw: list[dict[str, Any]] | None, max_elements: int) -> list[dict[str, Any]]:
     """Project only non-sensitive structural refs while a login is guarded."""
-    if not raw or max_elements <= 0:
+    if not isinstance(raw, list) or max_elements <= 0:
         return []
     rows = raw[:max_elements]
     projected: list[dict[str, Any]] = []
@@ -159,6 +167,8 @@ def project_snapshot(
 
     Never emits ``outerHTML`` / raw DOM / a screenshot — only the projection.
     """
+    if not isinstance(raw, list):
+        return []
     if max_elements < 0:
         max_elements = 0
     if sensitive:
@@ -193,7 +203,12 @@ async def snapshot(
     sensitive: bool | None = None,
 ) -> list[dict[str, Any]]:
     """Perceive a page, suppressing DOM names and values for guarded sessions."""
-    guarded = is_session_sensitive(session_id) if sensitive is None else sensitive
+    if sensitive is not None and not isinstance(sensitive, bool):
+        raise ValueError("sensitive must be a boolean when provided")
+    # A caller may explicitly request sensitive mode, but it may not override
+    # the authoritative session guard with ``False`` while a login session is
+    # still owned by the guard.
+    guarded = is_session_sensitive(session_id) or sensitive is True
     script = SENSITIVE_SNAPSHOT_JS if guarded else SNAPSHOT_JS
     raw = await page.evaluate(script)
     return project_snapshot(raw or [], max_elements=max_elements, sensitive=guarded)

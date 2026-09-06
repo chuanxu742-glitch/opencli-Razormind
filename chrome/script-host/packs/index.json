@@ -10,10 +10,11 @@
   {
     "id": "account-login",
     "version": "1.0.0",
-    "matches": ["http://127.0.0.1/*", "http://localhost/*"],
+    "matches": ["http://127.0.0.1:49906/*", "http://localhost:49906/*"],
     "js": ["packs/account-login/content.js"],
     "run_at": "document_idle",
     "rule": "packs/account-login/rules.json",
+    "rule_version": "1.0.0",
     "actions": [
       { "id": "login.observe", "sensitive": false },
       { "id": "login.open", "sensitive": false },
