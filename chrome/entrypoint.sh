@@ -1,12 +1,64 @@
 #!/bin/bash
 set -e
 
+PROFILE_DIR="${PROFILE_DIR:-/home/chrome/.config/chromium}"
+RUNTIME_HOME="${RUNTIME_HOME:-/home/chrome}"
+RUNTIME_CACHE_DIR="${RUNTIME_CACHE_DIR:-$RUNTIME_HOME/.cache}"
+RUNTIME_STATE_DIR="${RUNTIME_STATE_DIR:-$RUNTIME_HOME/.local/state/opencli-account-runtime}"
+CHROMIUM_POLICY_FILE="${CHROMIUM_POLICY_FILE:-/etc/chromium/policies/managed/opencli-account-runtime.json}"
+validate_runtime_path() {
+  local path="$1"
+  local label="$2"
+  if [[ "$path" != /* || "$path" == "/" || -L "$path" ]]; then
+    echo "[entrypoint] $label must be an absolute, non-root, non-symlink path" >&2
+    exit 1
+  fi
+  mkdir -p -- "$path"
+  local canonical
+  canonical="$(readlink -f -- "$path" 2>/dev/null)" || {
+    echo "[entrypoint] $label cannot be canonicalized" >&2
+    exit 1
+  }
+  if [[ "$canonical" != "$path" ]]; then
+    echo "[entrypoint] $label has a symlinked parent" >&2
+    exit 1
+  fi
+}
+validate_runtime_path "$PROFILE_DIR" PROFILE_DIR
+validate_runtime_path "$RUNTIME_HOME" RUNTIME_HOME
+validate_runtime_path "$RUNTIME_CACHE_DIR" RUNTIME_CACHE_DIR
+validate_runtime_path "$RUNTIME_STATE_DIR" RUNTIME_STATE_DIR
+if [[ "$CHROMIUM_POLICY_FILE" != /* || -L "$CHROMIUM_POLICY_FILE" || ! -f "$CHROMIUM_POLICY_FILE" ]]; then
+  echo "[entrypoint] managed Chromium policy is unavailable" >&2
+  exit 1
+fi
+export PROFILE_DIR RUNTIME_HOME RUNTIME_CACHE_DIR RUNTIME_STATE_DIR CHROMIUM_POLICY_FILE
+export HOME="$RUNTIME_HOME"
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$RUNTIME_HOME/.config}"
+export CLOAKBROWSER_CACHE_DIR="${CLOAKBROWSER_CACHE_DIR:-$RUNTIME_CACHE_DIR}"
+
+verify_profile_ready() {
+  if [[ "$PROFILE_DIR" != /* || "$PROFILE_DIR" == "/" || -L "$PROFILE_DIR" ]]; then
+    echo "[entrypoint] active PROFILE_DIR must be absolute and non-symlink" >&2
+    exit 1
+  fi
+  for lock_name in SingletonLock SingletonCookie SingletonSocket; do
+    if [ -e "$PROFILE_DIR/$lock_name" ]; then
+      echo "[entrypoint] profile has a singleton lock; refusing to steal it" >&2
+      exit 1
+    fi
+  done
+}
+verify_chromium_policy() {
+  node -e 'const p=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); if(p.PasswordManagerEnabled!==false || (p.AutofillAddressEnabled!==undefined && p.AutofillAddressEnabled!==false) || (p.AutofillCreditCardEnabled!==undefined && p.AutofillCreditCardEnabled!==false)) process.exit(1);' "$CHROMIUM_POLICY_FILE"
+}
+
+verify_profile_ready
+verify_chromium_policy
 rm -f /tmp/.X99-lock
 Xvfb :99 -screen 0 1280x900x24 -nolisten tcp &
 export DISPLAY=:99
 sleep 1
-
-find /home/chrome/.config/chromium -name 'SingletonLock' -o -name 'SingletonCookie' -o -name 'SingletonSocket' 2>/dev/null | xargs rm -f 2>/dev/null || true
 
 export CHROME_HOSTNAME="${CHROME_HOSTNAME:-${HOSTNAME:-chrome}}"
 envsubst '${CHROME_HOSTNAME}' < /etc/nginx/conf.d/cdp.conf.template > /etc/nginx/conf.d/cdp.conf
@@ -66,8 +118,8 @@ CHROME_BIN="$(node /usr/local/bin/resolve-browser-executable.mjs "$BROWSER_ENGIN
 }
 echo "[entrypoint] Browser engine: $BROWSER_ENGINE"
 start_chrome() {
-  find /home/chrome/.config/chromium -name 'SingletonLock' -o -name 'SingletonCookie' -o -name 'SingletonSocket' 2>/dev/null | xargs rm -f 2>/dev/null || true
-  "$CHROME_BIN" --remote-debugging-port=9222 --remote-debugging-address=0.0.0.0 --remote-allow-origins='*' --no-sandbox --disable-dev-shm-usage --user-data-dir=/home/chrome/.config/chromium --window-size=1280,900 "${CHROME_EXTRA_FLAGS[@]}" "$@"
+  verify_profile_ready
+  "$CHROME_BIN" --remote-debugging-port=9222 --remote-debugging-address=0.0.0.0 --remote-allow-origins='*' --no-sandbox --disable-dev-shm-usage --disable-save-password-bubble --user-data-dir="$PROFILE_DIR" --window-size=1280,900 "${CHROME_EXTRA_FLAGS[@]}" "$@"
 }
 
 run_runtime_self_check() {

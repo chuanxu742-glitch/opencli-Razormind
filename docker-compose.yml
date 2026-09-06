@@ -379,9 +379,15 @@ services:
       AGENT_REGISTER: ${AGENT_REGISTER:-ws}
       AGENT_ADVERTISE_URL: ${AGENT_ADVERTISE_URL:-http://agent-1:19823}
       BROWSER_RUNTIME_BUNDLE_ROOT: /opt/browser-runtime-bundles
+      PROFILE_DIR: ${CHROME_PROFILE_DIR:-/home/chrome/.config/chromium}
+      RUNTIME_HOME: ${CHROME_RUNTIME_HOME:-/home/chrome}
+      RUNTIME_CACHE_DIR: ${CHROME_RUNTIME_CACHE_DIR:-/home/chrome/.cache}
+      RUNTIME_STATE_DIR: ${CHROME_RUNTIME_STATE_DIR:-/var/lib/opencli/account-runtime}
+      CHROMIUM_POLICY_FILE: /etc/chromium/policies/managed/opencli-account-runtime.json
       BROWSER_RUNTIME_BUNDLE_MANIFEST: /opt/browser-runtime-bundles/opencli-default/2/manifest.json
     volumes:
-      - agent_profile_1:/home/chrome/.config/chromium
+      - agent_profile_1:${CHROME_PROFILE_DIR:-/home/chrome/.config/chromium}
+      - agent_runtime_state_1:${CHROME_RUNTIME_STATE_DIR:-/var/lib/opencli/account-runtime}
     ports:
       - "127.0.0.1:${NOVNC_PORT:-6080}:6080"
     healthcheck:
@@ -390,6 +396,7 @@ services:
       timeout: 5s
       retries: 6
       start_period: 30s
+    init: true
     restart: unless-stopped
 
   # Additional browser instances are managed dynamically via the API
@@ -431,10 +438,17 @@ services:
       HTTPS_PROXY: ${HTTPS_PROXY:-}
       BROWSER_RUNTIME_BUNDLE_ROOT: /opt/browser-runtime-bundles
       BROWSER_RUNTIME_BUNDLE_MANIFEST: /opt/browser-runtime-bundles/opencli-default/2/manifest.json
+      PROFILE_DIR: ${AGENT_PROFILE_DIR:-/home/agent/.config/chromium}
+      RUNTIME_HOME: ${AGENT_RUNTIME_HOME:-/home/agent}
+      RUNTIME_CACHE_DIR: ${AGENT_RUNTIME_CACHE_DIR:-/home/agent/.cache}
+      RUNTIME_STATE_DIR: ${AGENT_RUNTIME_STATE_DIR:-/var/lib/opencli/account-runtime}
+      CHROMIUM_POLICY_FILE: /etc/chromium/policies/managed/opencli-account-runtime.json
     volumes:
-      - agent_profile_1:/home/agent/.config/chromium
+      - agent_profile:${AGENT_PROFILE_DIR:-/home/agent/.config/chromium}
+      - agent_runtime_state:${AGENT_RUNTIME_STATE_DIR:-/var/lib/opencli/account-runtime}
     ports:
       - "${AGENT_PORT:-19823}:19823"
+    init: true
     restart: unless-stopped
 
   # ── ODP data plane (Rust hot path) — docker compose --profile odp up
@@ -621,4 +635,6 @@ volumes:
   db_data:
   agent_profile_1:
   agent_profile:
+  agent_runtime_state_1:
+  agent_runtime_state:
   invokeai_data:

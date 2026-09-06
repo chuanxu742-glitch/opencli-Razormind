@@ -45,6 +45,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         apt-get install -y --no-install-recommends npm; \
     fi \
     && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /etc/chromium/policies/managed \
+    && printf '%s\n' '{"PasswordManagerEnabled":false,"AutofillAddressEnabled":false,"AutofillCreditCardEnabled":false}' \
+       > /etc/chromium/policies/managed/opencli-account-runtime.json \
+    && chmod 0644 /etc/chromium/policies/managed/opencli-account-runtime.json
 
 # ── Optional: Chromium + VNC + virtual display ────────────────────────────────
 # Set INSTALL_CHROME=true at build time to embed Chrome in the image.
@@ -120,6 +124,7 @@ RUN chmod +x /usr/local/bin/resolve-browser-executable.mjs
 # Agent server source plus the runtime adapters it imports at startup.
 WORKDIR /app
 COPY backend/agent_server.py ./backend/agent_server.py
+COPY backend/browser_account_runtime.py ./backend/browser_account_runtime.py
 COPY backend/agent_runtime_dispatch.py ./backend/agent_runtime_dispatch.py
 COPY backend/agent_runtimes/ ./backend/agent_runtimes/
 COPY backend/miniflow/ ./backend/miniflow/
@@ -131,6 +136,7 @@ RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 
 RUN useradd -m -u 1000 agent \
     && mkdir -p /home/agent/.config/chromium /opt/cloakbrowser/cache \
+       /home/agent/.local/state/opencli-account-runtime /var/lib/opencli/account-runtime \
     && if [ "$INSTALL_CHROME" = "true" ]; then \
         mkdir -p /etc/nginx/conf.d /var/lib/nginx /var/log/nginx /run \
         && rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true \
@@ -138,7 +144,7 @@ RUN useradd -m -u 1000 agent \
         && sed -i 's|pid /run/nginx.pid|pid /tmp/nginx.pid|' /etc/nginx/nginx.conf \
         && chown -R agent:agent /etc/nginx /var/lib/nginx /var/log/nginx /run; \
     fi \
-    && chown -R agent:agent /home/agent /app /opt/cloakbrowser
+    && chown -R agent:agent /home/agent /app /opt/cloakbrowser /var/lib/opencli
 
 ENV PYTHONPATH=/app \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -156,6 +162,9 @@ ENV PYTHONPATH=/app \
     # false → connect to host Chrome (host.docker.internal)
     AGENT_HAS_CHROME=${INSTALL_CHROME} \
     BROWSER_ENGINE=${BROWSER_ENGINE} \
+    PROFILE_DIR=/home/agent/.config/chromium \
+    RUNTIME_STATE_DIR=/home/agent/.local/state/opencli-account-runtime \
+    CHROMIUM_POLICY_FILE=/etc/chromium/policies/managed/opencli-account-runtime.json \
     CLOAKBROWSER_CACHE_DIR=/opt/cloakbrowser/cache
 
 USER agent

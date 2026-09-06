@@ -5,6 +5,41 @@ HAVE_CHROME=false
 if command -v chromium >/dev/null 2>&1; then HAVE_CHROME=true; fi
 if [ "${AGENT_HAS_CHROME:-false}" = "true" ]; then HAVE_CHROME=true; fi
 
+PROFILE_DIR="${PROFILE_DIR:-/home/agent/.config/chromium}"
+RUNTIME_HOME="${RUNTIME_HOME:-/home/agent}"
+RUNTIME_CACHE_DIR="${RUNTIME_CACHE_DIR:-$RUNTIME_HOME/.cache}"
+RUNTIME_STATE_DIR="${RUNTIME_STATE_DIR:-$RUNTIME_HOME/.local/state/opencli-account-runtime}"
+CHROMIUM_POLICY_FILE="${CHROMIUM_POLICY_FILE:-/etc/chromium/policies/managed/opencli-account-runtime.json}"
+validate_runtime_path() {
+  local path="$1"
+  local label="$2"
+  if [[ "$path" != /* || "$path" == "/" || -L "$path" ]]; then
+    echo "[agent] $label must be an absolute, non-root, non-symlink path" >&2
+    exit 1
+  fi
+  mkdir -p -- "$path"
+  local canonical
+  canonical="$(readlink -f -- "$path" 2>/dev/null)" || {
+    echo "[agent] $label cannot be canonicalized" >&2
+    exit 1
+  }
+  if [[ "$canonical" != "$path" ]]; then
+    echo "[agent] $label has a symlinked parent" >&2
+    exit 1
+  fi
+}
+validate_runtime_path "$PROFILE_DIR" PROFILE_DIR
+validate_runtime_path "$RUNTIME_HOME" RUNTIME_HOME
+validate_runtime_path "$RUNTIME_CACHE_DIR" RUNTIME_CACHE_DIR
+validate_runtime_path "$RUNTIME_STATE_DIR" RUNTIME_STATE_DIR
+if [[ "$CHROMIUM_POLICY_FILE" != /* || -L "$CHROMIUM_POLICY_FILE" || ! -f "$CHROMIUM_POLICY_FILE" ]]; then
+  echo "[agent] managed Chromium policy is unavailable" >&2
+  exit 1
+fi
+export PROFILE_DIR RUNTIME_HOME RUNTIME_CACHE_DIR RUNTIME_STATE_DIR CHROMIUM_POLICY_FILE
+export HOME="$RUNTIME_HOME"
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$RUNTIME_HOME/.config}"
+export CLOAKBROWSER_CACHE_DIR="${CLOAKBROWSER_CACHE_DIR:-$RUNTIME_CACHE_DIR}"
 BROWSER_RUNTIME_BUNDLE_ROOT="${BROWSER_RUNTIME_BUNDLE_ROOT:-/opt/browser-runtime-bundles}"
 BROWSER_RUNTIME_BUNDLE_MANIFEST="${BROWSER_RUNTIME_BUNDLE_MANIFEST:-$BROWSER_RUNTIME_BUNDLE_ROOT/opencli-default/2/manifest.json}"
 BUNDLE_EXTENSION_OUTPUT="$(node /usr/local/bin/resolve-browser-runtime-bundle.mjs "$BROWSER_RUNTIME_BUNDLE_MANIFEST" "$BROWSER_RUNTIME_BUNDLE_ROOT")"
@@ -31,14 +66,38 @@ if [ -n "${BROWSER_STARTUP_PAGES:-}" ]; then
 fi
 if [ "${#STARTUP_PAGES[@]}" -eq 0 ]; then STARTUP_PAGES=(https://www.doubao.com/chat); fi
 
+verify_profile_ready() {
+  if [[ "$CHROME_PROFILE" != /* || "$CHROME_PROFILE" == "/" || -L "$CHROME_PROFILE" ]]; then
+    echo "[agent] active PROFILE_DIR must be absolute and non-symlink" >&2
+    exit 1
+  fi
+  for lock_name in SingletonLock SingletonCookie SingletonSocket; do
+    if [ -e "$CHROME_PROFILE/$lock_name" ]; then
+      echo "[agent] profile has a singleton lock; refusing to steal it" >&2
+      exit 1
+    fi
+  done
+}
+verify_chromium_policy() {
+  node -e 'const p=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); if(p.PasswordManagerEnabled!==false || (p.AutofillAddressEnabled!==undefined && p.AutofillAddressEnabled!==false) || (p.AutofillCreditCardEnabled!==undefined && p.AutofillCreditCardEnabled!==false)) process.exit(1);' "$CHROMIUM_POLICY_FILE"
+}
+
 if [ "$HAVE_CHROME" = "true" ]; then
   export OPENCLI_CDP_ENDPOINT="http://localhost:9222"
   echo "[agent] Chrome detected — starting embedded browser stack"
-  CHROME_PROFILE=/home/agent/.config/chromium
+  CHROME_PROFILE="$PROFILE_DIR"
   if [ "${OPENCLI_BROWSER_PROFILE_KIND:-authenticated}" = "anonymous" ]; then
     CHROME_PROFILE="$(mktemp -d /tmp/opencli-anonymous-profile.XXXXXX)"
+    # Keep every browser/runtime consumer on the same explicit profile path;
+    # anonymous acquisition receives a fresh non-persistent profile and never
+    # borrows the account volume.
+    PROFILE_DIR="$CHROME_PROFILE"
+    export PROFILE_DIR
     echo "[agent] Anonymous profile requested — using fresh $CHROME_PROFILE"
   fi
+  mkdir -p "$CHROME_PROFILE"
+  verify_profile_ready
+  verify_chromium_policy
   rm -f /tmp/.X99-lock
   Xvfb :99 -screen 0 1280x900x24 -nolisten tcp &
   export DISPLAY=:99
@@ -65,12 +124,11 @@ if [ "$HAVE_CHROME" = "true" ]; then
   done) &
   echo "[agent] BBX daemon started on ${BBX_TCP_HOST:-127.0.0.1}:${BBX_TCP_PORT:-19826}"
 
-  find "$CHROME_PROFILE" -name 'SingletonLock' -o -name 'SingletonCookie' -o -name 'SingletonSocket' 2>/dev/null | xargs rm -f 2>/dev/null || true
 
   DAEMON_JS="$(npm root -g)/@jackwener/opencli/dist/src/daemon.js"
   if [ -f "$DAEMON_JS" ]; then
     (while true; do
-      env -u OPENCLI_DAEMON_PORT OPENCLI_DAEMON_LISTEN=127.0.0.1 node "$DAEMON_JS"
+      OPENCLI_DAEMON_LISTEN=127.0.0.1 node "$DAEMON_JS"
       echo "[agent] Bridge daemon exited, restarting in 1s..."
       sleep 1
     done) &
@@ -86,8 +144,8 @@ if [ "$HAVE_CHROME" = "true" ]; then
   }
   echo "[agent] Browser engine: $BROWSER_ENGINE"
   start_chrome() {
-    find "$CHROME_PROFILE" -name 'SingletonLock' -o -name 'SingletonCookie' -o -name 'SingletonSocket' 2>/dev/null | xargs rm -f 2>/dev/null || true
-    "$CHROME_BIN" --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --remote-allow-origins='*' --no-sandbox --disable-dev-shm-usage --no-first-run --no-default-browser-check --disable-session-crashed-bubble --user-data-dir="$CHROME_PROFILE" --profile-directory=Default "${CHROME_EXTRA_FLAGS[@]}" --window-size=1280,900 "$@"
+    verify_profile_ready
+    "$CHROME_BIN" --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --remote-allow-origins='*' --no-sandbox --disable-dev-shm-usage --no-first-run --no-default-browser-check --disable-session-crashed-bubble --disable-save-password-bubble --user-data-dir="$CHROME_PROFILE" --profile-directory=Default "${CHROME_EXTRA_FLAGS[@]}" --window-size=1280,900 "$@"
   }
   run_runtime_self_check() {
     for _ in $(seq 1 30); do
