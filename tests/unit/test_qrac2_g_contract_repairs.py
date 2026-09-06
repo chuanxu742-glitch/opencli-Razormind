@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from pydantic import SecretStr
 
 from backend.models.browser import BrowserAccountStatus, BrowserAuthEvidence, BrowserCommandKind
 from backend.schemas.browser_account import (
@@ -20,10 +21,23 @@ from backend.schemas.browser_account import (
     PortalOwnerRouteV1,
     PortalPixelFrameV1,
     PortalRegionFocusV1,
+    PortalOuterBindingV1,
     PortalTicketGrantV1,
+    PortalTicketIssueRequestV1,
+    PortalTicketRecordV1,
+    PortalTicketRedeemRequestV1,
+    PortalTransientV1,
+    PortalWireFrameV1,
     SensitiveSessionBindingV1,
     SessionEnvelopeV1,
     SessionTargetV1,
+)
+from backend.services.browser_portal_contract import (
+    admit_command_before_side_effects,
+    issue_first_portal_ticket,
+    redeem_portal_ticket,
+    route_portal_frame,
+    ticket_record_from_issue,
 )
 
 
@@ -100,20 +114,21 @@ def test_h1_freezes_command_and_rejects_stale_guard_before_side_effects() -> Non
             available_at=now,
             expires_at=now + timedelta(seconds=1),
         )
-    CommandExecutionGuardV1(command=command, claim=claim, session=session)
+    admitted = admit_command_before_side_effects(command, claim, session)
+    assert admitted.claim.command_id == "command"
     with pytest.raises(ValueError):
-        CommandExecutionGuardV1(
-            command=command,
-            claim=claim.model_copy(update={"workspace_id": "other"}),
-            session=session,
+        admit_command_before_side_effects(
+            command,
+            claim.model_copy(update={"workspace_id": "other"}),
+            session,
         )
     with pytest.raises(ValueError):
-        CommandExecutionGuardV1(
-            command=command.model_copy(
+        admit_command_before_side_effects(
+            command.model_copy(
                 update={"payload": LoginRuleCommandPayloadV1(login_rule_id="rule", login_rule_version="2")}
             ),
-            claim=claim,
-            session=session,
+            claim,
+            session,
         )
 
 
@@ -218,6 +233,7 @@ def test_h4_ticket_entry_responses_cannot_be_mistaken_for_grants() -> None:
         reason="capacity_missing",
     )
     blocked = PortalEntryBlockedV1(
+        http_status=503,
         account_ref=ref,
         session_id="session",
         session_revision=3,
@@ -309,4 +325,135 @@ def test_h5_pixel_mime_bytes_and_owner_route_are_bounded() -> None:
             route_expires_at=now + timedelta(minutes=1),
             max_frame_bytes=4_000_000,
             max_input_bytes=4_096,
+        )
+
+
+def test_h3_first_ticket_redeem_binds_csrf_session_and_replay() -> None:
+    now, ref, target, _, _, _ = _context()
+    csrf = SecretStr("csrf-token-012345")
+    ticket = SecretStr("ticket-secret-012345")
+    issue = issue_first_portal_ticket(
+        PortalTicketIssueRequestV1(
+            account_ref=ref,
+            session_id="session",
+            expected_session_revision=3,
+            csrf_token=csrf,
+        ),
+        ticket=ticket,
+        now=now,
+        expires_at=now + timedelta(minutes=5),
+        hard_expires_at=now + timedelta(minutes=10),
+        session_revision=3,
+    )
+    record = ticket_record_from_issue(issue, ticket_id="ticket-id", subject="operator")
+    redeem = PortalTicketRedeemRequestV1(
+        first_entry="initial",
+        account_ref=ref,
+        session_id="session",
+        expected_session_revision=3,
+        ticket_id="ticket-id",
+        ticket=ticket,
+        csrf_token=csrf,
+    )
+    grant = redeem_portal_ticket(
+        redeem,
+        record=record,
+        authenticated_subject="operator",
+        now=now,
+        cookie_name="qrac2",
+        websocket_path="/portal",
+    )
+    assert isinstance(grant, PortalTicketGrantV1)
+    replay = redeem_portal_ticket(
+        redeem,
+        record=record.model_copy(update={"consumed_at": now}),
+        authenticated_subject="operator",
+        now=now,
+        cookie_name="qrac2",
+        websocket_path="/portal",
+    )
+    assert getattr(replay, "status") == "blocked"
+    assert getattr(replay, "http_status") == 410
+    mismatch = redeem_portal_ticket(
+        redeem.model_copy(update={"session_id": "other"}),
+        record=record,
+        authenticated_subject="operator",
+        now=now,
+        cookie_name="qrac2",
+        websocket_path="/portal",
+    )
+    assert getattr(mismatch, "status") == "blocked"
+    assert getattr(mismatch, "http_status") == 409
+
+
+def test_h5_owner_route_applies_real_wire_binding() -> None:
+    now, ref, target, _, _, _ = _context()
+    raw = b"\x89PNG\r\n\x1a\n"
+    frame = PortalPixelFrameV1(
+        workspace_id=ref.workspace_id,
+        account_id=ref.account_id,
+        session_id="session",
+        epoch=2,
+        target=target,
+        view_generation=4,
+        sequence=2,
+        region_kind="form",
+        mime_type="image/png",
+        expires_at=now + timedelta(seconds=5),
+        clip=PortalClipV1(x=0, y=0, width=10, height=10),
+        byte_length=len(raw),
+        frame_bytes=raw,
+    )
+    wire = PortalWireFrameV1(
+        sequence=2,
+        encoding="pixel-binary",
+        content_type="application/octet-stream",
+        mime_type="image/png",
+        byte_length=len(raw),
+        transient=PortalTransientV1(
+            binding=PortalOuterBindingV1(
+                workspace_id=ref.workspace_id,
+                account_id=ref.account_id,
+                session_id="session",
+                epoch=2,
+                target=target,
+                view_generation=4,
+            ),
+            pixel=frame,
+        ),
+    )
+    binding = SensitiveSessionBindingV1(
+        account_ref=ref,
+        session_id="session",
+        epoch=2,
+        target=target,
+        view_generation=4,
+        record_session_id="record-session",
+    )
+    route = PortalOwnerRouteV1(
+        binding=binding,
+        node_identity=NodeIdentityV1(node_id="node", boot_id="boot"),
+        region_focus=PortalRegionFocusV1(
+            target=target,
+            view_generation=4,
+            region_kind="form",
+            approved_regions=[frame.clip],
+            focused_field_ref="otp",
+        ),
+        session_revision=3,
+        route_expires_at=now + timedelta(minutes=1),
+        max_frame_bytes=4_000_000,
+        max_input_bytes=4_096,
+    )
+    assert route_portal_frame(route, wire) is wire
+    with pytest.raises(ValueError):
+        route_portal_frame(
+            route,
+            wire.model_copy(
+                update={
+                    "transient": wire.transient.model_copy(
+                        update={"binding": wire.transient.binding.model_copy(update={"session_id": "other"})}
+                    )
+                }
+            ),
         )

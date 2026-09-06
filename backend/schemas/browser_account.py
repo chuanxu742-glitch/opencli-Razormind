@@ -76,7 +76,9 @@ LOGIN_SESSION_VIEW_ROUTE = f"{LOGIN_SESSION_ROUTE}/view"
 LOGIN_SESSION_TAKEOVER_ROUTE = f"{LOGIN_SESSION_ROUTE}/takeover"
 LOGIN_SESSION_CONFIRM_ROUTE = f"{LOGIN_SESSION_ROUTE}/confirm"
 LOGIN_SESSION_CLOSE_ROUTE = f"{LOGIN_SESSION_ROUTE}/close"
-PORTAL_TICKET_REDEEM_ROUTE = f"{LOGIN_SESSION_ROUTE}/portal-ticket"
+PORTAL_TICKET_ROUTE = f"{LOGIN_SESSION_ROUTE}/portal-ticket"
+PORTAL_TICKET_ISSUE_ROUTE = f"{PORTAL_TICKET_ROUTE}/issue"
+PORTAL_TICKET_REDEEM_ROUTE = f"{PORTAL_TICKET_ROUTE}/redeem"
 PORTAL_WS_ROUTE = f"{LOGIN_SESSION_ROUTE}/portal"
 IDEMPOTENCY_HEADER = "Idempotency-Key"
 
@@ -896,22 +898,35 @@ class PortalTransientV1(_ContractModel):
 
 
 class PortalWireFrameV1(_ContractModel):
-    """Explicit websocket framing without exposing transient payloads to storage."""
+    """Explicit C2/A/R websocket frame layout; payload never enters durable storage."""
 
+    contract_version: Literal[1] = QRAC2_CONTRACT_VERSION
+    protocol: Literal["qrac2.portal.v1"] = "qrac2.portal.v1"
+    sequence: int = Field(ge=1)
     encoding: Literal["control-json", "pixel-binary"]
     content_type: Literal["application/json", "application/octet-stream"]
+    mime_type: Literal["application/json", "image/png", "image/jpeg", "image/webp"]
+    byte_length: int | None = Field(default=None, ge=1, le=MAX_PORTAL_FRAME_BYTES)
     transient: PortalTransientV1
 
     @model_validator(mode="after")
     def validate_encoding(self) -> "PortalWireFrameV1":
-        if self.encoding == "control-json" and self.content_type != "application/json":
-            raise ValueError("control frames require application/json")
-        if self.encoding == "pixel-binary" and self.content_type != "application/octet-stream":
-            raise ValueError("pixel frames require application/octet-stream")
-        if self.encoding == "control-json" and self.transient.control is None:
-            raise ValueError("control framing requires a control message")
-        if self.encoding == "pixel-binary" and self.transient.pixel is None:
-            raise ValueError("pixel framing requires a pixel frame")
+        if self.encoding == "control-json":
+            if self.content_type != "application/json" or self.mime_type != "application/json":
+                raise ValueError("control frames require application/json")
+            if self.transient.control is None or self.byte_length is not None:
+                raise ValueError("control framing requires a control message and no binary length")
+        if self.encoding == "pixel-binary":
+            pixel = self.transient.pixel
+            if (
+                self.content_type != "application/octet-stream"
+                or pixel is None
+                or self.mime_type != pixel.mime_type
+                or self.byte_length != pixel.byte_length
+            ):
+                raise ValueError("pixel framing must carry the bounded pixel MIME and byte length")
+        if self.contract_version != self.transient.contract_version:
+            raise ValueError("wire and transient contract versions differ")
         return self
 
 
@@ -1009,16 +1024,77 @@ class BrowserAccountListV1(_ContractModel):
     next_cursor: str | None = Field(default=None, min_length=1, max_length=512)
 
 
+class PortalTicketIssueRequestV1(_ContractModel):
+    """First-ticket HTTP request; the ticket is issued only in the body."""
+
+    contract_version: Literal[1] = QRAC2_CONTRACT_VERSION
+    first_entry: Literal["initial"] = "initial"
+    account_ref: AccountRef
+    session_id: str = Field(min_length=1, max_length=36)
+    expected_session_revision: int = Field(ge=0)
+    csrf_token: SecretStr = Field(min_length=16, max_length=512)
+
+
+class PortalTicketIssuedV1(_ContractModel):
+    """One-time ticket and CSRF secret returned in the response body."""
+
+    contract_version: Literal[1] = QRAC2_CONTRACT_VERSION
+    status: Literal["issued"] = "issued"
+    account_ref: AccountRef
+    session_id: str = Field(min_length=1, max_length=36)
+    session_revision: int = Field(ge=0)
+    ticket: SecretStr = Field(min_length=16, max_length=512)
+    csrf_token: SecretStr = Field(min_length=16, max_length=512)
+    issued_at: datetime
+    expires_at: datetime
+    hard_expires_at: datetime
+    http_status: Literal[200] = 200
+
+    @model_validator(mode="after")
+    def validate_ticket_window(self) -> "PortalTicketIssuedV1":
+        if self.expires_at <= self.issued_at or self.hard_expires_at < self.expires_at:
+            raise ValueError("invalid portal ticket lifetime")
+        if (self.hard_expires_at - self.issued_at).total_seconds() > 1800:
+            raise ValueError("portal ticket hard lifetime exceeds thirty minutes")
+        return self
+
+
+class PortalTicketRecordV1(_ContractModel):
+    """Persisted ticket metadata; only digests, never raw ticket or CSRF."""
+
+    contract_version: Literal[1] = QRAC2_CONTRACT_VERSION
+    ticket_id: str = Field(min_length=1, max_length=36)
+    ticket_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    csrf_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    subject: str = Field(min_length=1, max_length=255)
+    account_ref: AccountRef
+    session_id: str = Field(min_length=1, max_length=36)
+    session_revision: int = Field(ge=0)
+    issued_at: datetime
+    expires_at: datetime
+    hard_expires_at: datetime
+    consumed_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def validate_ticket_window(self) -> "PortalTicketRecordV1":
+        if self.expires_at <= self.issued_at or self.hard_expires_at < self.expires_at:
+            raise ValueError("invalid portal ticket lifetime")
+        if (self.hard_expires_at - self.issued_at).total_seconds() > 1800:
+            raise ValueError("portal ticket hard lifetime exceeds thirty minutes")
+        return self
+
+
 class PortalTicketRedeemRequestV1(_ContractModel):
-    """Body-only first-entry exchange; no secret may appear in the URL."""
+    """Body-only one-time exchange; no secret may appear in the URL."""
 
     contract_version: Literal[1] = QRAC2_CONTRACT_VERSION
     first_entry: Literal["initial", "reconnect"]
     account_ref: AccountRef
     session_id: str = Field(min_length=1, max_length=36)
     expected_session_revision: int = Field(ge=0)
-    ticket: SecretStr
-    csrf_token: SecretStr
+    ticket_id: str = Field(min_length=1, max_length=36)
+    ticket: SecretStr = Field(min_length=16, max_length=512)
+    csrf_token: SecretStr = Field(min_length=16, max_length=512)
 
 class PortalTicketGrantV1(_ContractModel):
     """Non-secret routing facts returned after a successful ticket exchange."""
@@ -1026,6 +1102,7 @@ class PortalTicketGrantV1(_ContractModel):
     contract_version: Literal[1] = QRAC2_CONTRACT_VERSION
     status: Literal["granted"] = "granted"
 
+    http_status: Literal[200] = 200
     workspace_id: str = Field(min_length=1, max_length=36)
     account_id: str = Field(min_length=1, max_length=36)
     session_revision: int = Field(ge=0)
@@ -1035,6 +1112,12 @@ class PortalTicketGrantV1(_ContractModel):
     hard_expires_at: datetime
     cookie_name: str = Field(min_length=1, max_length=64)
     websocket_path: str = Field(min_length=1, max_length=512)
+    # HTTP-only cookie attributes are part of the boundary, not implementation detail.
+    cookie_http_only: Literal[True] = True
+    cookie_secure: Literal[True] = True
+    same_site: Literal["strict", "lax"] = "strict"
+    origin_required: Literal[True] = True
+    csrf_bound: Literal[True] = True
 
     @model_validator(mode="after")
     def validate_ticket_window(self) -> "PortalTicketGrantV1":
@@ -1050,6 +1133,7 @@ class PortalEntryWaitingV1(_ContractModel):
 
     contract_version: Literal[1] = QRAC2_CONTRACT_VERSION
     status: Literal["waiting"] = "waiting"
+    http_status: Literal[202] = 202
     account_ref: AccountRef
     session_id: str = Field(min_length=1, max_length=36)
     session_revision: int = Field(ge=0)
@@ -1067,10 +1151,18 @@ class PortalEntryBlockedV1(_ContractModel):
 
     contract_version: Literal[1] = QRAC2_CONTRACT_VERSION
     status: Literal["blocked"] = "blocked"
+    http_status: int = Field(ge=400, le=599)
     account_ref: AccountRef
     session_id: str = Field(min_length=1, max_length=36)
     session_revision: int = Field(ge=0)
     error_code: BrowserAccountErrorCode
+
+    @model_validator(mode="after")
+    def validate_http_status(self) -> "PortalEntryBlockedV1":
+        if self.http_status != ERROR_HTTP_STATUS[self.error_code]:
+            raise ValueError("portal error status does not match error code")
+        return self
+
 
 
 PortalEntryResponseV1 = PortalTicketGrantV1 | PortalEntryWaitingV1 | PortalEntryBlockedV1
