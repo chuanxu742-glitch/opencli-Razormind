@@ -539,6 +539,74 @@ async def test_redis_renewal_loss_cleans_lease_and_allows_reacquire(monkeypatch)
     async with second.acquire("A") as reacquired:
         assert reacquired == "A"
 
+
+@pytest.mark.asyncio
+async def test_redis_renewal_error_cancels_holder_and_allows_reacquire(monkeypatch):
+    from backend.browser_pool import RedisBrowserPool
+
+    class FailingRenewalRedis(_FakeRedis):
+        def __init__(self):
+            super().__init__()
+            self.renewal_failed = asyncio.Event()
+
+        async def eval(self, script, _numkeys, key, owner, ttl=None):
+            if "pexpire" in script and not self.renewal_failed.is_set():
+                self.renewal_failed.set()
+                raise ConnectionError("renewal connection lost")
+            return await super().eval(script, _numkeys, key, owner, ttl)
+
+    redis = FailingRenewalRedis()
+    first = RedisBrowserPool(["A"], "redis://test")
+    second = RedisBrowserPool(["A"], "redis://test")
+    monkeypatch.setattr(first, "_client", lambda: redis)
+    monkeypatch.setattr(second, "_client", lambda: redis)
+    first._LEASE_RENEW_SECONDS = 0.001
+
+    with pytest.raises(asyncio.CancelledError):
+        async with first.acquire("A"):
+            await redis.renewal_failed.wait()
+            await asyncio.Future()
+
+    assert redis.has_lease("A") is False
+    async with second.acquire("A") as reacquired:
+        assert reacquired == "A"
+
+
+@pytest.mark.asyncio
+async def test_redis_renewal_client_error_cancels_holder_and_allows_reacquire(monkeypatch):
+    from backend.browser_pool import RedisBrowserPool
+
+    class FailingClient:
+        def __init__(self, redis):
+            self.redis = redis
+            self.calls = 0
+            self.failed = asyncio.Event()
+
+        def __call__(self):
+            self.calls += 1
+            if self.calls == 2:
+                self.failed.set()
+                raise ConnectionError("renewal client unavailable")
+            return self.redis
+
+    redis = _FakeRedis()
+    first = RedisBrowserPool(["A"], "redis://test")
+    second = RedisBrowserPool(["A"], "redis://test")
+    failing_client = FailingClient(redis)
+    monkeypatch.setattr(first, "_client", failing_client)
+    monkeypatch.setattr(second, "_client", lambda: redis)
+    first._LEASE_RENEW_SECONDS = 0.001
+
+    with pytest.raises(asyncio.CancelledError):
+        async with first.acquire("A"):
+            await failing_client.failed.wait()
+            await asyncio.Future()
+
+    assert redis.has_lease("A") is False
+    async with second.acquire("A") as reacquired:
+        assert reacquired == "A"
+
+
 # Managed official-site acquisition must never fall back to the operator's
 # default (potentially authenticated) browser profile.
 @pytest.mark.asyncio

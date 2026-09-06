@@ -531,15 +531,25 @@ class RedisBrowserPool:
                         return
                     except TimeoutError:
                         pass
-                    async with self._client() as r:
-                        renewed = await r.eval(
-                            "if redis.call('get',KEYS[1]) == ARGV[1] then "
-                            "return redis.call('pexpire',KEYS[1],ARGV[2]) else return 0 end",
-                            1,
-                            self._lease_key(lease_endpoint),
-                            lease_owner,
-                            self._LEASE_TTL_MS,
+                    try:
+                        async with self._client() as r:
+                            renewed = await r.eval(
+                                "if redis.call('get',KEYS[1]) == ARGV[1] then "
+                                "return redis.call('pexpire',KEYS[1],ARGV[2]) else return 0 end",
+                                1,
+                                self._lease_key(lease_endpoint),
+                                lease_owner,
+                                self._LEASE_TTL_MS,
+                            )
+                    except Exception:
+                        logger.exception(
+                            "Chrome lease renewal failed; stopping holder: %s",
+                            lease_endpoint,
                         )
+                        stop_renewal.set()
+                        if owning_task is not None:
+                            owning_task.cancel()
+                        return
                     if not renewed:
                         if owning_task is not None:
                             owning_task.cancel()
