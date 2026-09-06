@@ -5,6 +5,7 @@ Both HTTP-mode agents (center calls agent) and WS-mode agents (agent initiates
 reverse channel) register here and have their online/offline history tracked.
 """
 import io
+import json
 import logging
 import re
 import shlex
@@ -447,6 +448,82 @@ async def get_agent_runtime_bundle() -> Response:
         content=archive.getvalue(),
         media_type="application/gzip",
         headers={"Content-Disposition": 'attachment; filename="opencli-agent-runtime.tar.gz"'},
+    )
+
+
+@router.get("/install/opencli-adapters.tar.gz")
+async def get_opencli_adapter_bundle() -> Response:
+    """Distribute the fixed adapter inventory through the existing API auth boundary."""
+    roots = [Path(__file__).parent.parent.parent.parent, Path("/app")]
+    root = next(
+        (candidate for candidate in roots
+         if (candidate / "integrations/opencli/adapter-pack.json").is_file()),
+        None,
+    )
+    if root is None:
+        raise HTTPException(status_code=404, detail="OpenCLI adapter package not packaged")
+    source = root / "integrations/opencli"
+    try:
+        inventory = json.loads((source / "adapter-pack.json").read_text(encoding="utf-8"))
+        files = inventory.get("files")
+        if (
+            inventory.get("schemaVersion") != 1
+            or inventory.get("opencliVersion") != "1.8.7"
+            or not isinstance(files, list)
+            or not files
+            or any(
+                not isinstance(file, str)
+                or re.fullmatch(r"(amazon|taobao|coupang|ebay)/[a-z0-9-]+\.js", file) is None
+                for file in files
+            )
+            or len(files) != len(set(files))
+            or not isinstance(inventory.get("commands"), list)
+            or not inventory["commands"]
+        ):
+            raise ValueError("Invalid inventory")
+        for command in inventory["commands"]:
+            if (
+                not isinstance(command, dict)
+                or command.get("modulePath") not in files
+                or command.get("sourceFile", command.get("modulePath")) not in files
+            ):
+                raise ValueError("Missing command payload")
+        names = [
+            "scripts/install-opencli-adapters.mjs",
+            "integrations/opencli/adapter-pack.json",
+            "integrations/opencli/LICENSE.opencli",
+            *(f"integrations/opencli/{file}" for file in files),
+        ]
+        payload = []
+        for name in names:
+            file = root / name
+            if (
+                not file.is_file()
+                or any(part.is_symlink() or part.is_junction()
+                       for part in [file, *file.parents] if part != root.parent)
+                or not file.resolve().is_relative_to(root.resolve())
+            ):
+                raise ValueError("Unsafe or missing payload")
+            data = file.read_bytes()
+            if not data:
+                raise ValueError("Empty payload")
+            payload.append((name, data))
+    except (OSError, ValueError, TypeError, AttributeError) as exc:
+        raise HTTPException(
+            status_code=503, detail="OpenCLI adapter package is incomplete or invalid"
+        ) from exc
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w:gz") as tar:
+        for name, data in payload:
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            info.mode = 0o644
+            info.mtime = 0
+            tar.addfile(info, io.BytesIO(data))
+    return Response(
+        content=archive.getvalue(),
+        media_type="application/gzip",
+        headers={"Content-Disposition": 'attachment; filename="opencli-adapters.tar.gz"'},
     )
 
 

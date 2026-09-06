@@ -1,5 +1,6 @@
-"""在隔离的真实 OpenCLI 安装上验证补丁，不修改全局 npm 或访问商家。"""
+"""在隔离的官方 OpenCLI 与用户 HOME 上验证独立 adapters；不访问真实商家。"""
 
+import base64
 import hashlib
 import json
 import os
@@ -13,6 +14,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 PATCH = ROOT / "scripts" / "patch-opencli.js"
+INSTALLER = ROOT / "scripts" / "install-opencli-adapters.mjs"
+ADAPTERS = ROOT / "integrations" / "opencli"
 
 
 def _run(args, *, env=None):
@@ -23,44 +26,51 @@ def _run(args, *, env=None):
 def baseline():
     supplied = os.environ.get("OPENCLI_TEST_PACKAGE")
     archive = os.environ.get("OPENCLI_TEST_ARCHIVE")
-    required = bool(supplied or archive)
     node = shutil.which("node")
-    if not node:
-        if required:
-            pytest.fail("显式 OpenCLI fixture 要求 Node，不允许跳过")
-        pytest.skip("需要 Node 和已安装的 OpenCLI 1.8.7")
-    if archive and not Path(archive).is_file():
-        pytest.fail("显式 OPENCLI_TEST_ARCHIVE 文件不存在")
-    candidates = [Path(supplied)] if supplied else [
-        Path(os.environ.get("APPDATA", "")) / "npm/node_modules/@jackwener/opencli",
-        Path("/usr/local/lib/node_modules/@jackwener/opencli"),
-        Path("/usr/lib/node_modules/@jackwener/opencli"),
-    ]
-    source = next((p for p in candidates if (p / "package.json").is_file()), None)
-    if source is None:
-        if required:
-            pytest.fail("显式 OpenCLI fixture 安装根不存在")
-        pytest.skip("设置 OPENCLI_TEST_PACKAGE 为真实 OpenCLI 1.8.7 安装根")
-    if not archive and (source / ".opencli-admin-ecommerce.json").exists():
-        if required:
-            pytest.fail("显式安装根已经打补丁；请提供 pristine OPENCLI_TEST_ARCHIVE")
-        pytest.skip("本地安装已经打补丁；需要 pristine OPENCLI_TEST_ARCHIVE")
+    if not node or not supplied or not archive:
+        pytest.fail("需要 Node、OPENCLI_TEST_PACKAGE 与官方 OPENCLI_TEST_ARCHIVE；不读取全局安装")
+    source = Path(supplied).resolve()
+    archive = Path(archive).resolve()
+    if not archive.is_file() or not (source / "node_modules").is_dir():
+        pytest.fail("显式 OpenCLI 归档或隔离 runtime dependencies 不存在")
+    expected = "2M+oPc70R1jNGzKzNrsm3fN4/gdvxCKlla7s9eaaTjkDjlzHpoZFN1YdV01A185kwCTN/ChOg+rbO4epO73c3w=="
+    if base64.b64encode(hashlib.sha512(archive.read_bytes()).digest()).decode() != expected:
+        pytest.fail("OpenCLI 1.8.7 官方归档 SHA512 不匹配")
     return node, source, archive
 
 
 def _copy_baseline(prefix, source, archive, *, include_dependencies=True):
     package = prefix / "node_modules/@jackwener/opencli"
-    if archive:
-        unpack = prefix / "unpack"
-        with tarfile.open(archive) as bundle:
-            bundle.extractall(unpack, filter="data")
-        package.parent.mkdir(parents=True)
-        shutil.move(str(unpack / "package"), package)
-        if include_dependencies:
-            shutil.copytree(source / "node_modules", package / "node_modules")
-    else:
-        shutil.copytree(source, package, ignore=None if include_dependencies else shutil.ignore_patterns("node_modules"))
+    unpack = prefix / "unpack"
+    with tarfile.open(archive) as bundle:
+        bundle.extractall(unpack, filter="data")
+    package.parent.mkdir(parents=True)
+    shutil.move(str(unpack / "package"), package)
+    if include_dependencies:
+        shutil.copytree(source / "node_modules", package / "node_modules")
     return package
+
+
+def _isolated_runtime(prefix, node):
+    for directory in ("home", "bin", "cache", "tmp"):
+        (prefix / directory).mkdir(parents=True, exist_ok=True)
+    isolated_node = prefix / "bin" / Path(node).name
+    shutil.copy2(node, isolated_node)
+    env = {key: value for key, value in os.environ.items() if key.upper() in {"SYSTEMROOT", "WINDIR"}}
+    env.update(
+        HOME=str(prefix / "home"), USERPROFILE=str(prefix / "home"),
+        PATH=str(prefix / "bin"), NPM_CONFIG_PREFIX=str(prefix),
+        NPM_CONFIG_CACHE=str(prefix / "cache"),
+        TEMP=str(prefix / "tmp"), TMP=str(prefix / "tmp"),
+        XDG_CACHE_HOME=str(prefix / "cache"),
+    )
+    return str(isolated_node), env
+
+
+def _business_snapshot(package):
+    paths = [path for path in (package / "clis").rglob("*") if path.is_file()]
+    paths.append(package / "cli-manifest.json")
+    return {path.relative_to(package).as_posix(): hashlib.sha256(path.read_bytes()).digest() for path in paths}
 
 
 @pytest.fixture(scope="module")
@@ -68,27 +78,35 @@ def installation(tmp_path_factory, baseline):
     node, source, archive = baseline
     prefix = tmp_path_factory.mktemp("ecommerce-opencli")
     package = _copy_baseline(prefix, source, archive)
-    result = _run([node, str(PATCH), str(prefix)])
-    assert result.returncode == 0, result.stderr + result.stdout
-    env = {key: value for key, value in os.environ.items() if key.upper() in {"PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP"}}
-    env.update(HOME=str(prefix / "home"), USERPROFILE=str(prefix / "home"))
-    (prefix / "home").mkdir()
+    node, env = _isolated_runtime(prefix, node)
+    before = _business_snapshot(package)
+    for command in (
+        [node, str(PATCH), str(prefix)],
+        [node, str(INSTALLER), "--source", str(ADAPTERS), "--prefix", str(prefix), "--home", env["HOME"]],
+        [node, str(package / "dist/src/main.js"), "list", "-f", "json"],
+    ):
+        result = _run(command, env=env)
+        assert result.returncode == 0, result.stderr + result.stdout
+    assert _business_snapshot(package) == before
     return node, prefix, package, env
 
 
 def _js(installation, code):
     node, _, package, env = installation
-    result = _run([node, "--input-type=module", "-e", code], env=dict(env, FIXTURE_PACKAGE=package.as_uri()))
+    result = _run([node, "--input-type=module", "-e", code], env=dict(
+        env, FIXTURE_PACKAGE=package.as_uri(),
+        FIXTURE_ADAPTERS=(Path(env["HOME"]) / ".opencli/clis").as_uri(),
+    ))
     assert result.returncode == 0, result.stderr + result.stdout
     return json.loads(result.stdout)
 
 
 def test_patch_reentrant_and_real_cli_discovery(installation):
     node, prefix, package, env = installation
-    before = {p: hashlib.sha256(p.read_bytes()).digest() for p in package.glob("clis/ebay/*.js")}
+    before = _business_snapshot(package)
     result = _run([node, str(PATCH), str(prefix)], env=env)
     assert result.returncode == 0, result.stderr
-    assert before == {p: hashlib.sha256(p.read_bytes()).digest() for p in before}
+    assert _business_snapshot(package) == before
     catalog = _run([node, str(package / "dist/src/main.js"), "list", "-f", "json"], env=env)
     assert catalog.returncode == 0, catalog.stderr
     ebay = {row["name"]: row for row in json.loads(catalog.stdout) if row["site"] == "ebay"}
@@ -98,11 +116,11 @@ def test_patch_reentrant_and_real_cli_discovery(installation):
 
 def test_amazon_real_payload_locale_and_strict_identity(installation):
     data = _js(installation, r"""
-const root = process.env.FIXTURE_PACKAGE;
-const shared = await import(root + '/clis/amazon/shared.js');
-const product = (await import(root + '/clis/amazon/product.js')).__test__;
-const offer = (await import(root + '/clis/amazon/offer.js')).__test__;
-const discussion = (await import(root + '/clis/amazon/discussion.js')).__test__;
+const root = process.env.FIXTURE_ADAPTERS;
+const shared = await import(root + '/amazon/shared.js');
+const product = (await import(root + '/amazon/product.js')).__test__;
+const offer = (await import(root + '/amazon/offer.js')).__test__;
+const discussion = (await import(root + '/amazon/discussion.js')).__test__;
 const rows = [
  ['com', '$1,299.99'], ['de','€1.234,56'], ['de','1.234,56 €'],
  ['ca','CDN$29.99'], ['ca','$29.99'], ['co.jp','￥2,999'],
@@ -127,9 +145,52 @@ console.log(JSON.stringify({rows, rejected:invalid.map(url=>{try {shared.buildPr
     assert data["unknownPrice"]["price_value"] is None
 
 
+def test_all_seven_amazon_commands_use_local_marketplace_helpers(installation):
+    data = _js(installation, r"""
+import vm from 'node:vm';
+const names=['search','product','offer','discussion','bestsellers','new-releases','movers-shakers'];
+for(const name of names) await import(process.env.FIXTURE_ADAPTERS+'/amazon/'+name+'.js');
+const {getRegistry}=await import(process.env.FIXTURE_PACKAGE+'/dist/src/registry.js');
+const productUrl='https://www.amazon.ca/dp/B000000001';
+const node=(text,attrs={})=>({textContent:text,innerText:text,href:attrs.href,getAttribute:key=>attrs[key]??null});
+function select(selector){
+ if(selector.includes('rating-out-of-text')||selector.includes('#acrPopover'))return node('4.5 out of 5 stars',{title:'4.5 out of 5 stars'});
+ if(selector.includes('total-review-count')||selector.includes('#acrCustomerReviewText')||selector.includes('#customerReviews'))return node('1,234 ratings');
+ if(selector.includes('aria-label*="out of 5 stars"'))return node('',{'aria-label':'4.5 out of 5 stars'});
+ if(selector.includes('a-offscreen')||selector.includes('a-color-price'))return node('$29.99');
+ if(selector.includes('sellerProfileTriggerId'))return node('Fixture seller');
+ if(selector.includes('ShipsFrom')||selector.includes('shipsFrom')||selector.includes('merchant-info'))return node('Ships from Fixture warehouse Sold by Fixture seller');
+ if(selector.includes('productTitle')||selector==='h2'||selector.includes('line-clamp'))return node('Fixture product');
+ if(selector.includes('/dp/'))return node('Fixture product',{href:productUrl});
+ if(selector.includes('zg-bdg-text'))return node('#1');
+ return null;
+}
+const card={getAttribute:key=>key==='data-asin'?'B000000001':null,querySelector:select,querySelectorAll:()=>[],innerText:'Fixture product'};
+const document={title:'Fixture products',body:{innerText:'Fixture products'},querySelector:select,
+ querySelectorAll:selector=>selector.includes('s-search-result')||selector.includes('p13n')?[card]:[]};
+const paths={bestsellers:'/Best-Sellers/zgbs','new-releases':'/gp/new-releases','movers-shakers':'/gp/movers-and-shakers'};
+const result={};
+for(const name of names){
+ const input=paths[name]?'https://www.amazon.ca'+paths[name]:productUrl;
+ const href=name==='discussion'?'https://www.amazon.ca/product-reviews/B000000001':input;
+ const page={goto:async()=>{},wait:async()=>{},evaluate:async code=>vm.runInNewContext(code,{document,window:{location:{href}}})};
+ result[name]=await getRegistry().get('amazon/'+name).func(page,{input,query:'fixture',limit:1});
+}
+console.log(JSON.stringify(result));
+""")
+    assert set(data) == {"search", "product", "offer", "discussion", "bestsellers", "new-releases", "movers-shakers"}
+    for name, rows in data.items():
+        assert rows[0]["asin"] == "B000000001"
+        if name == "discussion":
+            assert rows[0]["average_rating_value"] == 4.5
+            assert rows[0]["total_review_count"] == 1234
+        else:
+            assert (rows[0]["price_text"], rows[0]["price_value"], rows[0]["currency"]) == ("$29.99", 29.99, "CAD")
+
+
 def test_locale_ambiguous_amounts_and_numeric_word_boundaries(installation):
     data = _js(installation, r"""
-const shared=await import(process.env.FIXTURE_PACKAGE+'/clis/amazon/shared.js');
+const shared=await import(process.env.FIXTURE_ADAPTERS+'/amazon/shared.js');
 const inputs=['$10 - $20','1.234,56 € 1.399,99 €','-$19.99'];
 console.log(JSON.stringify({
  inputs, amounts:inputs.map(text=>shared.parsePriceText(text,'https://www.amazon.com/dp/B000000001')),
@@ -148,7 +209,7 @@ console.log(JSON.stringify({
 
 def test_coupang_variants_and_path_boundary(installation):
     data = _js(installation, r"""
-const {canonicalizeProductUrl} = await import(process.env.FIXTURE_PACKAGE + '/clis/coupang/utils.js');
+const {canonicalizeProductUrl} = await import(process.env.FIXTURE_ADAPTERS + '/coupang/utils.js');
 const urls=['https://www.coupang.com/vp/products/123456789?itemId=111&vendorItemId=222&q=tracking',
 'https://www.coupang.com/vp/products/123456789?itemId=112&vendorItemId=223',
 'https://www.coupang.com/vp/products/123456789oops',
@@ -163,10 +224,10 @@ console.log(JSON.stringify(urls.map(url=>canonicalizeProductUrl(url,''))));
 def test_coupang_native_search_and_product_preserve_observed_variants(installation):
     data = _js(installation, r"""
 import vm from 'node:vm';
-const root=process.env.FIXTURE_PACKAGE;
-await import(root+'/clis/coupang/search.js');
-await import(root+'/clis/coupang/product.js');
-const {getRegistry}=await import(root+'/dist/src/registry.js');
+const root=process.env.FIXTURE_ADAPTERS;
+await import(root+'/coupang/search.js');
+await import(root+'/coupang/product.js');
+const {getRegistry}=await import(process.env.FIXTURE_PACKAGE+'/dist/src/registry.js');
 const search=getRegistry().get('coupang/search');
 const product=getRegistry().get('coupang/product');
 const base='https://www.coupang.com/vp/products/123456789';
@@ -207,12 +268,30 @@ console.log(JSON.stringify({
     assert data["observedOnly"]["rows"][0]["url"] == base + "?itemId=112&vendorItemId=222"
 
 
+def test_coupang_write_command_retains_variants_before_any_write(installation):
+    data = _js(installation, r"""
+await import(process.env.FIXTURE_ADAPTERS+'/coupang/add-to-cart.js');
+const {getRegistry}=await import(process.env.FIXTURE_PACKAGE+'/dist/src/registry.js');
+const command=getRegistry().get('coupang/add-to-cart');
+let navigated, evaluated=false, stopped=false;
+const page={goto:async url=>{navigated=url;throw new Error('STOP_BEFORE_WRITE');},
+ evaluate:async()=>{evaluated=true;throw new Error('WRITE_PATH_FORBIDDEN');}};
+try {
+ await command.func(page,{'product-id':'123456789',url:'https://www.coupang.com/vp/products/123456789?itemId=111&vendorItemId=222&track=x'});
+} catch(error){stopped=error.message.includes('STOP_BEFORE_WRITE');}
+console.log(JSON.stringify({navigated,evaluated,stopped,access:command.access,browser:command.browser}));
+""")
+    assert data["navigated"] == "https://www.coupang.com/vp/products/123456789?itemId=111&vendorItemId=222"
+    assert data["stopped"] is True and data["evaluated"] is False
+    assert data["access"] == "write" and data["browser"] is True
+
+
 def test_taobao_actual_extractor_keeps_same_title_different_ids(installation):
     data = _js(installation, r"""
 import vm from 'node:vm';
-const root=process.env.FIXTURE_PACKAGE;
-await import(root+'/clis/taobao/search.js');
-const {getRegistry}=await import(root+'/dist/src/registry.js');
+const root=process.env.FIXTURE_ADAPTERS;
+await import(root+'/taobao/search.js');
+const {getRegistry}=await import(process.env.FIXTURE_PACKAGE+'/dist/src/registry.js');
 const command=getRegistry().get('taobao/search');
 const cards=['12345678901','12345678902','12345678901','12345678903'].map(id=>({parentElement:{getAttribute:()=>id,parentElement:null},querySelector:s=>s.includes('title--')?{textContent:'Same title'}:null,querySelectorAll:()=>[]}));
 const page={goto:async()=>{},wait:async()=>{},autoScroll:async()=>{},evaluate:async code=>{
@@ -326,38 +405,39 @@ def test_real_ebay_cli_legitimate_zero_results(installation, tmp_path):
     assert json.loads(result.stdout) == []
 
 
-def test_drift_is_rejected_before_any_install_mutation(installation):
-    node, prefix, package, env = installation
-    target = package / "clis/amazon/shared.js"
-    original = target.read_bytes()
-    manifest = (package / "cli-manifest.json").read_bytes()
-    bridge = (package / "dist/src/browser/bridge.js").read_bytes()
-    try:
-        target.write_bytes(original + b"\n// upstream drift\n")
-        result = _run([node, str(PATCH), str(prefix)], env=env)
-        assert result.returncode != 0
-        assert (package / "cli-manifest.json").read_bytes() == manifest
-        assert (package / "dist/src/browser/bridge.js").read_bytes() == bridge
-    finally:
-        target.write_bytes(original)
-
-
-def test_unknown_fresh_upstream_fails_without_any_install_write(baseline, tmp_path):
+@pytest.mark.parametrize("relative,anchor", [
+    ("dist/src/daemon.js", "httpServer.listen(PORT, '127.0.0.1', () => {"),
+    ("dist/src/browser/daemon-transport.js", "const DAEMON_URL = `http://127.0.0.1:${DAEMON_PORT}`;"),
+    ("dist/src/browser/bridge.js", "async _ensureDaemon(timeoutSeconds, contextId, preferredContextId)"),
+    ("dist/src/execution.js", "const BrowserFactory = getBrowserFactory(cmd.site);"),
+    ("dist/src/runtime.js", "export function getBrowserFactory(site)"),
+])
+def test_unknown_runtime_fails_without_any_install_write(baseline, tmp_path, relative, anchor):
     node, source, archive = baseline
     package = _copy_baseline(tmp_path, source, archive, include_dependencies=False)
-    target = package / "clis/coupang/search.js"
-    # Keep every replacement anchor intact: content verification must catch drift.
-    target.write_bytes(target.read_bytes() + b"\n// unknown upstream change\n")
-    receipt = package / ".opencli-admin-ecommerce.json"
-    assert not receipt.exists()
-
-    def snapshot():
-        paths = [path for directory in ("dist", "clis") for path in (package / directory).rglob("*") if path.is_file()]
-        paths.append(package / "cli-manifest.json")
-        return {path.relative_to(package).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
-
-    before = snapshot()
-    result = _run([node, str(PATCH), str(tmp_path)])
+    node, env = _isolated_runtime(tmp_path, node)
+    target = package / relative
+    original = target.read_text(encoding="utf-8")
+    assert anchor in original
+    target.write_text(original.replace(anchor, "UNSUPPORTED_RUNTIME_STRUCTURE"), encoding="utf-8")
+    paths = [path for path in package.rglob("*") if path.is_file()]
+    before = {path: path.read_bytes() for path in paths}
+    result = _run([node, str(PATCH), str(tmp_path)], env=env)
     assert result.returncode != 0
-    assert snapshot() == before
-    assert not receipt.exists()
+    assert {path: path.read_bytes() for path in paths} == before
+
+
+def test_modified_patched_runtime_fails_without_partial_changes(baseline, tmp_path):
+    node, source, archive = baseline
+    package = _copy_baseline(tmp_path, source, archive, include_dependencies=False)
+    node, env = _isolated_runtime(tmp_path, node)
+    result = _run([node, str(PATCH), str(tmp_path)], env=env)
+    assert result.returncode == 0, result.stderr
+    target = package / "dist/src/execution.js"
+    source = target.read_text(encoding="utf-8")
+    target.write_text(source.replace("reachable = response.ok;", "reachable = true;"), encoding="utf-8")
+    paths = [path for path in package.rglob("*") if path.is_file()]
+    before = {path: path.read_bytes() for path in paths}
+    result = _run([node, str(PATCH), str(tmp_path)], env=env)
+    assert result.returncode != 0
+    assert {path: path.read_bytes() for path in paths} == before

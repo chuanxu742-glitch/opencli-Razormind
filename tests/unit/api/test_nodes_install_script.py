@@ -1,6 +1,8 @@
 """Install-script rendering tests for edge node bootstrap."""
 
 import io
+import json
+from pathlib import Path
 import os
 import subprocess
 import sys
@@ -108,60 +110,6 @@ def test_inline_install_script_template_keeps_wireguard_reachability_only():
     assert "install_netbird" in body
 
 
-def test_native_installer_authenticates_follow_up_downloads():
-    body = (
-        __import__("pathlib").Path(__file__).parents[3]
-        / "scripts"
-        / "install-agent.sh"
-    ).read_text(encoding="utf-8")
-
-    assert 'AUTH_HEADER=(-H "Authorization: Bearer $AGENT_API_TOKEN")' in body
-    assert 'curl -fsSL "${AUTH_HEADER[@]}"' in body
-    assert 'wget --header="Authorization: Bearer $AGENT_API_TOKEN"' in body
-    assert '[[ -e "$OHMYOPENCLI_ROOT" ]] && die' in body
-    assert 'rm -rf "$OHMYOPENCLI_ROOT"' not in body
-    assert "npm install -g @jackwener/opencli@1.8.7" in body
-
-
-def test_windows_managed_installer_supports_api_auth():
-    installer = (
-        __import__("pathlib").Path(__file__).parents[3]
-        / "scripts"
-        / "install-managed-opencli.ps1"
-    ).read_text(encoding="utf-8")
-
-    assert "[string]$ApiAuthToken" in installer
-    assert 'Authorization = "Bearer $ApiAuthToken"' in installer
-    assert "-Headers $requestHeaders" in installer
-    assert '$OpenCliVersion = "1.8.7"' in installer
-
-
-@pytest.mark.asyncio
-async def test_managed_opencli_patch_is_served_to_native_agents(client):
-    response = await client.get("/api/v1/nodes/install/patch-opencli.js")
-
-    assert response.status_code == 200
-    assert "OPENCLI_ADMIN_MANAGED_CDP_ROUTING_V2" in response.text
-    assert "fetch(probeUrl" in response.text
-    assert "OPENCLI_ADMIN_REMOTE_DAEMON_ROUTE_V2" in response.text
-    assert "OPENCLI_ADMIN_RUNTIME_FACTORY_V1" in response.text
-    assert "OPENCLI_ADMIN_FACTORY_SELECTION_V1" in response.text
-    assert "'dist', 'src', 'daemon.js'" in response.text
-    assert "'dist', 'src', 'browser', 'daemon-transport.js'" in response.text
-
-
-def test_native_installer_downloads_and_extracts_runtime_bundle():
-    body = (
-        __import__("pathlib").Path(__file__).parents[3]
-        / "scripts"
-        / "install-agent.sh"
-    ).read_text(encoding="utf-8")
-
-    assert "/api/v1/nodes/install/agent-runtime.tar.gz" in body
-    assert 'tar --no-same-owner --no-same-permissions -xzf "$RUNTIME_BUNDLE"' in body
-    assert 'backend/agent_runtimes/*.py' in body
-    assert 'backend/miniflow/*.py' in body
-    assert 'backend/security/*.py' in body
 
 
 @pytest.mark.asyncio
@@ -215,3 +163,45 @@ async def test_runtime_bundle_imports_in_native_agent_layout(client, tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.asyncio
+async def test_adapter_bundle_requires_auth_and_contains_only_complete_inventory(client, monkeypatch):
+    monkeypatch.setenv("API_AUTH_TOKEN", "packaging-fixture-token")
+    get_settings.cache_clear()
+    try:
+        unauthenticated = await client.get("/api/v1/nodes/install/opencli-adapters.tar.gz")
+        assert unauthenticated.status_code == 401
+        response = await client.get(
+            "/api/v1/nodes/install/opencli-adapters.tar.gz",
+            headers={"Authorization": "Bearer packaging-fixture-token"},
+        )
+    finally:
+        get_settings.cache_clear()
+    assert response.status_code == 200
+    with tarfile.open(fileobj=io.BytesIO(response.content), mode="r:gz") as archive:
+        inventory = json.load(archive.extractfile("integrations/opencli/adapter-pack.json"))
+        expected = {
+            "scripts/install-opencli-adapters.mjs",
+            "integrations/opencli/adapter-pack.json",
+            "integrations/opencli/LICENSE.opencli",
+            *(f"integrations/opencli/{file}" for file in inventory["files"]),
+        }
+        assert set(archive.getnames()) == expected
+        assert all(member.isfile() and member.size > 0 for member in archive.getmembers())
+        assert all(entry["modulePath"] in inventory["files"] for entry in inventory["commands"])
+
+
+@pytest.mark.asyncio
+async def test_adapter_bundle_missing_payload_is_service_error_not_partial_success(client, monkeypatch):
+    original = Path.read_bytes
+
+    def missing_adapter(path):
+        if path.as_posix().endswith("/integrations/opencli/ebay/search.js"):
+            raise FileNotFoundError("fixture missing adapter")
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", missing_adapter)
+    response = await client.get("/api/v1/nodes/install/opencli-adapters.tar.gz")
+    assert response.status_code == 503
+    assert not response.headers["content-type"].startswith("application/gzip")

@@ -178,8 +178,9 @@ jobs:
       - name: Backend syntax check
         run: uv run python -m compileall backend
 
-      - name: Provision isolated OpenCLI patch-test baseline
-        run: |
+      - name: Provision isolated OpenCLI packaging baseline
+        shell: bash
+        run: &opencli-packaging-baseline |
           python - <<'PY'
           import base64
           import hashlib
@@ -193,6 +194,23 @@ jobs:
 
           root = Path(os.environ["RUNNER_TEMP"]) / "opencli-ecommerce-baseline"
           root.mkdir(parents=True, exist_ok=True)
+          tools = root / "bin"
+          tools.mkdir(exist_ok=True)
+          node = shutil.which("node")
+          npm = shutil.which("npm")
+          if not node or not npm:
+              raise RuntimeError("Node and npm are required for the official baseline")
+          shutil.copy2(node, tools / Path(node).name)
+          for name in ("home", "cache", "tmp", "prefix"):
+              (root / name).mkdir(exist_ok=True)
+          isolated = {key: value for key, value in os.environ.items()
+                      if key.upper() in {"SYSTEMROOT", "WINDIR", "COMSPEC"}}
+          isolated.update(
+              HOME=str(root / "home"), USERPROFILE=str(root / "home"),
+              PATH=str(tools), NPM_CONFIG_PREFIX=str(root / "prefix"),
+              NPM_CONFIG_CACHE=str(root / "cache"), XDG_CACHE_HOME=str(root / "cache"),
+              TEMP=str(root / "tmp"), TMP=str(root / "tmp"),
+          )
           archive = root / "jackwener-opencli-1.8.7.tgz"
           url = "https://registry.npmjs.org/@jackwener/opencli/-/opencli-1.8.7.tgz"
           with urllib.request.urlopen(url, timeout=60) as response:
@@ -213,10 +231,10 @@ jobs:
               encoding="utf-8",
           )
           subprocess.run(
-              [shutil.which("npm"), "install", "--prefix", str(dependencies),
+              [npm, "install", "--prefix", str(dependencies),
                "--omit=dev", "--ignore-scripts", "--package-lock=false",
                "--no-audit", "--no-fund"],
-              check=True, shell=os.name == "nt",
+              check=True, shell=os.name == "nt", env=isolated,
           )
           shutil.copytree(dependencies / "node_modules", package / "node_modules")
           if not (package / "node_modules").is_dir():
@@ -241,6 +259,25 @@ jobs:
       # self-skips in this job.
       - name: Backend tests (with coverage report)
         run: uv run pytest tests/unit tests/compat tests/integration -m "not live" --cov=backend --cov-report=term-missing --cov-fail-under=0
+
+  windows-opencli-packaging:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version-file: ".python-version"
+      - uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "26"
+      - name: Install Python dependencies
+        run: uv sync --extra dev
+      - name: Provision isolated official OpenCLI
+        shell: bash
+        run: *opencli-packaging-baseline
+      - name: Exercise Windows adapter discovery and junction boundaries
+        run: uv run pytest tests/unit/test_opencli_adapter_installation.py tests/unit/api/test_nodes_install_script.py -q --no-cov
 
   frontend-workflow-checks:
     runs-on: ubuntu-latest

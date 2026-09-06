@@ -1,0 +1,9 @@
+// Vendored from @jackwener/opencli 1.8.7 (Apache-2.0); see ../LICENSE.opencli.
+import { cli } from '@jackwener/opencli/registry';
+import { createRankingCliOptions } from './rankings.js';
+cli(createRankingCliOptions({
+    commandName: 'movers-shakers',
+    access: 'read',
+    listType: 'movers_shakers',
+    description: 'Amazon Movers & Shakers pages for short-term growth signals',
+}));

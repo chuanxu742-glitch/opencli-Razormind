@@ -6,14 +6,24 @@ ARG CLOAKBROWSER_VERSION=0.5.10
 # OPENCLI_VERSION: pin the opencli release; patch-opencli.js adds DAEMON_HOST/LISTEN env hooks
 ARG OPENCLI_VERSION=1.8.7
 COPY scripts/patch-opencli.js /tmp/patch-opencli.js
+ENV PATH="/opt/opencli-runtime/bin:${PATH}"
+COPY scripts/install-opencli-adapters.mjs /opt/opencli-adapter-pack/scripts/install-opencli-adapters.mjs
+COPY integrations/opencli/adapter-pack.json integrations/opencli/LICENSE.opencli /opt/opencli-adapter-pack/integrations/opencli/
+COPY integrations/opencli/amazon/ /opt/opencli-adapter-pack/integrations/opencli/amazon/
+COPY integrations/opencli/taobao/ /opt/opencli-adapter-pack/integrations/opencli/taobao/
+COPY integrations/opencli/coupang/ /opt/opencli-adapter-pack/integrations/opencli/coupang/
+COPY integrations/opencli/ebay/ /opt/opencli-adapter-pack/integrations/opencli/ebay/
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium x11vnc xvfb novnc websockify procps nginx \
     fonts-noto-cjk gettext-base \
     curl ca-certificates unzip \
     && curl -fsSL https://deb.nodesource.com/setup_26.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
-    && npm install -g @jackwener/opencli@${OPENCLI_VERSION} \
-    && node /tmp/patch-opencli.js \
+    && test "${OPENCLI_VERSION}" = "1.8.7" \
+    && npm uninstall -g --prefix /opt/opencli-runtime --ignore-scripts @jackwener/opencli \
+    && test ! -e /opt/opencli-runtime/lib/node_modules/@jackwener/opencli \
+    && npm install -g --prefix /opt/opencli-runtime --ignore-scripts --registry=https://registry.npmjs.org @jackwener/opencli@1.8.7 \
+    && node /tmp/patch-opencli.js /opt/opencli-runtime \
     && rm /tmp/patch-opencli.js \
     && rm -rf /root/.npm /var/lib/apt/lists/*
 RUN if [ "$BROWSER_ENGINE" = "cloakbrowser" ]; then \
@@ -75,6 +85,9 @@ ENV BROWSER_ENGINE=${BROWSER_ENGINE} \
 EXPOSE 6080 19222 19825
 
 USER chrome
+ENV HOME=/home/chrome
+RUN node /opt/opencli-adapter-pack/scripts/install-opencli-adapters.mjs \
+    --source /opt/opencli-adapter-pack/integrations/opencli --prefix /opt/opencli-runtime --home /home/chrome
 # Pre-create profile directory as chrome user so Docker initialises new
 # named volumes with the correct ownership (avoids "Permission denied" on
 # first run when a fresh volume is mounted over a root-owned path).

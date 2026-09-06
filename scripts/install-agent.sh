@@ -30,6 +30,8 @@
 #   NETBIRD_MANAGEMENT_URL Self-hosted NetBird management URL (optional)
 #   NETBIRD_IMAGE_TAG  NetBird Docker image tag (default: latest)
 #   OHMYOPENCLI_REPO   Optional audited adapter-pack repository for Python installs
+#   OPENCLI_MANAGED_PREFIX Optional absolute managed npm prefix (default: $HOME/.opencli-agent/npm)
+#   OPENCLI_CONFIRM_MANAGED_PREFIX true confirms ownership before restoring a custom prefix
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
@@ -272,6 +274,9 @@ install_docker() {
 # ── Python/pip install ─────────────────────────────────────────────────────────
 install_python() {
   command -v python3 >/dev/null 2>&1 || die "Python 3 is not installed"
+  AGENT_USER="$(id -un)"
+  [[ "$HOME" == /* && "$HOME" != *$'\n'* && "$HOME" != *'"'* && "$HOME" != *'%'* && "$HOME" != *'\'* ]] || die "HOME must be an absolute service-safe path"
+  [[ "$(python3 -c 'import os; print(os.path.realpath(os.environ["HOME"]))')" == "$HOME" ]] || die "HOME must not traverse symlinks"
 
   AGENT_DIR="$HOME/.opencli-agent"
   mkdir -p "$AGENT_DIR/backend"
@@ -331,33 +336,95 @@ install_python() {
     UVICORN_BIN="$VENV_DIR/bin/uvicorn"
     info "Installed into virtualenv: $VENV_DIR"
   elif python3 -m pip install --user --quiet fastapi "uvicorn[standard]" httpx pyyaml websockets 2>/dev/null; then
-    UVICORN_BIN="uvicorn"
+    UVICORN_BIN="$(command -v uvicorn)"
   else
     die "Could not install Python dependencies. Try: python3 -m venv ~/.opencli-agent/venv && source ~/.opencli-agent/venv/bin/activate && pip install fastapi 'uvicorn[standard]' httpx pyyaml websockets"
   fi
 
-  # ── Check / install opencli ───────────────────────────────────────────────
-  if command -v npm >/dev/null 2>&1; then
-    if [ -t 0 ]; then
-      read -r -p "Install or upgrade managed OpenCLI 1.8.7 and Pi 0.83.0 via npm? [Y/n] " _reply </dev/tty || _reply="Y"
-    else
-      _reply="Y"
-      info "Installing pinned OpenCLI 1.8.7 and Pi 0.83.0 via npm (non-interactive)..."
-    fi
-    if [[ "${_reply:-Y}" =~ ^[Yy]$ ]]; then
-      npm install -g @jackwener/opencli@1.8.7 @earendil-works/pi-coding-agent@0.83.0
-      PATCH_FILE="$AGENT_DIR/patch-opencli.js"
-      curl -fsSL "${AUTH_HEADER[@]}" \
-        "$CENTRAL_API_URL/api/v1/nodes/install/patch-opencli.js" -o "$PATCH_FILE"
-      node "$PATCH_FILE"
-      info "opencli: $(opencli --version 2>/dev/null | head -1 || echo 'installed')"
-    else
-      warn "Skipped — opencli channel will be unavailable"
-    fi
-  else
-    warn "npm not found — opencli channel will be unavailable"
-    warn "  Install Node.js 26+ from https://nodejs.org then run: npm install -g @jackwener/opencli@1.8.7 @earendil-works/pi-coding-agent@0.83.0"
+  # Use a dedicated prefix by default; an existing global installation is never
+  # implicitly claimed. Operators can explicitly confirm a legacy managed prefix.
+  command -v npm >/dev/null 2>&1 || die "npm is required to install pinned OpenCLI"
+  command -v node >/dev/null 2>&1 || die "Node.js is required"
+  OPENCLI_PREFIX="${OPENCLI_MANAGED_PREFIX:-$AGENT_DIR/npm}"
+  [[ "$OPENCLI_PREFIX" == /* && "$OPENCLI_PREFIX" != *$'\n'* && "$OPENCLI_PREFIX" != *'"'* \
+    && "$OPENCLI_PREFIX" != *'%'* && "$OPENCLI_PREFIX" != *'\'* ]] || die "OPENCLI_MANAGED_PREFIX must be an absolute service-safe path"
+  if [[ "$OPENCLI_PREFIX" != "$AGENT_DIR/npm" && "${OPENCLI_CONFIRM_MANAGED_PREFIX:-false}" != "true" ]]; then
+    die "Set OPENCLI_CONFIRM_MANAGED_PREFIX=true only for a confirmed managed legacy target"
   fi
+  python3 - "$OPENCLI_PREFIX" <<'PY'
+import pathlib
+import sys
+prefix = pathlib.Path(sys.argv[1])
+for target in (prefix, prefix / "lib/node_modules/@jackwener/opencli", prefix / "node_modules/@jackwener/opencli"):
+    for part in (target, *target.parents):
+        if part.is_symlink():
+            raise SystemExit("Managed npm target must not traverse links")
+PY
+  mkdir -p "$OPENCLI_PREFIX"
+  export NPM_CONFIG_PREFIX="$OPENCLI_PREFIX"
+  export NPM_CONFIG_CACHE="$AGENT_DIR/npm-cache"
+  NODE_BIN="$(command -v node)"
+  NODE_BIN="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$NODE_BIN")"
+  export PATH="$OPENCLI_PREFIX/bin:$(dirname "$NODE_BIN"):$PATH"
+  download_managed_payload() {
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsSL "${AUTH_HEADER[@]}" "$1" -o "$2"
+    elif [[ -n "$AGENT_API_TOKEN" ]]; then
+      wget --header="Authorization: Bearer $AGENT_API_TOKEN" -qO "$2" "$1"
+    else
+      wget -qO "$2" "$1"
+    fi
+  }
+  ADAPTER_STAGE="$(mktemp -d "$AGENT_DIR/adapter-package.XXXXXX")"
+  PATCH_FILE="$ADAPTER_STAGE/patch-opencli.js"
+  download_managed_payload "${CENTRAL_API_URL%/}/api/v1/nodes/install/patch-opencli.js" "$PATCH_FILE"
+  download_managed_payload "${CENTRAL_API_URL%/}/api/v1/nodes/install/opencli-adapters.tar.gz" "$ADAPTER_STAGE/adapters.tar.gz"
+  python3 - "$ADAPTER_STAGE" <<'PY'
+import json
+import pathlib
+import re
+import sys
+import tarfile
+root = pathlib.Path(sys.argv[1])
+with tarfile.open(root / "adapters.tar.gz") as archive:
+    members = archive.getmembers()
+    names = [member.name for member in members]
+    fixed = {"scripts/install-opencli-adapters.mjs", "integrations/opencli/adapter-pack.json", "integrations/opencli/LICENSE.opencli"}
+    if len(names) != len(set(names)) or any(
+        not member.isfile() or not member.size or (
+            member.name not in fixed and not re.fullmatch(
+                r"integrations/opencli/(amazon|taobao|coupang|ebay)/[a-z0-9-]+\.js", member.name
+            )
+        ) for member in members
+    ) or not fixed.issubset(names):
+        raise SystemExit("Invalid adapter archive")
+    inventory = json.load(archive.extractfile("integrations/opencli/adapter-pack.json"))
+    if inventory.get("schemaVersion") != 1 or inventory.get("opencliVersion") != "1.8.7":
+        raise SystemExit("Invalid adapter inventory")
+    expected = fixed | {f"integrations/opencli/{file}" for file in inventory["files"]}
+    if set(names) != expected:
+        raise SystemExit("Incomplete adapter archive")
+    # Every member is a regular allowlisted file under a new private directory.
+    for member in members:
+        target = root / member.name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(archive.extractfile(member).read())
+PY
+  # Uninstall without lifecycle scripts (the upstream preuninstall stops daemons).
+  # An absent package directory is required: same-version npm install alone does
+  # not remove old commerce files or receipts.
+  npm uninstall -g --prefix "$OPENCLI_PREFIX" --ignore-scripts @jackwener/opencli
+  [[ ! -e "$OPENCLI_PREFIX/lib/node_modules/@jackwener/opencli" && ! -L "$OPENCLI_PREFIX/lib/node_modules/@jackwener/opencli" \
+    && ! -e "$OPENCLI_PREFIX/node_modules/@jackwener/opencli" && ! -L "$OPENCLI_PREFIX/node_modules/@jackwener/opencli" ]] || die "Official restore failed: old package remains"
+  npm install -g --prefix "$OPENCLI_PREFIX" --ignore-scripts --registry=https://registry.npmjs.org @jackwener/opencli@1.8.7
+  npm install -g --prefix "$OPENCLI_PREFIX" @earendil-works/pi-coding-agent@0.83.0
+  "$NODE_BIN" "$PATCH_FILE" "$OPENCLI_PREFIX"
+  "$NODE_BIN" "$ADAPTER_STAGE/scripts/install-opencli-adapters.mjs" \
+    --source "$ADAPTER_STAGE/integrations/opencli" --prefix "$OPENCLI_PREFIX" --home "$HOME"
+  rm -rf "$ADAPTER_STAGE"
+  OPENCLI_BIN="$OPENCLI_PREFIX/bin/opencli"
+  [[ -x "$OPENCLI_BIN" && "$UVICORN_BIN" == /* && -x "$UVICORN_BIN" ]] || die "Managed executables are unavailable"
+  export OPENCLI_BIN
 
   # Organization-specific adapter packs are optional and never fetched implicitly.
   OHMYOPENCLI_ROOT=""
@@ -366,10 +433,16 @@ install_python() {
     OHMYOPENCLI_COMMIT="${OHMYOPENCLI_COMMIT:-73cc60c83586ef2c95469b3b70d6cfc80fa5bc53}"
     OFFICIAL_SITE_CAPABILITY_COMMIT="${OFFICIAL_SITE_CAPABILITY_COMMIT:-$OHMYOPENCLI_COMMIT}"
     command -v git >/dev/null 2>&1 || die "git is required to install the adapter pack"
-    [[ -e "$OHMYOPENCLI_ROOT" ]] && die \
-      "Adapter-pack target already exists; archive it explicitly before reinstalling: $OHMYOPENCLI_ROOT"
-    git clone "$OHMYOPENCLI_REPO" "$OHMYOPENCLI_ROOT"
-    git -C "$OHMYOPENCLI_ROOT" checkout --detach "$OHMYOPENCLI_COMMIT"
+    [[ ! -L "$OHMYOPENCLI_ROOT" ]] || die "Organization checkout must not be a symlink"
+    if [[ -e "$OHMYOPENCLI_ROOT" ]]; then
+      [[ "$(git -C "$OHMYOPENCLI_ROOT" remote get-url origin)" == "$OHMYOPENCLI_REPO" \
+        && "$(git -C "$OHMYOPENCLI_ROOT" rev-parse HEAD)" == "$OHMYOPENCLI_COMMIT" \
+        && -z "$(git -C "$OHMYOPENCLI_ROOT" status --porcelain)" ]] || \
+        die "Existing organization repository is not the clean requested pinned checkout; left unchanged"
+    else
+      git clone "$OHMYOPENCLI_REPO" "$OHMYOPENCLI_ROOT"
+      git -C "$OHMYOPENCLI_ROOT" checkout --detach "$OHMYOPENCLI_COMMIT"
+    fi
     git -C "$OHMYOPENCLI_ROOT" merge-base --is-ancestor \
       "$OFFICIAL_SITE_CAPABILITY_COMMIT" HEAD
     (cd "$OHMYOPENCLI_ROOT" && npm ci && npm run bootstrap)
@@ -440,7 +513,6 @@ install_python() {
   fi
 
   # ── Launch agent server ───────────────────────────────────────────────────
-  AGENT_CMD="$UVICORN_BIN backend.agent_server:app --host 0.0.0.0 --port ${AGENT_PORT}"
   SYSTEMD_UNIT="/etc/systemd/system/opencli-agent.service"
 
   if command -v systemctl >/dev/null 2>&1 && [[ -w /etc/systemd/system ]]; then
@@ -452,7 +524,11 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=${AGENT_DIR}
+User=${AGENT_USER}
+Environment="HOME=${HOME}"
+Environment="PATH=${OPENCLI_PREFIX}/bin:$(dirname "$NODE_BIN"):/usr/local/bin:/usr/bin:/bin"
+Environment="OPENCLI_BIN=${OPENCLI_BIN}"
+WorkingDirectory="${AGENT_DIR}"
 Restart=on-failure
 RestartSec=5
 Environment=CENTRAL_API_URL=${CENTRAL_API_URL}
@@ -468,14 +544,16 @@ Environment=OPENCLI_BROWSER_PROFILE_KIND=${OPENCLI_BROWSER_PROFILE_KIND}
 $([ -n "${OPENCLI_CDP_ENDPOINT:-}" ] && echo "Environment=OPENCLI_CDP_ENDPOINT=${OPENCLI_CDP_ENDPOINT}")
 $([ -n "${HTTP_PROXY:-}" ]  && echo "Environment=HTTP_PROXY=${HTTP_PROXY}")
 $([ -n "${HTTPS_PROXY:-}" ] && echo "Environment=HTTPS_PROXY=${HTTPS_PROXY}")
-ExecStart=${AGENT_CMD}
+ExecStart="${UVICORN_BIN}" backend.agent_server:app --host 0.0.0.0 --port ${AGENT_PORT}
 
 [Install]
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable --now opencli-agent
-    info "Service enabled and started (systemctl status opencli-agent)"
+    systemctl enable opencli-agent
+    systemctl restart opencli-agent
+    systemctl is-active --quiet opencli-agent || die "Agent service failed to start"
+    info "Service enabled and restarted (systemctl status opencli-agent)"
   else
     info "Starting agent in background (no systemd)..."
     (
@@ -488,8 +566,7 @@ EOF
       [[ -n "${OPENCLI_CDP_ENDPOINT:-}" ]] && export OPENCLI_CDP_ENDPOINT
       [[ -n "${HTTP_PROXY:-}" ]]  && export HTTP_PROXY
       [[ -n "${HTTPS_PROXY:-}" ]] && export HTTPS_PROXY
-      # shellcheck disable=SC2086
-      nohup $AGENT_CMD > /tmp/opencli-agent.log 2>&1 &
+      nohup "$UVICORN_BIN" backend.agent_server:app --host 0.0.0.0 --port "$AGENT_PORT" > /tmp/opencli-agent.log 2>&1 &
       echo $! > /tmp/opencli-agent.pid
     )
     info "Agent started (PID=$(cat /tmp/opencli-agent.pid 2>/dev/null || echo '?')). Logs: /tmp/opencli-agent.log"

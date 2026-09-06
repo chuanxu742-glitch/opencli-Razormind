@@ -1,0 +1,560 @@
+{
+  "schemaVersion": 1,
+  "opencliVersion": "1.8.7",
+  "files": [
+    "amazon/admin-locale.js",
+    "amazon/bestsellers.js",
+    "amazon/discussion.js",
+    "amazon/movers-shakers.js",
+    "amazon/new-releases.js",
+    "amazon/offer.js",
+    "amazon/product.js",
+    "amazon/rankings.js",
+    "amazon/search.js",
+    "amazon/shared.js",
+    "coupang/add-to-cart.js",
+    "coupang/product.js",
+    "coupang/search.js",
+    "coupang/utils.js",
+    "ebay/product.js",
+    "ebay/search.js",
+    "ebay/shared.js",
+    "taobao/common.js",
+    "taobao/search.js"
+  ],
+  "commands": [
+    {
+      "site": "amazon",
+      "name": "bestsellers",
+      "description": "Amazon Best Sellers pages for category candidate discovery",
+      "access": "read",
+      "domain": "amazon.com",
+      "strategy": "cookie",
+      "browser": true,
+      "args": [
+        {
+          "name": "input",
+          "type": "str",
+          "required": false,
+          "positional": true,
+          "help": "Ranking URL or supported Amazon path. Omit to use the list root."
+        },
+        {
+          "name": "limit",
+          "type": "int",
+          "default": 100,
+          "required": false,
+          "help": "Maximum number of ranked items to return (default 100)"
+        }
+      ],
+      "columns": [
+        "list_type",
+        "rank",
+        "asin",
+        "title",
+        "price_text",
+        "rating_value",
+        "review_count"
+      ],
+      "type": "js",
+      "modulePath": "amazon/bestsellers.js",
+      "sourceFile": "amazon/bestsellers.js",
+      "navigateBefore": false
+    },
+    {
+      "site": "amazon",
+      "name": "discussion",
+      "description": "Amazon review summary and sample customer discussion from product review pages",
+      "access": "read",
+      "domain": "amazon.com",
+      "strategy": "cookie",
+      "browser": true,
+      "args": [
+        {
+          "name": "input",
+          "type": "str",
+          "required": true,
+          "positional": true,
+          "help": "ASIN or product URL, for example B0FJS72893"
+        },
+        {
+          "name": "limit",
+          "type": "int",
+          "default": 10,
+          "required": false,
+          "help": "Maximum number of review samples to return (default 10)"
+        }
+      ],
+      "columns": [
+        "asin",
+        "average_rating_value",
+        "total_review_count"
+      ],
+      "type": "js",
+      "modulePath": "amazon/discussion.js",
+      "sourceFile": "amazon/discussion.js",
+      "navigateBefore": false
+    },
+    {
+      "site": "amazon",
+      "name": "movers-shakers",
+      "description": "Amazon Movers & Shakers pages for short-term growth signals",
+      "access": "read",
+      "domain": "amazon.com",
+      "strategy": "cookie",
+      "browser": true,
+      "args": [
+        {
+          "name": "input",
+          "type": "str",
+          "required": false,
+          "positional": true,
+          "help": "Ranking URL or supported Amazon path. Omit to use the list root."
+        },
+        {
+          "name": "limit",
+          "type": "int",
+          "default": 100,
+          "required": false,
+          "help": "Maximum number of ranked items to return (default 100)"
+        }
+      ],
+      "columns": [
+        "list_type",
+        "rank",
+        "asin",
+        "title",
+        "price_text",
+        "rating_value",
+        "review_count"
+      ],
+      "type": "js",
+      "modulePath": "amazon/movers-shakers.js",
+      "sourceFile": "amazon/movers-shakers.js",
+      "navigateBefore": false
+    },
+    {
+      "site": "amazon",
+      "name": "new-releases",
+      "description": "Amazon New Releases pages for early momentum discovery",
+      "access": "read",
+      "domain": "amazon.com",
+      "strategy": "cookie",
+      "browser": true,
+      "args": [
+        {
+          "name": "input",
+          "type": "str",
+          "required": false,
+          "positional": true,
+          "help": "Ranking URL or supported Amazon path. Omit to use the list root."
+        },
+        {
+          "name": "limit",
+          "type": "int",
+          "default": 100,
+          "required": false,
+          "help": "Maximum number of ranked items to return (default 100)"
+        }
+      ],
+      "columns": [
+        "list_type",
+        "rank",
+        "asin",
+        "title",
+        "price_text",
+        "rating_value",
+        "review_count"
+      ],
+      "type": "js",
+      "modulePath": "amazon/new-releases.js",
+      "sourceFile": "amazon/new-releases.js",
+      "navigateBefore": false
+    },
+    {
+      "site": "amazon",
+      "name": "offer",
+      "description": "Amazon seller, buy box, and fulfillment facts from the product page",
+      "access": "read",
+      "domain": "amazon.com",
+      "strategy": "cookie",
+      "browser": true,
+      "args": [
+        {
+          "name": "input",
+          "type": "str",
+          "required": true,
+          "positional": true,
+          "help": "ASIN or product URL, for example B0FJS72893"
+        }
+      ],
+      "columns": [
+        "asin",
+        "price_text",
+        "sold_by",
+        "ships_from",
+        "is_amazon_sold",
+        "is_amazon_fulfilled"
+      ],
+      "type": "js",
+      "modulePath": "amazon/offer.js",
+      "sourceFile": "amazon/offer.js",
+      "navigateBefore": false
+    },
+    {
+      "site": "amazon",
+      "name": "product",
+      "description": "Amazon product page facts for candidate validation",
+      "access": "read",
+      "domain": "amazon.com",
+      "strategy": "cookie",
+      "browser": true,
+      "args": [
+        {
+          "name": "input",
+          "type": "str",
+          "required": true,
+          "positional": true,
+          "help": "ASIN or product URL, for example B0FJS72893"
+        }
+      ],
+      "columns": [
+        "asin",
+        "title",
+        "price_text",
+        "rating_value",
+        "review_count"
+      ],
+      "type": "js",
+      "modulePath": "amazon/product.js",
+      "sourceFile": "amazon/product.js",
+      "navigateBefore": false
+    },
+    {
+      "site": "amazon",
+      "name": "search",
+      "description": "Amazon search results for product discovery and coarse filtering",
+      "access": "read",
+      "domain": "amazon.com",
+      "strategy": "cookie",
+      "browser": true,
+      "args": [
+        {
+          "name": "query",
+          "type": "str",
+          "required": true,
+          "positional": true,
+          "help": "Search query, for example \"desk shelf organizer\""
+        },
+        {
+          "name": "limit",
+          "type": "int",
+          "default": 20,
+          "required": false,
+          "help": "Maximum number of results to return (default 20)"
+        }
+      ],
+      "columns": [
+        "rank",
+        "asin",
+        "title",
+        "price_text",
+        "rating_value",
+        "review_count"
+      ],
+      "type": "js",
+      "modulePath": "amazon/search.js",
+      "sourceFile": "amazon/search.js",
+      "navigateBefore": false
+    },
+    {
+      "site": "coupang",
+      "name": "add-to-cart",
+      "description": "Add a Coupang product to cart using logged-in browser session",
+      "access": "write",
+      "domain": "www.coupang.com",
+      "strategy": "cookie",
+      "browser": true,
+      "args": [
+        {
+          "name": "product-id",
+          "type": "str",
+          "required": false,
+          "positional": true,
+          "help": "Coupang product ID"
+        },
+        {
+          "name": "url",
+          "type": "str",
+          "required": false,
+          "help": "Canonical product URL"
+        }
+      ],
+      "columns": [
+        "ok",
+        "product_id",
+        "url",
+        "message"
+      ],
+      "type": "js",
+      "modulePath": "coupang/add-to-cart.js",
+      "sourceFile": "coupang/add-to-cart.js",
+      "navigateBefore": "https://www.coupang.com"
+    },
+    {
+      "site": "coupang",
+      "name": "product",
+      "description": "Read full product detail (price, rating, seller, delivery) for a Coupang product",
+      "access": "read",
+      "domain": "www.coupang.com",
+      "strategy": "cookie",
+      "browser": true,
+      "args": [
+        {
+          "name": "product-id",
+          "type": "str",
+          "required": false,
+          "positional": true,
+          "help": "Coupang product ID (digits only)"
+        },
+        {
+          "name": "url",
+          "type": "str",
+          "required": false,
+          "help": "Canonical Coupang product URL (alternative to --product-id)"
+        }
+      ],
+      "columns": [
+        "product_id",
+        "title",
+        "price",
+        "original_price",
+        "discount_rate",
+        "rating",
+        "review_count",
+        "seller",
+        "brand",
+        "rocket",
+        "delivery_promise",
+        "image_url",
+        "url"
+      ],
+      "type": "js",
+      "modulePath": "coupang/product.js",
+      "sourceFile": "coupang/product.js",
+      "navigateBefore": "https://www.coupang.com"
+    },
+    {
+      "site": "coupang",
+      "name": "search",
+      "description": "Search Coupang products with logged-in browser session",
+      "access": "read",
+      "domain": "www.coupang.com",
+      "strategy": "cookie",
+      "browser": true,
+      "args": [
+        {
+          "name": "query",
+          "type": "str",
+          "required": true,
+          "positional": true,
+          "help": "Search keyword"
+        },
+        {
+          "name": "page",
+          "type": "int",
+          "default": 1,
+          "required": false,
+          "help": "Search result page number"
+        },
+        {
+          "name": "limit",
+          "type": "int",
+          "default": 20,
+          "required": false,
+          "help": "Max results (max 50)"
+        },
+        {
+          "name": "filter",
+          "type": "str",
+          "required": false,
+          "help": "Optional search filter (currently supports: rocket)"
+        }
+      ],
+      "columns": [
+        "rank",
+        "product_id",
+        "title",
+        "price",
+        "unit_price",
+        "rating",
+        "review_count",
+        "rocket",
+        "delivery_type",
+        "delivery_promise",
+        "url"
+      ],
+      "type": "js",
+      "modulePath": "coupang/search.js",
+      "sourceFile": "coupang/search.js",
+      "navigateBefore": "https://www.coupang.com"
+    },
+    {
+      "site": "taobao",
+      "name": "search",
+      "description": "淘宝商品搜索",
+      "access": "read",
+      "domain": "s.taobao.com",
+      "strategy": "cookie",
+      "browser": true,
+      "args": [
+        {
+          "name": "query",
+          "type": "str",
+          "required": true,
+          "positional": true,
+          "help": "搜索关键词"
+        },
+        {
+          "name": "sort",
+          "type": "str",
+          "default": "default",
+          "required": false,
+          "help": "排序 (default/sale销量/price价格)",
+          "choices": [
+            "default",
+            "sale",
+            "price"
+          ]
+        },
+        {
+          "name": "limit",
+          "type": "int",
+          "default": 10,
+          "required": false,
+          "help": "返回结果数量 (max 40)"
+        }
+      ],
+      "columns": [
+        "rank",
+        "title",
+        "price",
+        "sales",
+        "shop",
+        "location",
+        "item_id",
+        "url"
+      ],
+      "type": "js",
+      "modulePath": "taobao/search.js",
+      "sourceFile": "taobao/search.js",
+      "navigateBefore": false
+    },
+    {
+      "site": "ebay",
+      "name": "search",
+      "access": "read",
+      "description": "eBay Browse one-page keyword search",
+      "domain": "ebay.com",
+      "strategy": "public",
+      "browser": false,
+      "navigateBefore": false,
+      "args": [
+        {
+          "name": "query",
+          "type": "str",
+          "positional": true,
+          "required": true,
+          "help": "Keywords (max 100 characters)"
+        },
+        {
+          "name": "limit",
+          "type": "int",
+          "default": 20,
+          "help": "Items per page (1-200)"
+        },
+        {
+          "name": "offset",
+          "type": "int",
+          "default": 0,
+          "help": "Page offset, a multiple of limit (0-9999)"
+        },
+        {
+          "name": "marketplace",
+          "default": "EBAY_US",
+          "choices": [
+            "EBAY_US"
+          ],
+          "help": "Explicit marketplace"
+        },
+        {
+          "name": "environment",
+          "default": "production",
+          "choices": [
+            "production",
+            "sandbox"
+          ],
+          "help": "Isolated eBay API environment"
+        }
+      ],
+      "columns": [
+        "itemId",
+        "title",
+        "price",
+        "itemWebUrl",
+        "marketplace",
+        "environment"
+      ],
+      "type": "js",
+      "modulePath": "ebay/search.js",
+      "sourceFile": "ebay/search.js"
+    },
+    {
+      "site": "ebay",
+      "name": "product",
+      "access": "read",
+      "description": "eBay Browse REST item details",
+      "domain": "ebay.com",
+      "strategy": "public",
+      "browser": false,
+      "navigateBefore": false,
+      "args": [
+        {
+          "name": "input",
+          "type": "str",
+          "positional": true,
+          "required": true,
+          "help": "REST itemId, including variation: v1|listing|variation"
+        },
+        {
+          "name": "marketplace",
+          "default": "EBAY_US",
+          "choices": [
+            "EBAY_US"
+          ],
+          "help": "Explicit marketplace"
+        },
+        {
+          "name": "environment",
+          "default": "production",
+          "choices": [
+            "production",
+            "sandbox"
+          ],
+          "help": "Isolated eBay API environment"
+        }
+      ],
+      "columns": [
+        "itemId",
+        "title",
+        "price",
+        "itemWebUrl",
+        "marketplace",
+        "environment"
+      ],
+      "type": "js",
+      "modulePath": "ebay/product.js",
+      "sourceFile": "ebay/product.js"
+    }
+  ]
+}

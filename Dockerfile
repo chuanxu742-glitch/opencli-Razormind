@@ -31,9 +31,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ARG OPENCLI_VERSION=1.8.7
 ARG IMAGE_TAG=latest
 COPY scripts/patch-opencli.js /tmp/patch-opencli.js
-RUN npm install -g @jackwener/opencli@${OPENCLI_VERSION} \
-    && npm install -g @larksuite/cli@1.0.91 \
-    && node /tmp/patch-opencli.js \
+ENV PATH="/opt/opencli-runtime/bin:${PATH}"
+RUN test "${OPENCLI_VERSION}" = "1.8.7" \
+    && npm uninstall -g --prefix /opt/opencli-runtime --ignore-scripts @jackwener/opencli \
+    && test ! -e /opt/opencli-runtime/lib/node_modules/@jackwener/opencli \
+    && npm install -g --prefix /opt/opencli-runtime --ignore-scripts --registry=https://registry.npmjs.org @jackwener/opencli@1.8.7 \
+    && npm install -g --prefix /opt/opencli-runtime @larksuite/cli@1.0.91 \
+    && node /tmp/patch-opencli.js /opt/opencli-runtime \
     && rm /tmp/patch-opencli.js \
     && rm -rf /root/.npm
 
@@ -44,6 +48,12 @@ COPY --from=builder /install /usr/local
 COPY backend/ ./backend/
 COPY scripts/patch-opencli.js ./scripts/patch-opencli.js
 COPY scripts/install-agent.sh ./scripts/install-agent.sh
+COPY scripts/install-opencli-adapters.mjs ./scripts/install-opencli-adapters.mjs
+COPY integrations/opencli/adapter-pack.json integrations/opencli/LICENSE.opencli ./integrations/opencli/
+COPY integrations/opencli/amazon/ ./integrations/opencli/amazon/
+COPY integrations/opencli/taobao/ ./integrations/opencli/taobao/
+COPY integrations/opencli/coupang/ ./integrations/opencli/coupang/
+COPY integrations/opencli/ebay/ ./integrations/opencli/ebay/
 COPY alembic.ini .
 
 # Entrypoint handles migrations
@@ -55,6 +65,9 @@ RUN useradd -m -u 1000 appuser && \
     mkdir -p /data && \
     chown -R appuser:appuser /app /data
 USER appuser
+ENV HOME=/home/appuser
+RUN node /app/scripts/install-opencli-adapters.mjs \
+    --source /app/integrations/opencli --prefix /opt/opencli-runtime --home /home/appuser
 
 ENV PYTHONPATH=/app \
     PYTHONDONTWRITEBYTECODE=1 \
