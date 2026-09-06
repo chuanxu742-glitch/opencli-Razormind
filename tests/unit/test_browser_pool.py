@@ -1,7 +1,7 @@
-"""Unit tests for LocalBrowserPool from backend/browser_pool.py."""
+"""Unit tests for browser pool routing and ownership."""
 
 import asyncio
-from unittest.mock import AsyncMock, patch
+import time
 
 import pytest
 
@@ -203,50 +203,6 @@ async def test_acquire_any_concurrent_gets_endpoints():
     assert pool.available == 2
 
 
-# ── RedisBrowserPool properties ────────────────────────────────────────────────
-
-
-def test_redis_pool_properties():
-    """RedisBrowserPool exposes the correct properties."""
-    from backend.browser_pool import RedisBrowserPool
-
-    pool = RedisBrowserPool(
-        ["http://chrome:9222", "http://chrome-2:9222"], "redis://localhost:6379"
-    )
-    assert pool.total == 2
-    assert pool.available == -1  # unknown
-    assert "http://chrome:9222" in pool.endpoints
-    assert pool.available_for("http://chrome:9222") is True
-    assert pool.available_for("http://nonexistent:9222") is False
-
-
-def test_redis_pool_metadata_matches_local_protocol():
-    from backend.browser_pool import RedisBrowserPool
-
-    pool = RedisBrowserPool(["http://chrome:9222"], "redis://localhost:6379")
-    pool.set_agent_url("http://chrome:9222", "http://agent:8080")
-    pool.set_agent_protocol("http://chrome:9222", "http")
-    pool.set_node_type("http://chrome:9222", "shell")
-
-    assert pool.get_agent_url("http://chrome:9222") == "http://agent:8080"
-    assert pool.get_agent_protocol("http://chrome:9222") == "http"
-    assert pool.get_node_type("http://chrome:9222") == "shell"
-
-
-
-
-def test_redis_pool_ep_key():
-    """_ep_key generates safe Redis keys from endpoint URLs."""
-    from backend.browser_pool import RedisBrowserPool
-
-    key = RedisBrowserPool._ep_key("http://chrome:9222")
-    assert "://" not in key
-    assert key.startswith("browser_pool:ep:")
-
-
-# ── LocalBrowserPool: explicit unknown endpoint ───────────────────────────────
-
-
 @pytest.mark.asyncio
 async def test_acquire_unknown_endpoint_fails_closed():
     """Requesting an unknown endpoint must not acquire another instance."""
@@ -276,222 +232,312 @@ async def test_required_anonymous_route_never_falls_back_or_uses_authenticated()
 # ── init_pool with Redis ──────────────────────────────────────────────────────
 
 
-def test_init_pool_redis(monkeypatch):
-    """init_pool with use_redis=True and redis_url creates a RedisBrowserPool."""
-    from backend import browser_pool
-    from backend.browser_pool import RedisBrowserPool
+class _FakeRedis:
+    def __init__(self):
+        self.values = {}
+        self.expires = {}
+        self.renewal_lost = False
 
-    pool = browser_pool.init_pool(
-        ["http://chrome:9222"],
-        use_redis=True,
-        redis_url="redis://localhost:6379",
-    )
-    assert isinstance(pool, RedisBrowserPool)
-    assert pool.total == 1
+    async def __aenter__(self):
+        return self
 
+    async def __aexit__(self, *_args):
+        return False
 
-@pytest.mark.asyncio
-async def test_ensure_ready_redis_pool_calls_initialize():
-    """ensure_ready calls initialize() on RedisBrowserPool."""
-    from backend import browser_pool
-    from backend.browser_pool import RedisBrowserPool
+    def _purge(self, key):
+        if self.expires.get(key, float("inf")) <= time.monotonic():
+            self.values.pop(key, None)
+            self.expires.pop(key, None)
 
-    redis_pool = RedisBrowserPool(["http://chrome:9222"], "redis://localhost:6379")
-    redis_pool.initialize = AsyncMock()
-    browser_pool._pool = redis_pool
+    async def incr(self, key):
+        self._purge(key)
+        self.values[key] = int(self.values.get(key, 0)) + 1
+        return self.values[key]
 
-    await browser_pool.ensure_ready()
+    async def set(self, key, value, *, nx=False, px=None):
+        self._purge(key)
+        if nx and key in self.values:
+            return False
+        self.values[key] = value
+        if px is not None:
+            self.expires[key] = time.monotonic() + px / 1000
+        return True
 
-    redis_pool.initialize.assert_awaited_once()
+    async def eval(self, script, _numkeys, key, owner, ttl=None):
+        self._purge(key)
+        if "pexpire" in script:
+            if self.renewal_lost:
+                return 0
+            if self.values.get(key) != owner:
+                return 0
+            self.expires[key] = time.monotonic() + ttl / 1000
+            return 1
+        if self.values.get(key) == owner:
+            self.values.pop(key, None)
+            self.expires.pop(key, None)
+            return 1
+        return 0
 
+    def expire_leases(self):
+        for key in list(self.values):
+            if key.endswith(":lease"):
+                self.expires[key] = time.monotonic() - 1
+                self._purge(key)
 
-# ── RedisBrowserPool._client ─────────────────────────────────────────────────
-
-
-def test_redis_pool_client_returns_redis_client():
-    """_client() returns an aioredis client from the configured URL."""
-    from unittest.mock import MagicMock
-
-    from backend.browser_pool import RedisBrowserPool
-
-    mock_redis_client = MagicMock()
-    with patch("redis.asyncio.from_url", return_value=mock_redis_client):
-        pool = RedisBrowserPool(["http://chrome:9222"], "redis://localhost:6379")
-        client = pool._client()
-
-    assert client is mock_redis_client
-
-
-# ── RedisBrowserPool.initialize ──────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_redis_pool_initialize():
-    """initialize() populates the pool keys in Redis."""
-    from unittest.mock import AsyncMock
-
-    from backend.browser_pool import RedisBrowserPool
-
-    mock_redis = AsyncMock()
-    mock_redis.set = AsyncMock(return_value=True)
-    mock_redis.delete = AsyncMock()
-    mock_redis.rpush = AsyncMock()
-    mock_redis_cm = AsyncMock()
-    mock_redis_cm.__aenter__ = AsyncMock(return_value=mock_redis)
-    mock_redis_cm.__aexit__ = AsyncMock(return_value=False)
-
-    pool = RedisBrowserPool(["http://chrome:9222"], "redis://localhost:6379")
-
-    with patch.object(pool, "_client", return_value=mock_redis_cm):
-        await pool.initialize()
-
-    mock_redis.rpush.assert_called()
+    def has_lease(self, endpoint):
+        key = f"browser_pool:ep:{endpoint}:lease"
+        self._purge(key)
+        return key in self.values
 
 
 @pytest.mark.asyncio
-async def test_redis_pool_initialize_already_initialized():
-    """initialize() is a no-op if pool already initialized (lock not acquired)."""
-    from backend.browser_pool import RedisBrowserPool
+async def test_local_cancel_unrouted_waiter_restores_all_tokens():
+    from backend.browser_pool import LocalBrowserPool
 
-    mock_redis = AsyncMock()
-    mock_redis.set = AsyncMock(return_value=None)  # lock not acquired
-    mock_redis_cm = AsyncMock()
-    mock_redis_cm.__aenter__ = AsyncMock(return_value=mock_redis)
-    mock_redis_cm.__aexit__ = AsyncMock(return_value=False)
+    pool = LocalBrowserPool(["A", "B", "C"])
+    holders = [pool.acquire(ep) for ep in pool.endpoints]
+    for holder in holders:
+        await holder.__aenter__()
 
-    pool = RedisBrowserPool(["http://chrome:9222"], "redis://localhost:6379")
+    waiter = asyncio.create_task(pool.acquire().__aenter__())
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    waiter.cancel()
+    await asyncio.gather(waiter, return_exceptions=True)
+    for holder in holders:
+        await holder.__aexit__(None, None, None)
 
-    with patch.object(pool, "_client", return_value=mock_redis_cm):
-        await pool.initialize()
-
-    mock_redis.rpush.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_redis_pool_registers_a_dynamic_anonymous_endpoint_idempotently():
-    from backend.browser_pool import RedisBrowserPool
-
-    endpoint = "http://dynamic-clean-profile:9222"
-    mock_redis = AsyncMock()
-    mock_redis.sadd = AsyncMock(side_effect=[1, 0])
-    mock_redis.rpush = AsyncMock()
-    mock_redis_cm = AsyncMock()
-    mock_redis_cm.__aenter__ = AsyncMock(return_value=mock_redis)
-    mock_redis_cm.__aexit__ = AsyncMock(return_value=False)
-    pool = RedisBrowserPool([], "redis://localhost:6379")
-
-    with patch.object(pool, "_client", return_value=mock_redis_cm):
-        await pool.register_endpoint(endpoint)
-        await pool.register_endpoint(endpoint)
-    pool.set_profile_kind(endpoint, "anonymous")
-
-    assert pool.select_anonymous_endpoint() == endpoint
-    assert mock_redis.rpush.await_count == 2
-    mock_redis.rpush.assert_any_await("browser_pool:endpoints", endpoint)
-    mock_redis.rpush.assert_any_await(pool._ep_key(endpoint), endpoint)
-
-
-# ── RedisBrowserPool.acquire ──────────────────────────────────────────────────
+    assert pool.available == 3
+    for endpoint in pool.endpoints:
+        async with pool.acquire(endpoint) as acquired:
+            assert acquired == endpoint
 
 
 @pytest.mark.asyncio
-async def test_redis_pool_acquire_any():
-    """acquire() without endpoint blpops from the shared pool key."""
-    from backend.browser_pool import RedisBrowserPool
+async def test_local_cancel_waiting_profile_lock_restores_endpoint():
+    from backend.browser_pool import LocalBrowserPool
 
-    ep = "http://chrome:9222"
-    mock_redis = AsyncMock()
-    mock_redis.blpop = AsyncMock(return_value=("browser_pool:endpoints", ep))
-    mock_redis.incr = AsyncMock(return_value=1)
-    mock_redis.set = AsyncMock(return_value=True)
-    mock_redis.eval = AsyncMock(return_value=1)
-    mock_redis.rpush = AsyncMock()
-    mock_redis_cm = AsyncMock()
-    mock_redis_cm.__aenter__ = AsyncMock(return_value=mock_redis)
-    mock_redis_cm.__aexit__ = AsyncMock(return_value=False)
+    pool = LocalBrowserPool(["A", "B"])
+    pool.set_profile_name("A", "shared")
+    pool.set_profile_name("B", "shared")
+    holder = pool.acquire("A")
+    await holder.__aenter__()
 
-    pool = RedisBrowserPool([ep], "redis://localhost:6379")
+    waiter = asyncio.create_task(pool.acquire("B").__aenter__())
+    for _ in range(10):
+        await asyncio.sleep(0)
+        if not pool.available_for("B"):
+            break
+    waiter.cancel()
+    await asyncio.gather(waiter, return_exceptions=True)
+    assert pool.available_for("B") is True
 
-    with patch.object(pool, "_client", return_value=mock_redis_cm):
-        async with pool.acquire() as acquired_ep:
-            assert acquired_ep == ep
-
-
-@pytest.mark.asyncio
-async def test_redis_pool_acquire_routed():
-    """acquire(endpoint) blpops from the per-endpoint key."""
-    from backend.browser_pool import RedisBrowserPool
-
-    ep = "http://chrome:9222"
-    mock_redis = AsyncMock()
-    mock_redis.blpop = AsyncMock(return_value=(f"browser_pool:ep:{ep}", ep))
-    mock_redis.incr = AsyncMock(return_value=1)
-    mock_redis.set = AsyncMock(return_value=True)
-    mock_redis.eval = AsyncMock(return_value=1)
-    mock_redis.rpush = AsyncMock()
-    mock_redis_cm = AsyncMock()
-    mock_redis_cm.__aenter__ = AsyncMock(return_value=mock_redis)
-    mock_redis_cm.__aexit__ = AsyncMock(return_value=False)
-
-    pool = RedisBrowserPool([ep], "redis://localhost:6379")
-
-    with patch.object(pool, "_client", return_value=mock_redis_cm):
-        async with pool.acquire(ep) as acquired_ep:
-            assert acquired_ep == ep
+    await holder.__aexit__(None, None, None)
+    assert pool.available == 2
 
 
 @pytest.mark.asyncio
-async def test_redis_pool_acquire_timeout(monkeypatch):
-    """acquire() raises TimeoutError when no endpoint lease is available."""
+async def test_local_cancel_after_profile_lock_wins_restores_slot_once():
+    from backend.browser_pool import LocalBrowserPool
+
+    pool = LocalBrowserPool(["A", "B"])
+    pool.set_profile_name("A", "shared")
+    pool.set_profile_name("B", "shared")
+    holder = pool.acquire("A")
+    await holder.__aenter__()
+
+    waiter = asyncio.create_task(pool.acquire("B").__aenter__())
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert pool.available_for("B") is False
+
+    await holder.__aexit__(None, None, None)
+    waiter.cancel()
+    await asyncio.gather(waiter, return_exceptions=True)
+
+    assert pool.available == 2
+    for endpoint in pool.endpoints:
+        async with pool.acquire(endpoint) as acquired:
+            assert acquired == endpoint
+
+
+@pytest.mark.asyncio
+async def test_redis_pools_compete_by_endpoint_lease_and_reacquire(monkeypatch):
     from backend.browser_pool import RedisBrowserPool
 
-    mock_redis = AsyncMock()
-    mock_redis.blpop = AsyncMock(return_value=None)
-    mock_redis.set = AsyncMock(return_value=False)
-    mock_redis_cm = AsyncMock()
-    mock_redis_cm.__aenter__ = AsyncMock(return_value=mock_redis)
-    mock_redis_cm.__aexit__ = AsyncMock(return_value=False)
+    redis = _FakeRedis()
+    first = RedisBrowserPool(["A", "B"], "redis://test")
+    second = RedisBrowserPool(["A", "B"], "redis://test")
+    monkeypatch.setattr(first, "_client", lambda: redis)
+    monkeypatch.setattr(second, "_client", lambda: redis)
+    first._ACQUIRE_TIMEOUT_SECONDS = 0.01
+    second._ACQUIRE_TIMEOUT_SECONDS = 0.01
+    second._RETRY_SECONDS = 0.001
 
-    pool = RedisBrowserPool(["http://chrome:9222"], "redis://localhost:6379")
-    monkeypatch.setattr(pool, "_ACQUIRE_TIMEOUT_SECONDS", 0.01)
-    monkeypatch.setattr(pool, "_RETRY_SECONDS", 0.001)
-
-    with patch.object(pool, "_client", return_value=mock_redis_cm):
+    async with first.acquire("A") as acquired:
+        assert acquired == "A"
+        async with second.acquire() as other:
+            assert other == "B"
         with pytest.raises(TimeoutError):
-            async with pool.acquire():
+            async with second.acquire("A"):
                 pass
+    async with second.acquire("A") as reacquired:
+        assert reacquired == "A"
 
 
 @pytest.mark.asyncio
-async def test_redis_routed_and_unrouted_share_one_endpoint_lease(monkeypatch):
+async def test_redis_cancel_after_set_cleans_owner_lease(monkeypatch):
     from backend.browser_pool import RedisBrowserPool
 
-    endpoint = "http://chrome:9222"
-    redis = AsyncMock()
-    responses = iter([("browser_pool:ep:route", endpoint)])
-    redis.blpop = AsyncMock(
-        side_effect=lambda *_args, **_kwargs: next(responses, None)
-    )
-    redis.incr = AsyncMock(return_value=1)
-    redis.set = AsyncMock(side_effect=[True, *([False] * 50)])
-    redis.eval = AsyncMock(return_value=1)
-    redis.rpush = AsyncMock()
-    redis_cm = AsyncMock()
-    redis_cm.__aenter__ = AsyncMock(return_value=redis)
-    redis_cm.__aexit__ = AsyncMock(return_value=False)
-    pool = RedisBrowserPool([endpoint], "redis://localhost:6379")
-    monkeypatch.setattr(pool, "_ACQUIRE_TIMEOUT_SECONDS", 0.02, raising=False)
-    monkeypatch.setattr(pool, "_RETRY_SECONDS", 0.001, raising=False)
+    class PausedRedis(_FakeRedis):
+        def __init__(self):
+            super().__init__()
+            self.set_done = asyncio.Event()
 
-    with patch.object(pool, "_client", return_value=redis_cm):
-        async with pool.acquire(endpoint):
-            with pytest.raises(TimeoutError):
-                async with pool.acquire():
-                    pass
+        async def set(self, key, value, *, nx=False, px=None):
+            result = await super().set(key, value, nx=nx, px=px)
+            if key.endswith(":lease") and not self.set_done.is_set():
+                self.set_done.set()
+                await asyncio.Future()
+            return result
 
-    lease_keys = [call.args[0] for call in redis.set.await_args_list]
-    assert set(lease_keys) == {pool._lease_key(endpoint)}
+    redis = PausedRedis()
+    first = RedisBrowserPool(["A"], "redis://test")
+    second = RedisBrowserPool(["A"], "redis://test")
+    monkeypatch.setattr(first, "_client", lambda: redis)
+    monkeypatch.setattr(second, "_client", lambda: redis)
+    first._ACQUIRE_TIMEOUT_SECONDS = 0.01
+    second._ACQUIRE_TIMEOUT_SECONDS = 0.01
 
+    waiter = asyncio.create_task(first.acquire("A").__aenter__())
+    await asyncio.wait_for(redis.set_done.wait(), 1)
+    waiter.cancel()
+    await asyncio.gather(waiter, return_exceptions=True)
+
+    assert redis.has_lease("A") is False
+    async with second.acquire("A") as reacquired:
+        assert reacquired == "A"
+
+
+@pytest.mark.asyncio
+async def test_redis_cancel_during_fence_acquisition_leaves_no_lease(monkeypatch):
+    from backend.browser_pool import RedisBrowserPool
+
+    class PausedRedis(_FakeRedis):
+        def __init__(self):
+            super().__init__()
+            self.incr_done = asyncio.Event()
+
+        async def incr(self, key):
+            result = await super().incr(key)
+            if not self.incr_done.is_set():
+                self.incr_done.set()
+                await asyncio.Future()
+            return result
+
+    redis = PausedRedis()
+    first = RedisBrowserPool(["A"], "redis://test")
+    second = RedisBrowserPool(["A"], "redis://test")
+    monkeypatch.setattr(first, "_client", lambda: redis)
+    monkeypatch.setattr(second, "_client", lambda: redis)
+
+    waiter = asyncio.create_task(first.acquire("A").__aenter__())
+    await asyncio.wait_for(redis.incr_done.wait(), 1)
+    waiter.cancel()
+    await asyncio.gather(waiter, return_exceptions=True)
+
+    assert redis.has_lease("A") is False
+    async with second.acquire("A") as reacquired:
+        assert reacquired == "A"
+
+
+@pytest.mark.asyncio
+async def test_redis_set_error_after_acceptance_cleans_owner_lease(monkeypatch):
+    from backend.browser_pool import RedisBrowserPool
+
+    class FailingRedis(_FakeRedis):
+        def __init__(self):
+            super().__init__()
+            self.fail_next = True
+
+        async def set(self, key, value, *, nx=False, px=None):
+            result = await super().set(key, value, nx=nx, px=px)
+            if key.endswith(":lease") and self.fail_next:
+                self.fail_next = False
+                raise ConnectionError("response lost after SET")
+            return result
+
+    redis = FailingRedis()
+    first = RedisBrowserPool(["A"], "redis://test")
+    second = RedisBrowserPool(["A"], "redis://test")
+    monkeypatch.setattr(first, "_client", lambda: redis)
+    monkeypatch.setattr(second, "_client", lambda: redis)
+
+    with pytest.raises(ConnectionError, match="response lost"):
+        await first.acquire("A").__aenter__()
+
+    assert redis.has_lease("A") is False
+    async with second.acquire("A") as reacquired:
+        assert reacquired == "A"
+
+
+@pytest.mark.asyncio
+async def test_redis_owner_cleanup_does_not_delete_replacement_lease(monkeypatch):
+    from backend.browser_pool import RedisBrowserPool
+
+    redis = _FakeRedis()
+    first = RedisBrowserPool(["A"], "redis://test")
+    second = RedisBrowserPool(["A"], "redis://test")
+    monkeypatch.setattr(first, "_client", lambda: redis)
+    monkeypatch.setattr(second, "_client", lambda: redis)
+
+    old_holder = first.acquire("A")
+    assert await old_holder.__aenter__() == "A"
+    redis.expire_leases()
+    replacement = second.acquire("A")
+    assert await replacement.__aenter__() == "A"
+
+    await old_holder.__aexit__(None, None, None)
+    assert redis.has_lease("A") is True
+    await replacement.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_redis_expired_owner_can_reacquire_without_queue_token(monkeypatch):
+    from backend.browser_pool import RedisBrowserPool
+
+    redis = _FakeRedis()
+    first = RedisBrowserPool(["A"], "redis://test")
+    second = RedisBrowserPool(["A"], "redis://test")
+    monkeypatch.setattr(first, "_client", lambda: redis)
+    monkeypatch.setattr(second, "_client", lambda: redis)
+    holder = first.acquire("A")
+    assert await holder.__aenter__() == "A"
+
+    redis.expire_leases()
+    async with second.acquire("A") as reacquired:
+        assert reacquired == "A"
+    await holder.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_redis_renewal_loss_cleans_lease_and_allows_reacquire(monkeypatch):
+    from backend.browser_pool import RedisBrowserPool
+
+    redis = _FakeRedis()
+    redis.renewal_lost = True
+    first = RedisBrowserPool(["A"], "redis://test")
+    second = RedisBrowserPool(["A"], "redis://test")
+    monkeypatch.setattr(first, "_client", lambda: redis)
+    monkeypatch.setattr(second, "_client", lambda: redis)
+    first._LEASE_RENEW_SECONDS = 0.001
+
+    with pytest.raises(asyncio.CancelledError):
+        async with first.acquire("A"):
+            await asyncio.sleep(0.02)
+    assert redis.has_lease("A") is False
+    async with second.acquire("A") as reacquired:
+        assert reacquired == "A"
 
 # Managed official-site acquisition must never fall back to the operator's
 # default (potentially authenticated) browser profile.

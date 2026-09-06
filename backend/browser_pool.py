@@ -5,8 +5,8 @@ can run concurrently without competing for a single browser.
 
 Two implementations:
   LocalBrowserPool  — per-endpoint asyncio.Queue slots, for TASK_EXECUTOR=local.
-  RedisBrowserPool  — Redis BLPOP/RPUSH, for TASK_EXECUTOR=celery (distributed
-                      workers across processes / machines).
+  RedisBrowserPool  — Redis endpoint leases, for TASK_EXECUTOR=celery
+                      (distributed workers across processes / machines).
 
 Routing:
   acquire(endpoint=None)         — any available instance (round-robin / first-free)
@@ -107,22 +107,63 @@ class LocalBrowserPool:
                 raise NoReadyBrowserSlotError()
             if not self.is_ready(endpoint):
                 raise NoReadyBrowserSlotError()
-            ep = await self._slots[endpoint].get()
+            get_task = asyncio.create_task(self._slots[endpoint].get())
+            try:
+                ep = await asyncio.shield(get_task)
+            except asyncio.CancelledError:
+                if not get_task.done():
+                    get_task.cancel()
+                try:
+                    token = await get_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                else:
+                    self._restore_slot(endpoint, token)
+                raise
             logger.debug("Chrome acquired (routed): %s", ep)
         else:
-            ep = await self._acquire_any()
+            acquire_task = asyncio.create_task(self._acquire_any())
+            try:
+                ep = await asyncio.shield(acquire_task)
+            except asyncio.CancelledError:
+                if not acquire_task.done():
+                    acquire_task.cancel()
+                try:
+                    acquired_endpoint = await acquire_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                else:
+                    self._restore_slot(acquired_endpoint)
+                raise
 
         if required_profile_kind and self.get_profile_kind(ep) != required_profile_kind:
-            self._slots[ep].put_nowait(ep)
+            self._restore_slot(ep)
             raise NoCleanProfileError()
 
         profile_lock = self._profile_locks.setdefault(self.get_profile_name(ep), asyncio.Lock())
-        await profile_lock.acquire()
+        lock_acquired = False
         try:
+            lock_task = asyncio.create_task(profile_lock.acquire())
+            try:
+                lock_acquired = await asyncio.shield(lock_task)
+            except asyncio.CancelledError:
+                if not lock_task.done():
+                    lock_task.cancel()
+                try:
+                    lock_acquired = await lock_task
+                except (asyncio.CancelledError, Exception):
+                    lock_acquired = False
+                else:
+                    if lock_acquired:
+                        profile_lock.release()
+                        lock_acquired = False
+                raise
+            lock_acquired = True
             yield ep
         finally:
-            profile_lock.release()
-            self._slots[ep].put_nowait(ep)
+            if lock_acquired:
+                profile_lock.release()
+            self._restore_slot(ep)
             logger.debug("Chrome released: %s", ep)
 
     @asynccontextmanager
@@ -151,6 +192,12 @@ class LocalBrowserPool:
             candidates[0],
         )
 
+    def _restore_slot(self, endpoint: str, token: str | None = None) -> None:
+        slot = self._slots.get(endpoint)
+        if slot is None or slot.full():
+            return
+        slot.put_nowait(endpoint if token is None else token)
+
     async def _acquire_any(self) -> str:
         """Wait for whichever READY endpoint slot becomes free first."""
         ready_slots = {ep: slot for ep, slot in self._slots.items() if self.is_ready(ep)}
@@ -159,35 +206,48 @@ class LocalBrowserPool:
         tasks: dict[asyncio.Task[str], str] = {
             asyncio.get_event_loop().create_task(slot.get()): ep for ep, slot in ready_slots.items()
         }
-        done, pending = await asyncio.wait(tasks.keys(), return_when=asyncio.FIRST_COMPLETED)
-
-        winner = next(iter(done))
-        winner_ep = tasks[winner]
-        for task in pending:
-            task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-
-        # Multiple queue.get() tasks may complete in the same loop turn.  Keep
-        # exactly one acquired token and put every losing token back immediately.
-        for task in done:
-            if task is winner:
-                continue
-            try:
-                token = task.result()
-            except (asyncio.CancelledError, Exception):
-                continue
-            slot = self._slots.get(tasks[task])
-            if slot is not None and not slot.full():
-                slot.put_nowait(token)
-
-        logger.debug(
-            "Chrome acquired (any): %s (available: %d/%d)",
-            winner_ep,
-            self.available,
-            self._total,
-        )
-        return winner_ep
+        winner_task: asyncio.Task[str] | None = None
+        keep_winner = False
+        try:
+            done, _ = await asyncio.wait(tasks.keys(), return_when=asyncio.FIRST_COMPLETED)
+            winner_task = next(
+                (
+                    task
+                    for task in done
+                    if not task.cancelled() and task.exception() is None
+                ),
+                None,
+            )
+            if winner_task is None:
+                raise RuntimeError("No browser slot acquisition completed")
+            for task in tasks:
+                if task is not winner_task and not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            winner_ep = tasks[winner_task]
+            keep_winner = True
+            logger.debug(
+                "Chrome acquired (any): %s (available: %d/%d)",
+                winner_ep,
+                self.available,
+                self._total,
+            )
+            return winner_ep
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            for task, endpoint in tasks.items():
+                if keep_winner and task is winner_task:
+                    continue
+                if task.cancelled():
+                    continue
+                try:
+                    token = task.result()
+                except BaseException:
+                    continue
+                self._restore_slot(endpoint, token)
 
     @property
     def total(self) -> int:
@@ -307,22 +367,20 @@ class LocalBrowserPool:
         logger.info("BrowserPool: removed endpoint %s (total: %d)", endpoint, self._total)
 
 class RedisBrowserPool:
-    """Distributed pool backed by Redis lists (BLPOP/RPUSH).
+    """Distributed pool backed by one owner-CAS lease per endpoint.
 
     Safe across multiple Celery worker processes and machines.
 
     Routing support:
-      - Unrouted acquire() uses the shared pool list (existing behaviour).
-      - Routed acquire(endpoint=...) uses a per-endpoint list key so only
-        that specific Chrome instance is used, without consuming a slot from
-        the shared pool.  This lets you pin data sources to Chrome instances
-        that are logged into specific sites.
+      - Unrouted acquire() tries every ready endpoint and takes the first lease
+        it wins.
+      - Routed acquire(endpoint=...) tries only that endpoint's lease.  Routed
+        and unrouted acquisition therefore compete for the same authority.
 
     Initialisation is idempotent (SET NX lock) so multiple API/worker
-    replicas don't double-push endpoints.
+    replicas can safely register the same endpoint set.
     """
 
-    _POOL_KEY = "browser_pool:endpoints"
     _LOCK_KEY = "browser_pool:initialized"
     _REGISTRY_KEY = "browser_pool:registered"
     _LEASE_TTL_MS = 30_000
@@ -332,7 +390,7 @@ class RedisBrowserPool:
 
     @staticmethod
     def _ep_key(endpoint: str) -> str:
-        """Per-endpoint Redis list key (safe characters only)."""
+        """Per-endpoint Redis namespace key (safe characters only)."""
         safe = endpoint.replace("://", "_").replace(":", "_").replace("/", "_")
         return f"browser_pool:ep:{safe}"
 
@@ -362,24 +420,15 @@ class RedisBrowserPool:
         return aioredis.from_url(self._redis_url, decode_responses=True)
 
     async def initialize(self) -> None:
-        """Populate the Redis pool and per-endpoint lists (idempotent)."""
+        """Register known endpoints without maintaining a second token ledger."""
         async with self._client() as r:
             acquired = await r.set(self._LOCK_KEY, "1", nx=True)
             if not acquired:
                 logger.info("BrowserPool (Redis): pool already initialized by another replica")
                 return
 
-            # Shared pool list (for unrouted acquire)
-            await r.delete(self._POOL_KEY)
             if self._endpoints:
-                await r.rpush(self._POOL_KEY, *self._endpoints)
                 await r.sadd(self._REGISTRY_KEY, *self._endpoints)
-
-            # Per-endpoint lists (for routed acquire)
-            for ep in self._endpoints:
-                key = self._ep_key(ep)
-                await r.delete(key)
-                await r.rpush(key, ep)
 
             logger.info(
                 "BrowserPool (Redis): %d Chrome instance(s) initialised",
@@ -403,8 +452,6 @@ class RedisBrowserPool:
             added = await r.sadd(self._REGISTRY_KEY, endpoint)
             if not added:
                 return
-            await r.rpush(self._POOL_KEY, endpoint)
-            await r.rpush(self._ep_key(endpoint), endpoint)
 
     @asynccontextmanager
     async def acquire(
@@ -432,81 +479,90 @@ class RedisBrowserPool:
         )
         if not candidates:
             raise NoReadyBrowserSlotError()
-        queue_key = self._ep_key(endpoint) if endpoint is not None else self._POOL_KEY
+
         deadline = time.monotonic() + self._ACQUIRE_TIMEOUT_SECONDS
-        ep = None
-        owner = None
-        while time.monotonic() < deadline and ep is None:
-            timeout = max(1, int(deadline - time.monotonic()))
-            async with self._client() as r:
-                popped = await r.blpop(queue_key, timeout=timeout)
-                if not popped:
-                    continue
-                _, candidate = popped
-                if candidate not in candidates:
-                    await r.rpush(queue_key, candidate)
-                    continue
-                fence = await r.incr(self._fence_key(candidate))
-                candidate_owner = f"{fence}:{uuid4()}"
-                acquired = await r.set(
-                    self._lease_key(candidate),
-                    candidate_owner,
-                    nx=True,
-                    px=self._LEASE_TTL_MS,
-                )
-                if acquired:
-                    ep = candidate
-                    owner = candidate_owner
-                else:
-                    # Redis lists are the token transport; restore a token
-                    # whenever the endpoint lease was won by another worker.
-                    await r.rpush(queue_key, candidate)
-            if ep is None:
-                await asyncio.sleep(self._RETRY_SECONDS)
-        if ep is None or owner is None:
-            raise TimeoutError("No Chrome endpoint lease became available in time")
-
-        owning_task = asyncio.current_task()
+        ep: str | None = None
+        owner: str | None = None
+        cleanup_ep: str | None = None
+        cleanup_owner: str | None = None
+        renewal_task: asyncio.Task[None] | None = None
         stop_renewal = asyncio.Event()
-
-        async def renew() -> None:
-            while True:
-                try:
-                    await asyncio.wait_for(stop_renewal.wait(), timeout=self._LEASE_RENEW_SECONDS)
-                    return
-                except TimeoutError:
-                    pass
-                async with self._client() as r:
-                    renewed = await r.eval(
-                        "if redis.call('get',KEYS[1]) == ARGV[1] then "
-                        "return redis.call('pexpire',KEYS[1],ARGV[2]) else return 0 end",
-                        1,
-                        self._lease_key(ep),
-                        owner,
-                        self._LEASE_TTL_MS,
-                    )
-                if not renewed:
-                    if owning_task is not None:
-                        owning_task.cancel()
-                    return
-
-        renewal_task = asyncio.create_task(renew())
         try:
+            while time.monotonic() < deadline and ep is None:
+                for candidate in candidates:
+                    owner_nonce = str(uuid4())
+                    candidate_owner: str
+                    # Track ownership before every await.  If cancellation
+                    # arrives after Redis accepts SET NX but before Python
+                    # receives its result, owner-CAS cleanup still applies.
+                    cleanup_ep = candidate
+                    cleanup_owner = None
+                    async with self._client() as r:
+                        fence = await r.incr(self._fence_key(candidate))
+                        candidate_owner = f"{fence}:{owner_nonce}"
+                        cleanup_owner = candidate_owner
+                        acquired = await r.set(
+                            self._lease_key(candidate),
+                            candidate_owner,
+                            nx=True,
+                            px=self._LEASE_TTL_MS,
+                        )
+                    if acquired:
+                        ep = candidate
+                        owner = candidate_owner
+                        break
+                    cleanup_ep = None
+                    cleanup_owner = None
+                if ep is None:
+                    await asyncio.sleep(self._RETRY_SECONDS)
+            if ep is None or owner is None:
+                raise TimeoutError("No Chrome endpoint lease became available in time")
+
+            owning_task = asyncio.current_task()
+            lease_endpoint = ep
+            lease_owner = owner
+
+            async def renew() -> None:
+                while True:
+                    try:
+                        await asyncio.wait_for(
+                            stop_renewal.wait(), timeout=self._LEASE_RENEW_SECONDS
+                        )
+                        return
+                    except TimeoutError:
+                        pass
+                    async with self._client() as r:
+                        renewed = await r.eval(
+                            "if redis.call('get',KEYS[1]) == ARGV[1] then "
+                            "return redis.call('pexpire',KEYS[1],ARGV[2]) else return 0 end",
+                            1,
+                            self._lease_key(lease_endpoint),
+                            lease_owner,
+                            self._LEASE_TTL_MS,
+                        )
+                    if not renewed:
+                        if owning_task is not None:
+                            owning_task.cancel()
+                        return
+
+            renewal_task = asyncio.create_task(renew())
             yield ep
         finally:
             stop_renewal.set()
-            await renewal_task
-            async with self._client() as r:
-                await r.eval(
-                    "if redis.call('get',KEYS[1]) == ARGV[1] then "
-                    "return redis.call('del',KEYS[1]) else return 0 end",
-                    1,
-                    self._lease_key(ep),
-                    owner,
-                )
-                await r.rpush(queue_key, ep)
-            logger.debug("Chrome lease released (Redis): %s", ep)
-
+            if renewal_task is not None:
+                renewal_task.cancel()
+                await asyncio.gather(renewal_task, return_exceptions=True)
+            if cleanup_ep is not None and cleanup_owner is not None:
+                async with self._client() as r:
+                    await r.eval(
+                        "if redis.call('get',KEYS[1]) == ARGV[1] then "
+                        "return redis.call('del',KEYS[1]) else return 0 end",
+                        1,
+                        self._lease_key(cleanup_ep),
+                        cleanup_owner,
+                    )
+            if ep is not None:
+                logger.debug("Chrome lease released (Redis): %s", ep)
 
     @property
     def total(self) -> int:
