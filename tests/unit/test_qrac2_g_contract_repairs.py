@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
+
 
 import pytest
 from pydantic import SecretStr
@@ -33,6 +33,7 @@ from backend.schemas.browser_account import (
     PortalTicketRecordV1,
     PortalTicketRedeemRequestV1,
     PortalTransientV1,
+    PortalWireLayoutV1,
     PortalWireFrameV1,
     SensitiveSessionBindingV1,
     SessionEnvelopeV1,
@@ -41,14 +42,46 @@ from backend.schemas.browser_account import (
 from backend.services.browser_portal_contract import (
     admit_command_before_side_effects,
     admit_portal_entry,
+    freeze_portal_record_session,
     complete_portal_record_session,
     invoke_portal_owner_transport,
     issue_first_portal_ticket,
     redeem_portal_ticket,
     register_portal_record_session,
     route_portal_frame,
+    consume_portal_ticket_cas,
     ticket_record_from_issue,
 )
+class _RecordSessionProbe:
+    def __init__(self) -> None:
+        self.session_id = "record-session"
+        self.page = object()
+        self.stopped = False
+        self._listener_installed = True
+        self._listener_revoked = False
+        self._pending_events = 1
+
+    def is_common_listener_installed(self) -> bool:
+        return self._listener_installed
+
+    def is_common_listener_revoked(self) -> bool:
+        return self._listener_revoked
+
+    def stop_common_listener(self) -> None:
+        self._listener_installed = False
+        self._listener_revoked = True
+
+    def drain_pending_events(self) -> bool:
+        self._pending_events = 0
+        return True
+
+    def has_pending_events(self) -> bool:
+        return self._pending_events != 0
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
 
 
 def _context() -> tuple[datetime, AccountRef, SessionTargetV1, SessionEnvelopeV1, DurableCommandV1, NodeClaimV1]:
@@ -309,6 +342,9 @@ def test_h5_pixel_mime_bytes_and_owner_route_are_bounded() -> None:
     route = PortalOwnerRouteV1(
         binding=binding,
         node_identity=NodeIdentityV1(node_id="node", boot_id="boot"),
+        owner_endpoint="https://owner.test",
+        tunnel_handle="tunnel-handle",
+        tunnel_auth_digest="a" * 64,
         region_focus=focus,
         session_revision=3,
         route_expires_at=now + timedelta(minutes=1),
@@ -337,6 +373,9 @@ def test_h5_pixel_mime_bytes_and_owner_route_are_bounded() -> None:
         PortalOwnerRouteV1(
             binding=binding.model_copy(update={"record_session_id": None}),
             node_identity=NodeIdentityV1(node_id="node", boot_id="boot"),
+            owner_endpoint="https://owner.test",
+            tunnel_handle="tunnel-handle",
+            tunnel_auth_digest="a" * 64,
             region_focus=focus,
             session_revision=3,
             route_expires_at=now + timedelta(minutes=1),
@@ -383,6 +422,17 @@ def test_h3_first_ticket_redeem_binds_csrf_session_and_replay() -> None:
         websocket_path="/portal",
     )
     assert isinstance(grant, PortalTicketGrantV1)
+    cas_loser = consume_portal_ticket_cas(
+        redeem,
+        record=record,
+        authenticated_subject="operator",
+        now=now,
+        cookie_name="qrac2",
+        websocket_path="/portal",
+        cas_update=lambda _cas, _now: False,
+    )
+    assert getattr(cas_loser, "status") == "blocked"
+    assert getattr(cas_loser, "http_status") == 410
     replay = redeem_portal_ticket(
         redeem,
         record=record.model_copy(update={"consumed_at": now}),
@@ -402,7 +452,7 @@ def test_h3_first_ticket_redeem_binds_csrf_session_and_replay() -> None:
         websocket_path="/portal",
     )
     assert getattr(mismatch, "status") == "blocked"
-    assert getattr(mismatch, "http_status") == 409
+    assert getattr(mismatch, "http_status") == 404
 
 
 def test_h5_owner_route_applies_real_wire_binding() -> None:
@@ -429,6 +479,7 @@ def test_h5_owner_route_applies_real_wire_binding() -> None:
         content_type="application/octet-stream",
         mime_type="image/png",
         byte_length=len(raw),
+        layout=PortalWireLayoutV1(metadata_bytes=16, payload_bytes=len(raw)),
         transient=PortalTransientV1(
             binding=PortalOuterBindingV1(
                 workspace_id=ref.workspace_id,
@@ -441,6 +492,16 @@ def test_h5_owner_route_applies_real_wire_binding() -> None:
             pixel=frame,
         ),
     )
+    with pytest.raises(ValueError):
+        PortalWireFrameV1(
+            sequence=2,
+            encoding="pixel-binary",
+            content_type="application/octet-stream",
+            mime_type="image/png",
+            byte_length=len(raw),
+            layout=PortalWireLayoutV1(metadata_bytes=16, payload_bytes=len(raw) + 1),
+            transient=wire.transient,
+        )
     binding = SensitiveSessionBindingV1(
         account_ref=ref,
         session_id="session",
@@ -449,28 +510,15 @@ def test_h5_owner_route_applies_real_wire_binding() -> None:
         view_generation=4,
         record_session_id="record-session",
     )
-    record_session = SimpleNamespace(
-        session_id="record-session",
-        page=object(),
-        stopped=False,
-    )
-    register_portal_record_session(
-        binding,
-        record_session,
-        completion=PortalRecordSessionContractV1(
-            record_session_id="record-session",
-            target=target,
-            view_generation=4,
-            status="active",
-            page_bound=True,
-            listener_installed=True,
-            listener_revoked=False,
-            pending_events_drained=False,
-        ),
-    )
+    record_session = _RecordSessionProbe()
+    register_portal_record_session(binding, record_session)
+    freeze_portal_record_session(binding, record_session)
     route = PortalOwnerRouteV1(
         binding=binding,
         node_identity=NodeIdentityV1(node_id="node", boot_id="boot"),
+        owner_endpoint="https://owner.test",
+        tunnel_handle="tunnel-handle",
+        tunnel_auth_digest="a" * 64,
         region_focus=PortalRegionFocusV1(
             target=target,
             view_generation=4,
@@ -489,6 +537,8 @@ def test_h5_owner_route_applies_real_wire_binding() -> None:
         invoke_portal_owner_transport(
             route,
             wire,
+            authenticate_owner=lambda owner: owner.tunnel_handle == "tunnel-handle"
+            and owner.tunnel_auth_digest == "a" * 64,
             now=now,
             transport=lambda owner, value: (
                 seen.append((owner.node_identity.node_id, value.sequence)) or value
@@ -499,8 +549,17 @@ def test_h5_owner_route_applies_real_wire_binding() -> None:
     assert seen == [("node", 2)]
     with pytest.raises(ValueError):
         invoke_portal_owner_transport(
+            route,
+            wire,
+            authenticate_owner=lambda _: False,
+            now=now,
+            transport=lambda *_: pytest.fail("unauthenticated route reached owner transport"),
+        )
+    with pytest.raises(ValueError):
+        invoke_portal_owner_transport(
             route.model_copy(update={"route_expires_at": now - timedelta(seconds=1)}),
             wire,
+            authenticate_owner=lambda _: True,
             now=now,
             transport=lambda *_: pytest.fail("expired route reached owner transport"),
         )
@@ -515,12 +574,8 @@ def test_h5_owner_route_applies_real_wire_binding() -> None:
                 }
             ),
         )
-    record_session.stopped = True
-    completed = complete_portal_record_session(
-        binding,
-        listener_revoked=True,
-        pending_events_drained=True,
-    )
+    record_session.stop()
+    completed = complete_portal_record_session(binding)
     assert completed.status == "completed"
     with pytest.raises(ValueError):
         route_portal_frame(route, wire, now=now)
@@ -543,6 +598,8 @@ def test_h1_pre_entry_freezes_perception_model_and_record_tuple() -> None:
         approved_regions=[PortalClipV1(x=0, y=0, width=10, height=10)],
         focused_field_ref="otp",
     )
+    record_session = _RecordSessionProbe()
+    register_portal_record_session(binding, record_session)
     handoff = admit_portal_entry(
         command,
         claim,
@@ -551,7 +608,7 @@ def test_h1_pre_entry_freezes_perception_model_and_record_tuple() -> None:
         perception=PortalPerceptionV1(
             target=target,
             view_generation=4,
-            elements=[PortalPerceptionElementV1(ref="0", role="input", name="OTP")],
+            elements=[PortalPerceptionElementV1(ref="0", role="input", field_ref="otp")],
             region_focus=focus,
         ),
         model_decision=PortalModelDecisionV1(
@@ -560,18 +617,11 @@ def test_h1_pre_entry_freezes_perception_model_and_record_tuple() -> None:
             action="input",
             focused_field_ref="otp",
         ),
-        record=PortalRecordSessionContractV1(
-            record_session_id="record-session",
-            target=target,
-            view_generation=4,
-            status="active",
-            page_bound=True,
-            listener_installed=True,
-            listener_revoked=False,
-            pending_events_drained=False,
-        ),
+        record_session=record_session,
     )
     assert handoff.guard.command.command_id == "command"
+    with pytest.raises(ValueError):
+        PortalPerceptionElementV1(ref="secret", role="input", name="OTP")
     with pytest.raises(ValueError):
         admit_portal_entry(
             command,
@@ -580,5 +630,5 @@ def test_h1_pre_entry_freezes_perception_model_and_record_tuple() -> None:
             binding=binding,
             perception=handoff.perception,
             model_decision=handoff.model_decision.model_copy(update={"view_generation": 3}),
-            record=handoff.record,
+            record_session=record_session,
         )

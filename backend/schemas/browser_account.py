@@ -34,6 +34,7 @@ from backend.models.browser import (
 
 class BrowserAccountErrorCode(StrEnum):
     AUTH_REQUIRED = "auth_required"
+    PORTAL_NOT_FOUND = "portal_not_found"
     ACCOUNT_IDENTITY_MISMATCH = "account_identity_mismatch"
     ACCOUNT_MIGRATION_REQUIRED = "account_migration_required"
     PROFILE_LOST = "profile_lost"
@@ -50,9 +51,9 @@ class BrowserAccountErrorCode(StrEnum):
     SESSION_EXPIRED = "session_expired"
     SAVE_FAILED = "save_failed"
 
-
 ERROR_HTTP_STATUS: dict[BrowserAccountErrorCode, int] = {
     BrowserAccountErrorCode.AUTH_REQUIRED: 409,
+    BrowserAccountErrorCode.PORTAL_NOT_FOUND: 404,
     BrowserAccountErrorCode.ACCOUNT_IDENTITY_MISMATCH: 409,
     BrowserAccountErrorCode.ACCOUNT_MIGRATION_REQUIRED: 409,
     BrowserAccountErrorCode.PROFILE_LOST: 409,
@@ -80,6 +81,8 @@ PORTAL_TICKET_ROUTE = f"{LOGIN_SESSION_ROUTE}/portal-ticket"
 PORTAL_TICKET_ISSUE_ROUTE = f"{PORTAL_TICKET_ROUTE}/issue"
 PORTAL_TICKET_REDEEM_ROUTE = f"{PORTAL_TICKET_ROUTE}/redeem"
 PORTAL_WS_ROUTE = f"{LOGIN_SESSION_ROUTE}/portal"
+PORTAL_TICKET_ISSUE_METHOD = "POST"
+PORTAL_TICKET_REDEEM_METHOD = "POST"
 IDEMPOTENCY_HEADER = "Idempotency-Key"
 
 
@@ -789,11 +792,13 @@ class PortalRegionFocusV1(_ContractModel):
 
 
 class PortalPerceptionElementV1(_ContractModel):
-    """Common sensitive-mode perception row; values never cross this boundary."""
+    """Sensitive-mode perception row; no human-readable text crosses boundary."""
 
     ref: str = Field(min_length=1, max_length=64)
     role: str = Field(min_length=1, max_length=64)
-    name: str = Field(max_length=200)
+    # Only an opaque rule-defined field reference is safe for model input.
+    field_ref: str | None = Field(default=None, min_length=1, max_length=128)
+    name: None = None
     value: None = None
 
 
@@ -834,13 +839,13 @@ class PortalModelDecisionV1(_ContractModel):
 
 
 class PortalRecordSessionContractV1(_ContractModel):
-    """RecordSession registration and completion facts for the same page."""
+    """RecordSession lifecycle facts for one real page binding."""
 
     contract_version: Literal[1] = QRAC2_CONTRACT_VERSION
     record_session_id: str = Field(min_length=1, max_length=36)
     target: SessionTargetV1
     view_generation: int = Field(ge=0)
-    status: Literal["active", "completed", "aborted"]
+    status: Literal["active", "sensitive", "completed", "aborted"]
     page_bound: bool
     listener_installed: bool
     listener_revoked: bool
@@ -850,9 +855,19 @@ class PortalRecordSessionContractV1(_ContractModel):
     def validate_completion(self) -> "PortalRecordSessionContractV1":
         self.target.require_complete()
         if self.status == "active" and (
-            not self.page_bound or not self.listener_installed or self.listener_revoked
+            not self.page_bound
+            or not self.listener_installed
+            or self.listener_revoked
+            or self.pending_events_drained
         ):
-            raise ValueError("active record session must have a live page listener")
+            raise ValueError("active record session must have a live listener")
+        if self.status == "sensitive" and (
+            not self.page_bound
+            or self.listener_installed
+            or not self.listener_revoked
+            or not self.pending_events_drained
+        ):
+            raise ValueError("sensitive record session requires stopped and drained listener")
         if self.status in {"completed", "aborted"} and (
             not self.listener_revoked or not self.pending_events_drained
         ):
@@ -1007,6 +1022,7 @@ class PortalTransientV1(_ContractModel):
     @model_validator(mode="after")
     def require_one_message(self) -> "PortalTransientV1":
         if (self.control is None) == (self.pixel is None):
+
             raise ValueError("portal transient must contain exactly one control or pixel message")
         message = self.control or self.pixel
         assert message is not None
@@ -1020,6 +1036,14 @@ class PortalTransientV1(_ContractModel):
         ):
             raise ValueError("portal message does not match trusted outer binding")
         return self
+class PortalWireLayoutV1(_ContractModel):
+    """Explicit wire header and metadata/payload byte layout."""
+
+    magic: Literal["QRAC2P1"] = "QRAC2P1"
+    byte_order: Literal["big-endian"] = "big-endian"
+    header_bytes: Literal[16] = 16
+    metadata_bytes: int = Field(gt=0, le=65_535)
+    payload_bytes: int = Field(ge=0, le=MAX_PORTAL_FRAME_BYTES)
 
 
 class PortalWireFrameV1(_ContractModel):
@@ -1032,15 +1056,32 @@ class PortalWireFrameV1(_ContractModel):
     content_type: Literal["application/json", "application/octet-stream"]
     mime_type: Literal["application/json", "image/png", "image/jpeg", "image/webp"]
     byte_length: int | None = Field(default=None, ge=1, le=MAX_PORTAL_FRAME_BYTES)
+    layout: PortalWireLayoutV1
     transient: PortalTransientV1
 
     @model_validator(mode="after")
     def validate_encoding(self) -> "PortalWireFrameV1":
+        message = self.transient.control or self.transient.pixel
+        assert message is not None
+        if message.sequence != self.sequence:
+            raise ValueError("wire and payload sequence differ")
         if self.encoding == "control-json":
-            if self.content_type != "application/json" or self.mime_type != "application/json":
-                raise ValueError("control frames require application/json")
-            if self.transient.control is None or self.byte_length is not None:
-                raise ValueError("control framing requires a control message and no binary length")
+            if (
+                self.content_type != "application/json"
+                or self.mime_type != "application/json"
+                or self.transient.control is None
+                or self.byte_length is not None
+            ):
+                raise ValueError("control framing requires JSON metadata and no binary length")
+            control = self.transient.control
+            payload = control.sensitive_payload
+            payload_length = (
+                len(payload.value.get_secret_value().encode("utf-8"))
+                if payload is not None and payload.value is not None
+                else 0
+            )
+            if self.layout.payload_bytes != payload_length:
+                raise ValueError("control payload byte length differs")
         if self.encoding == "pixel-binary":
             pixel = self.transient.pixel
             if (
@@ -1048,12 +1089,12 @@ class PortalWireFrameV1(_ContractModel):
                 or pixel is None
                 or self.mime_type != pixel.mime_type
                 or self.byte_length != pixel.byte_length
+                or self.layout.payload_bytes != pixel.byte_length
             ):
-                raise ValueError("pixel framing must carry the bounded pixel MIME and byte length")
+                raise ValueError("pixel framing must carry bounded binary payload bytes")
         if self.contract_version != self.transient.contract_version:
             raise ValueError("wire and transient contract versions differ")
         return self
-
 
 class PortalOwnerRouteV1(_ContractModel):
     """A-owned bounded route passed to R with session-page-record lineage."""
@@ -1062,6 +1103,9 @@ class PortalOwnerRouteV1(_ContractModel):
     owner: Literal["browser_account_service"] = "browser_account_service"
     binding: SensitiveSessionBindingV1
     node_identity: NodeIdentityV1
+    owner_endpoint: str = Field(min_length=1, max_length=2048)
+    tunnel_handle: str = Field(min_length=1, max_length=255)
+    tunnel_auth_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     region_focus: PortalRegionFocusV1
     session_revision: int = Field(ge=0)
     route_expires_at: datetime
@@ -1070,6 +1114,8 @@ class PortalOwnerRouteV1(_ContractModel):
 
     @model_validator(mode="after")
     def validate_owner_boundary(self) -> "PortalOwnerRouteV1":
+        if not self.owner_endpoint.startswith("https://"):
+            raise ValueError("owner transport endpoint must use TLS")
         if self.binding.record_session_id is None:
             raise ValueError("owner route requires a record session binding")
         if self.binding.target != self.region_focus.target:

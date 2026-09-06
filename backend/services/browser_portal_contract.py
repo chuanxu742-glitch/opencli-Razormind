@@ -68,6 +68,13 @@ class _RegisteredRecordSession:
 _RECORD_SESSIONS: dict[str, _RegisteredRecordSession] = {}
 
 
+def _runtime_method(record_session: Any, name: str) -> Callable[..., Any]:
+    method = getattr(record_session, name, None)
+    if not callable(method):
+        raise ValueError(f"record session does not implement {name}")
+    return method
+
+
 def admit_portal_entry(
     command: DurableCommandV1,
     claim: NodeClaimV1,
@@ -76,24 +83,22 @@ def admit_portal_entry(
     binding: SensitiveSessionBindingV1,
     perception: PortalPerceptionV1,
     model_decision: PortalModelDecisionV1,
-    record: PortalRecordSessionContractV1,
+    record_session: Any,
 ) -> PortalPreEntryHandoffV1:
-    """Freeze the common perception/model/record tuple before portal entry.
-
-    Command admission alone is insufficient: this handoff is the only value
-    an owner should pass to the model, record listener, or browser transport.
-    """
+    """Stop common capture and drain events before freezing portal handoff."""
 
     guard = admit_command_before_side_effects(command, claim, session)
+    freeze_portal_record_session(binding, record_session)
+    registration = _RECORD_SESSIONS[binding.record_session_id or ""]
     handoff = PortalPreEntryHandoffV1(
         guard=guard,
         binding=binding,
         perception=perception,
         model_decision=model_decision,
-        record=record,
+        record=registration.contract,
     )
-    if record.status != "active":
-        raise ValueError("portal pre-entry requires an active record session")
+    if registration.contract.status != "sensitive":
+        raise ValueError("portal pre-entry requires a stopped and drained record listener")
     return handoff
 
 
@@ -101,26 +106,33 @@ def register_portal_record_session(
     binding: SensitiveSessionBindingV1,
     record_session: Any,
     *,
-    completion: PortalRecordSessionContractV1,
     page: Any | None = None,
 ) -> PortalRecordSessionContractV1:
-    """Register a real RecordSession and its live page for one portal binding."""
+    """Register a real RecordSession and derive its live listener state."""
 
     record_id = binding.record_session_id
-    if record_id is None or completion.record_session_id != record_id:
-        raise ValueError("record session registration does not match binding")
     actual_id = getattr(record_session, "session_id", None)
     actual_page = getattr(record_session, "page", None)
-    if actual_id != record_id or actual_page is None:
+    if record_id is None or actual_id != record_id or actual_page is None:
         raise ValueError("record session must expose its real id and page")
     if page is not None and page is not actual_page:
         raise ValueError("record session page does not match registration")
     if getattr(record_session, "stopped", False):
         raise ValueError("stopped record session cannot be registered")
-    if completion.status != "active" or not completion.page_bound:
-        raise ValueError("record registration requires an active page binding")
-    if completion.target != binding.target or completion.view_generation != binding.view_generation:
-        raise ValueError("record registration target or generation mismatch")
+    is_installed = _runtime_method(record_session, "is_common_listener_installed")
+    is_revoked = _runtime_method(record_session, "is_common_listener_revoked")
+    if not is_installed() or is_revoked():
+        raise ValueError("record session listener is not active")
+    completion = PortalRecordSessionContractV1(
+        record_session_id=record_id,
+        target=binding.target,
+        view_generation=binding.view_generation,
+        status="active",
+        page_bound=True,
+        listener_installed=True,
+        listener_revoked=False,
+        pending_events_drained=False,
+    )
     _RECORD_SESSIONS[record_id] = _RegisteredRecordSession(
         session=record_session,
         page=actual_page,
@@ -130,48 +142,92 @@ def register_portal_record_session(
     return completion
 
 
-def resolve_portal_record_session(
+def freeze_portal_record_session(
     binding: SensitiveSessionBindingV1,
-) -> Any:
-    """Resolve the registered RecordSession, rejecting stale or stopped pages."""
+    record_session: Any,
+) -> PortalRecordSessionContractV1:
+    """Perform the real listener-stop and pending-event-drain transition."""
 
-    record_id = binding.record_session_id
-    registration = _RECORD_SESSIONS.get(record_id or "")
+    registration = _RECORD_SESSIONS.get(binding.record_session_id or "")
+    if registration is None or registration.session is not record_session:
+        raise ValueError("record session is not registered for this binding")
+    if registration.contract.status != "active":
+        raise ValueError("record session is not in active pre-entry state")
+    _runtime_method(record_session, "stop_common_listener")()
+    if not _runtime_method(record_session, "drain_pending_events")():
+        raise ValueError("record session pending events were not drained")
+    is_installed = _runtime_method(record_session, "is_common_listener_installed")
+    is_revoked = _runtime_method(record_session, "is_common_listener_revoked")
+    has_pending = _runtime_method(record_session, "has_pending_events")
+    if is_installed() or not is_revoked() or has_pending():
+        raise ValueError("record listener stop/drain state was not confirmed")
+    registration.contract = PortalRecordSessionContractV1(
+        record_session_id=binding.record_session_id or "",
+        target=binding.target,
+        view_generation=binding.view_generation,
+        status="sensitive",
+        page_bound=True,
+        listener_installed=False,
+        listener_revoked=True,
+        pending_events_drained=True,
+    )
+    return registration.contract
+
+
+def resolve_portal_record_session(binding: SensitiveSessionBindingV1) -> Any:
+    """Resolve the registered RecordSession and enforce its page identity."""
+
+    registration = _RECORD_SESSIONS.get(binding.record_session_id or "")
     if registration is None or registration.binding != binding:
         raise ValueError("portal record session is not registered for this binding")
-    if registration.contract.status != "active" or getattr(registration.session, "stopped", False):
+    if registration.contract.status not in {"active", "sensitive"}:
         raise ValueError("portal record session is no longer active")
     if getattr(registration.session, "page", None) is not registration.page:
         raise ValueError("portal record session page changed")
     return registration.session
 
 
+def _resolve_frozen_portal_record_session(binding: SensitiveSessionBindingV1) -> Any:
+    """Resolve only the post-stop session permitted for sensitive routing."""
+
+    session = resolve_portal_record_session(binding)
+    registration = _RECORD_SESSIONS[binding.record_session_id or ""]
+    if registration.contract.status != "sensitive":
+        raise ValueError("portal record session is not frozen for sensitive routing")
+    return session
+
+
 def complete_portal_record_session(
     binding: SensitiveSessionBindingV1,
     *,
     aborted: bool = False,
-    listener_revoked: bool,
-    pending_events_drained: bool,
 ) -> PortalRecordSessionContractV1:
-    """Record the explicit listener-drained completion required before close."""
+    """Require actual stop/listener-drain state, then release registration."""
 
     registration = _RECORD_SESSIONS.get(binding.record_session_id or "")
     if registration is None or registration.binding != binding:
         raise ValueError("portal record session is not registered for this binding")
+    if registration.contract.status != "sensitive":
+        raise ValueError("portal record session was not frozen before completion")
     if not getattr(registration.session, "stopped", False):
         raise ValueError("record completion requires RecordSession.stop")
-    status = "aborted" if aborted else "completed"
+    if (
+        _runtime_method(registration.session, "is_common_listener_installed")()
+        or not _runtime_method(registration.session, "is_common_listener_revoked")()
+        or _runtime_method(registration.session, "has_pending_events")()
+    ):
+        raise ValueError("record completion requires revoked listener and drained events")
     completed = PortalRecordSessionContractV1(
         record_session_id=binding.record_session_id or "",
         target=binding.target,
         view_generation=binding.view_generation,
-        status=status,
+        status="aborted" if aborted else "completed",
         page_bound=True,
-        listener_installed=True,
-        listener_revoked=listener_revoked,
-        pending_events_drained=pending_events_drained,
+        listener_installed=False,
+        listener_revoked=True,
+        pending_events_drained=True,
     )
-    registration.contract = completed
+    del _RECORD_SESSIONS[binding.record_session_id or ""]
     return completed
 
 
@@ -208,6 +264,8 @@ def issue_first_portal_ticket(
         expires_at=expires_at,
         hard_expires_at=hard_expires_at,
     )
+
+
 
 
 def ticket_record_from_issue(
@@ -256,21 +314,20 @@ def redeem_portal_ticket(
     cookie_name: str,
     websocket_path: str,
 ) -> PortalEntryResponseV1:
-    """Validate a ticket and return HTTP outcome plus an atomic CAS predicate.
+    """Validate a ticket and return HTTP outcome plus an atomic CAS predicate."""
 
-    This function never marks the record consumed. The owner must execute the
-    returned grant's ``consume_cas`` as ``WHERE consumed_at IS NULL`` in the
-    same database transaction that creates the session cookie.
-    """
-
+    if (
+        record.account_ref.workspace_id != request.account_ref.workspace_id
+        or record.account_ref.account_id != request.account_ref.account_id
+        or record.session_id != request.session_id
+    ):
+        return _blocked(request, BrowserAccountErrorCode.PORTAL_NOT_FOUND)
     if record.ticket_id != request.ticket_id:
-        return _blocked(request, BrowserAccountErrorCode.ACCOUNT_IDENTITY_MISMATCH)
+        return _blocked(request, BrowserAccountErrorCode.PERMISSION_DENIED)
     if record.consumed_at is not None or now >= record.expires_at:
         return _blocked(request, BrowserAccountErrorCode.SESSION_EXPIRED)
     if record.subject != authenticated_subject:
         return _blocked(request, BrowserAccountErrorCode.PERMISSION_DENIED)
-    if record.account_ref != request.account_ref or record.session_id != request.session_id:
-        return _blocked(request, BrowserAccountErrorCode.ACCOUNT_IDENTITY_MISMATCH)
     if record.session_revision != request.expected_session_revision:
         return _blocked(request, BrowserAccountErrorCode.STALE_GENERATION)
     if not hmac.compare_digest(record.ticket_digest, _digest(request.ticket)):
@@ -299,6 +356,33 @@ def redeem_portal_ticket(
     )
 
 
+def consume_portal_ticket_cas(
+    request: PortalTicketRedeemRequestV1,
+    *,
+    record: PortalTicketRecordV1,
+    authenticated_subject: str,
+    now: datetime,
+    cookie_name: str,
+    websocket_path: str,
+    cas_update: Callable[[PortalTicketConsumeCASV1, datetime], bool],
+) -> PortalEntryResponseV1:
+    """Apply the owner persistence CAS; a concurrent loser receives 410."""
+
+    outcome = redeem_portal_ticket(
+        request,
+        record=record,
+        authenticated_subject=authenticated_subject,
+        now=now,
+        cookie_name=cookie_name,
+        websocket_path=websocket_path,
+    )
+    if not isinstance(outcome, PortalTicketGrantV1):
+        return outcome
+    if not cas_update(outcome.consume_cas, now):
+        return _blocked(request, BrowserAccountErrorCode.SESSION_EXPIRED)
+    return outcome
+
+
 def _clip_contains(container: Any, candidate: Any) -> bool:
     return (
         container.x <= candidate.x
@@ -316,7 +400,7 @@ def route_portal_frame(
 ) -> PortalWireFrameV1:
     """Validate expiry, page/record lineage, focus, and bounded frame bytes."""
 
-    resolve_portal_record_session(owner_route.binding)
+    _resolve_frozen_portal_record_session(owner_route.binding)
     checked_at = now or datetime.now(timezone.utc)
     if owner_route.route_expires_at <= checked_at:
         raise ValueError("portal owner route has expired")
@@ -355,7 +439,8 @@ def route_portal_frame(
         assert control is not None
         payload = control.sensitive_payload
         if payload is not None and payload.value is not None:
-            if len(payload.value.get_secret_value()) > owner_route.max_input_bytes:
+            input_bytes = len(payload.value.get_secret_value().encode("utf-8"))
+            if input_bytes > owner_route.max_input_bytes:
                 raise ValueError("portal input exceeds owner route byte limit")
         if control.kind == "field_input":
             if control.field_ref != owner_route.region_focus.focused_field_ref:
@@ -367,10 +452,13 @@ def invoke_portal_owner_transport(
     owner_route: PortalOwnerRouteV1,
     frame: PortalWireFrameV1,
     *,
+    authenticate_owner: Callable[[PortalOwnerRouteV1], bool],
     transport: Callable[[PortalOwnerRouteV1, PortalWireFrameV1], _TransportResult],
     now: datetime | None = None,
 ) -> _TransportResult:
-    """Invoke the R owner transport only after A-side route validation."""
+    """Authenticate the node tunnel, then invoke R after A-side validation."""
 
     validated = route_portal_frame(owner_route, frame, now=now)
+    if not authenticate_owner(owner_route):
+        raise ValueError("portal owner transport authentication failed")
     return transport(owner_route, validated)
