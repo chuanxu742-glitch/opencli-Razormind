@@ -75,7 +75,7 @@ class BrowserSpace(TimestampMixin):
         ForeignKeyConstraint(
             ["workspace_id", "session_id"],
             ["browser_login_sessions.workspace_id", "browser_login_sessions.id"],
-            ondelete="SET NULL",
+            ondelete="RESTRICT",
         ),
     )
 

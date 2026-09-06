@@ -115,11 +115,6 @@ class SourceBindingRevision(TimestampMixin):
     __tablename__ = "source_binding_revisions"
     __table_args__ = (
         UniqueConstraint("source_binding_id", "revision_number"),
-        CheckConstraint(
-            "(account_id IS NULL AND account_revision IS NULL) OR "
-            "(account_id IS NOT NULL AND account_revision IS NOT NULL AND account_revision >= 1)",
-            name="ck_source_binding_revisions_account_pin",
-        ),
     )
 
     source_binding_id: Mapped[str] = mapped_column(
@@ -133,9 +128,8 @@ class SourceBindingRevision(TimestampMixin):
     created_by_user_id: Mapped[str] = mapped_column(
         ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
     )
-    # Optional account pin: a revision either remains legacy source-only or
-    # atomically identifies one account revision; it never follows latest state.
+    # Account selection is immutable at the binding-revision boundary. Runtime
+    # authentication and lease state remain independent mutable account facts.
     account_id: Mapped[str | None] = mapped_column(
         ForeignKey("browser_accounts.id", ondelete="RESTRICT"), nullable=True, index=True
     )
-    account_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)

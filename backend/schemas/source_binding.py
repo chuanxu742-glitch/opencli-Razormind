@@ -96,7 +96,6 @@ class SourceBindingRevisionCreate(BaseModel):
     source_revision_number: int = Field(ge=1)
     scope_config: dict = Field(default_factory=dict)
     account_id: str | None = Field(default=None, min_length=1, max_length=36)
-    account_revision: int | None = Field(default=None, ge=1)
 
 
 class SourceBindingRevisionRead(UTCModel):
@@ -106,7 +105,6 @@ class SourceBindingRevisionRead(UTCModel):
     pinned_source_revision_id: str
     scope_config: dict
     account_id: str | None
-    account_revision: int | None
     created_by_user_id: str
     created_at: datetime
     updated_at: datetime

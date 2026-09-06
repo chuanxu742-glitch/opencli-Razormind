@@ -2,7 +2,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, Optional
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Integer, JSON, String, UniqueConstraint
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Integer, JSON, String, UniqueConstraint, BigInteger
 from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.models.base import TimestampMixin
@@ -68,7 +68,7 @@ class EdgeNodeCapacity(TimestampMixin):
     boot_id: Mapped[str] = mapped_column(String(128), nullable=False)
     slot_limit: Mapped[int] = mapped_column(Integer, nullable=False)
     occupied_slots: Mapped[int] = mapped_column(Integer, nullable=False)
-    disk_available: Mapped[int] = mapped_column(Integer, nullable=False)
+    disk_available: Mapped[int] = mapped_column(BigInteger, nullable=False)
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     capabilities: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)

@@ -33,13 +33,7 @@ def upgrade() -> None:
 
     with op.batch_alter_table("source_binding_revisions") as batch:
         batch.add_column(sa.Column("account_id", sa.String(36), nullable=True))
-        batch.add_column(sa.Column("account_revision", sa.Integer(), nullable=True))
         batch.create_index("ix_source_binding_revisions_account_id", ["account_id"])
-        batch.create_check_constraint(
-            "ck_source_binding_revisions_account_pin",
-            "(account_id IS NULL AND account_revision IS NULL) OR "
-            "(account_id IS NOT NULL AND account_revision IS NOT NULL AND account_revision >= 1)",
-        )
 
     op.create_table(
         "browser_accounts",
@@ -62,6 +56,7 @@ def upgrade() -> None:
         sa.Column("evidence_observed_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("manual_confirmed_by", sa.String(36), nullable=True),
         sa.Column("status", sa.String(20), nullable=False, server_default="dormant"),
+        sa.Column("paused", sa.Boolean(), nullable=False, server_default=sa.false()),
         sa.Column("revision", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("status_reason_code", sa.String(64), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
@@ -113,7 +108,7 @@ def upgrade() -> None:
         sa.Column("boot_id", sa.String(128), nullable=False),
         sa.Column("slot_limit", sa.Integer(), nullable=False),
         sa.Column("occupied_slots", sa.Integer(), nullable=False),
-        sa.Column("disk_available", sa.Integer(), nullable=False),
+        sa.Column("disk_available", sa.BigInteger(), nullable=False),
         sa.Column("observed_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("capabilities", sa.JSON(), nullable=False),
@@ -210,7 +205,7 @@ def upgrade() -> None:
             "browser_login_sessions",
             ["workspace_id", "session_id"],
             ["workspace_id", "id"],
-            ondelete="SET NULL",
+            ondelete="RESTRICT",
         )
 
     op.create_table(
@@ -245,7 +240,7 @@ def upgrade() -> None:
     op.create_index(
         "uq_browser_account_leases_active_account",
         "browser_account_leases",
-        ["account_id"],
+        ["workspace_id", "account_id"],
         unique=True,
         sqlite_where=_ACTIVE_LEASES,
         postgresql_where=_ACTIVE_LEASES,
@@ -308,7 +303,7 @@ def upgrade() -> None:
         sa.Column("bundle_name", sa.String(100), nullable=False),
         sa.Column("browser_version", sa.String(100), nullable=False),
         sa.Column("files_count", sa.Integer(), nullable=False),
-        sa.Column("total_bytes", sa.Integer(), nullable=False),
+        sa.Column("total_bytes", sa.BigInteger(), nullable=False),
         sa.Column("checksum_manifest_ref", sa.String(255), nullable=False),
         sa.Column("complete_marker", sa.String(255), nullable=False),
         sa.Column("committed_at", sa.DateTime(timezone=True), nullable=False),
@@ -364,9 +359,7 @@ def downgrade() -> None:
     op.drop_table("edge_node_capacities")
     with op.batch_alter_table("source_binding_revisions") as batch:
         batch.drop_constraint("fk_source_binding_revisions_account_id", type_="foreignkey")
-        batch.drop_constraint("ck_source_binding_revisions_account_pin", type_="check")
         batch.drop_index("ix_source_binding_revisions_account_id")
-        batch.drop_column("account_revision")
         batch.drop_column("account_id")
     op.drop_index("ix_browser_accounts_workspace_status_id", table_name="browser_accounts")
     op.drop_index("ix_browser_accounts_node_id", table_name="browser_accounts")

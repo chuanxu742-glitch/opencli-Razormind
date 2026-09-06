@@ -10,8 +10,16 @@ from __future__ import annotations
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
-
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretBytes,
+    SecretStr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from backend.models.browser import (
     BrowserAccountStatus,
@@ -62,11 +70,44 @@ ERROR_HTTP_STATUS: dict[BrowserAccountErrorCode, int] = {
     BrowserAccountErrorCode.SAVE_FAILED: 409,
 }
 
-PUBLIC_ERROR_HTTP_STATUS = ERROR_HTTP_STATUS
-
-
 class _ContractModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+    def __init__(self, **data: Any) -> None:
+        try:
+            super().__init__(**data)
+        except ValidationError as exc:
+            raise _sanitized_validation_error(type(self), exc) from None
+
+    def to_wire(self) -> dict[str, Any]:
+        """Validate, normalize, and serialize one canonical contract value."""
+        return type(self).model_validate(self.model_dump(mode="python")).model_dump(
+            mode="json", exclude_none=True
+        )
+
+    @classmethod
+    def from_wire(cls, value: Any) -> Any:
+        """Validate one canonical wire value before it reaches a consumer."""
+        try:
+            return cls.model_validate(value)
+        except ValidationError as exc:
+            raise _sanitized_validation_error(cls, exc) from None
+
+
+def _sanitized_validation_error(model: type[BaseModel], exc: ValidationError) -> ValidationError:
+    """Do not let secret-bearing input values appear in contract errors."""
+    line_errors = []
+    for error in exc.errors(include_context=False):
+        line_errors.append(
+            {
+                "type": "value_error",
+                "loc": error["loc"],
+                "msg": "Value error, invalid contract",
+                "input": None,
+                "ctx": {"error": ValueError("invalid contract")},
+            }
+        )
+    return ValidationError.from_exception_data(model.__name__, line_errors)
 
 
 class AccountRef(_ContractModel):
@@ -80,6 +121,17 @@ class SessionTargetV1(_ContractModel):
     frame_id: int | str | None = None
     document_id: int | str | None = None
     origin: str | None = Field(default=None, min_length=1, max_length=2048)
+
+    def is_complete(self) -> bool:
+        return all(
+            value is not None
+            for value in (self.tab_id, self.frame_id, self.document_id, self.origin)
+        )
+
+    def require_complete(self) -> "SessionTargetV1":
+        if not self.is_complete():
+            raise ValueError("page operations require a complete real target")
+        return self
 
 
 class SessionEnvelopeV1(_ContractModel):
@@ -119,9 +171,68 @@ class SessionEnvelopeV1(_ContractModel):
             self.profile_id is None or self.profile_version is None
         ):
             raise ValueError("committed sessions require profile_id and profile_version")
-        if self.target.origin is None and self.profile_state == "committed":
-            raise ValueError("committed sessions require a verified target origin")
         return self
+
+
+class EmptyCommandPayloadV1(_ContractModel):
+    """Payload for commands whose context is carried by the outer envelope."""
+
+
+class LoginRuleCommandPayloadV1(_ContractModel):
+    login_rule_id: str = Field(min_length=1, max_length=128)
+    login_rule_version: str = Field(min_length=1, max_length=64)
+
+
+class RefreshLoginCommandPayloadV1(_ContractModel):
+    trigger: Literal["interval", "qr_expired", "navigation", "manual"]
+    expected_view_generation: int = Field(ge=0)
+
+
+class StopAndSaveCommandPayloadV1(_ContractModel):
+    expected_profile_version: int | None = Field(default=None, ge=1)
+    profile_manifest_ref: str | None = Field(default=None, min_length=1, max_length=255)
+
+
+class ExecuteReferenceCommandPayloadV1(_ContractModel):
+    execution_id: str = Field(min_length=1, max_length=128)
+    source_binding_revision_id: str | None = Field(default=None, min_length=1, max_length=36)
+
+
+class CloseSessionCommandPayloadV1(_ContractModel):
+    reason: Literal["completed", "cancelled", "expired", "error"]
+
+
+class IsolateCommandPayloadV1(_ContractModel):
+    isolation_evidence_ref: str = Field(min_length=1, max_length=255)
+
+
+class MigrateCommandPayloadV1(_ContractModel):
+    target_node_id: str = Field(min_length=1, max_length=36)
+    snapshot_ref: str = Field(min_length=1, max_length=255)
+
+
+CommandPayloadV1 = (
+    EmptyCommandPayloadV1
+    | LoginRuleCommandPayloadV1
+    | RefreshLoginCommandPayloadV1
+    | StopAndSaveCommandPayloadV1
+    | ExecuteReferenceCommandPayloadV1
+    | CloseSessionCommandPayloadV1
+    | IsolateCommandPayloadV1
+    | MigrateCommandPayloadV1
+)
+
+
+_COMMAND_PAYLOAD_TYPES: dict[BrowserCommandKind, type[_ContractModel]] = {
+    BrowserCommandKind.START_LOGIN: EmptyCommandPayloadV1,
+    BrowserCommandKind.APPLY_LOGIN_RULE: LoginRuleCommandPayloadV1,
+    BrowserCommandKind.REFRESH_LOGIN: RefreshLoginCommandPayloadV1,
+    BrowserCommandKind.STOP_AND_SAVE: StopAndSaveCommandPayloadV1,
+    BrowserCommandKind.EXECUTE_REFERENCE: ExecuteReferenceCommandPayloadV1,
+    BrowserCommandKind.CLOSE_SESSION: CloseSessionCommandPayloadV1,
+    BrowserCommandKind.ISOLATE: IsolateCommandPayloadV1,
+    BrowserCommandKind.MIGRATE: MigrateCommandPayloadV1,
+}
 
 
 class DurableCommandV1(_ContractModel):
@@ -140,13 +251,34 @@ class DurableCommandV1(_ContractModel):
     expires_at: datetime
     status: BrowserCommandStatus = BrowserCommandStatus.QUEUED
     session_id: str | None = Field(default=None, min_length=1, max_length=36)
-    payload: dict[str, Any] = Field(default_factory=dict)
+    payload: CommandPayloadV1 = Field(default_factory=EmptyCommandPayloadV1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_payload_for_kind(cls, values: Any) -> Any:
+        if not isinstance(values, dict):
+            return values
+        kind_value = values.get("kind")
+        payload = values.get("payload", {})
+        try:
+            kind = BrowserCommandKind(kind_value)
+            payload_type = _COMMAND_PAYLOAD_TYPES[kind]
+            values = dict(values)
+            values["payload"] = payload_type.model_validate(payload)
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("unsupported command payload")
+        return values
 
     @model_validator(mode="after")
-    def validate_deadline(self) -> "DurableCommandV1":
+    def validate_payload_type(self) -> "DurableCommandV1":
+        expected_type = _COMMAND_PAYLOAD_TYPES[self.kind]
+        if not isinstance(self.payload, expected_type):
+            raise ValueError("command payload does not match command kind")
         if self.expires_at <= self.available_at:
             raise ValueError("expires_at must be after available_at")
         return self
+
+
 
 
 class NodeClaimV1(_ContractModel):
@@ -165,6 +297,25 @@ class NodeClaimV1(_ContractModel):
             raise ValueError("expires_at must be after claimed_at")
         return self
 
+class ExternalIdentityV1(_ContractModel):
+    """Minimal non-secret identity proof; never includes cookies or tokens."""
+
+    provider: str = Field(min_length=1, max_length=128)
+    subject: str = Field(min_length=1, max_length=255)
+    label: str | None = Field(default=None, min_length=1, max_length=255)
+
+
+class NodeEvidenceV1(_ContractModel):
+    """Allowlisted operational evidence, not raw exceptions or page content."""
+
+    auth_evidence: BrowserAuthEvidence | None = None
+    runtime_status: Literal["healthy", "stopped", "unavailable", "unknown"] | None = None
+    state: Literal["opening", "presenting", "refreshing", "verifying", "challenge", "unknown", "saving", "saved", "error"] | None = None
+    view_generation: int | None = Field(default=None, ge=0)
+    profile_manifest_ref: str | None = Field(default=None, min_length=1, max_length=255)
+    isolation_evidence_ref: str | None = Field(default=None, min_length=1, max_length=255)
+    reason_code: BrowserAccountErrorCode | None = None
+
 
 class NodeResultV1(_ContractModel):
     command_id: str = Field(min_length=1, max_length=36)
@@ -175,8 +326,8 @@ class NodeResultV1(_ContractModel):
     expected_revision: int = Field(ge=0)
     status: Literal["succeeded", "failed", "blocked", "stopped"]
     error_code: BrowserAccountErrorCode | None = None
-    evidence: dict[str, Any] = Field(default_factory=dict)
-    external_identity: dict[str, Any] | None = None
+    evidence: NodeEvidenceV1 = Field(default_factory=NodeEvidenceV1)
+    external_identity: ExternalIdentityV1 | None = None
     profile_manifest_ref: str | None = Field(default=None, min_length=1, max_length=255)
     isolation_evidence_ref: str | None = Field(default=None, min_length=1, max_length=255)
 
@@ -252,8 +403,6 @@ class LoginRuleV1(_ContractModel):
     refresh: RefreshPolicyV1
     success: RuleSuccessV1
     challenge_conditions: list[str] = Field(default_factory=list, max_length=32)
-
-
 class LoginObservationV1(_ContractModel):
     session_id: str = Field(min_length=1, max_length=36)
     epoch: int = Field(ge=0)
@@ -273,14 +422,49 @@ class LoginObservationV1(_ContractModel):
         "error",
     ]
     evidence_kind: BrowserAuthEvidence
-    external_identity: dict[str, Any] | None = None
+    external_identity: ExternalIdentityV1 | None = None
     observed_at: datetime
     error_code: BrowserAccountErrorCode | None = None
 
 
-class PortalControlMessageV1(_ContractModel):
-    """Transient control message; never persist or include in command payloads."""
+class PortalSensitivePayloadV1(_ContractModel):
+    """Short-lived sensitive input; SecretStr prevents repr/log disclosure."""
 
+    value: SecretStr | None = None
+    key: str | None = Field(default=None, min_length=1, max_length=32)
+    x: int | None = Field(default=None, ge=0, le=4096)
+    y: int | None = Field(default=None, ge=0, le=4096)
+
+    @field_validator("value")
+    @classmethod
+    def bound_value(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is not None and len(value.get_secret_value()) > 4096:
+            raise ValueError("sensitive input exceeds transient limit")
+        return value
+
+    @model_validator(mode="after")
+    def require_value(self) -> "PortalSensitivePayloadV1":
+        if self.value is None and self.key is None and (self.x is None or self.y is None):
+            raise ValueError("sensitive payload is empty")
+        return self
+
+
+class PortalClipV1(_ContractModel):
+    x: int = Field(ge=0, le=8192)
+    y: int = Field(ge=0, le=8192)
+    width: int = Field(gt=0, le=4096)
+    height: int = Field(gt=0, le=4096)
+
+
+class PortalControlMessageV1(_ContractModel):
+    """Transient message with a trusted outer workspace/account binding.
+
+    Authentication, authorization, and lease checks are runtime obligations;
+    these fields are not proof merely because schema validation succeeded.
+    """
+
+    workspace_id: str = Field(min_length=1, max_length=36)
+    account_id: str = Field(min_length=1, max_length=36)
     session_id: str = Field(min_length=1, max_length=36)
     epoch: int = Field(ge=0)
     target: SessionTargetV1
@@ -288,26 +472,60 @@ class PortalControlMessageV1(_ContractModel):
     sequence: int = Field(ge=1)
     kind: Literal["field_input", "pointer", "key", "request_view", "takeover"]
     field_ref: str | None = Field(default=None, min_length=1, max_length=128)
-    sensitive_payload: dict[str, Any] | None = None
+    sensitive_payload: PortalSensitivePayloadV1 | None = None
+
+    @model_validator(mode="after")
+    def validate_target_boundary(self) -> "PortalControlMessageV1":
+        self.target.require_complete()
+        if self.kind == "field_input" and self.sensitive_payload is None:
+            raise ValueError("field input requires transient payload")
+        return self
 
 
 class PortalPixelFrameV1(_ContractModel):
     """Transient clipped frame; only approved regions may be sent to the client."""
 
+    workspace_id: str = Field(min_length=1, max_length=36)
+    account_id: str = Field(min_length=1, max_length=36)
     session_id: str = Field(min_length=1, max_length=36)
     epoch: int = Field(ge=0)
+    target: SessionTargetV1
     view_generation: int = Field(ge=0)
     sequence: int = Field(ge=1)
     region_kind: Literal["qr", "form", "approved"]
     expires_at: datetime
-    clip: dict[str, int] = Field(min_length=1)
-    masked_regions: list[dict[str, int]] = Field(default_factory=list)
-    frame_bytes: bytes = Field(min_length=1)
+    clip: PortalClipV1
+    masked_regions: list[PortalClipV1] = Field(default_factory=list, max_length=32)
+    frame_bytes: SecretBytes = Field(min_length=1)
+
+    @field_validator("frame_bytes")
+    @classmethod
+    def bound_frame(cls, value: SecretBytes) -> SecretBytes:
+        if len(value.get_secret_value()) > 4_000_000:
+            raise ValueError("transient pixel frame exceeds size limit")
+        return value
+
+    @model_validator(mode="after")
+    def validate_target_boundary(self) -> "PortalPixelFrameV1":
+        self.target.require_complete()
+        return self
+
+
+class PortalOuterBindingV1(_ContractModel):
+    """Trusted server-side binding supplied outside user-controlled payloads."""
+
+    workspace_id: str = Field(min_length=1, max_length=36)
+    account_id: str = Field(min_length=1, max_length=36)
+    session_id: str = Field(min_length=1, max_length=36)
+    epoch: int = Field(ge=0)
+    target: SessionTargetV1
+    view_generation: int = Field(ge=0)
 
 
 class PortalTransientV1(_ContractModel):
-    """Envelope for in-memory portal transport; not a persistence model."""
+    """In-memory transport envelope; runtime binds it to the authorized session."""
 
+    binding: PortalOuterBindingV1
     control: PortalControlMessageV1 | None = None
     pixel: PortalPixelFrameV1 | None = None
 
@@ -315,9 +533,43 @@ class PortalTransientV1(_ContractModel):
     def require_one_message(self) -> "PortalTransientV1":
         if (self.control is None) == (self.pixel is None):
             raise ValueError("portal transient must contain exactly one control or pixel message")
+        message = self.control or self.pixel
+        assert message is not None
+        if (
+            message.workspace_id != self.binding.workspace_id
+            or message.account_id != self.binding.account_id
+            or message.session_id != self.binding.session_id
+            or message.epoch != self.binding.epoch
+            or message.view_generation != self.binding.view_generation
+            or message.target != self.binding.target
+        ):
+            raise ValueError("portal message does not match trusted outer binding")
         return self
 
 
+class PortalAuthorizationFactsV1(_ContractModel):
+    """Fresh bounded batch facts used by every active portal replica."""
+
+    workspace_id: str = Field(min_length=1, max_length=36)
+    account_id: str = Field(min_length=1, max_length=36)
+    session_id: str = Field(min_length=1, max_length=36)
+    membership_exists: bool
+    role: Literal["admin", "maintainer", "operator", "viewer"] | None = None
+    user_disabled: bool
+    workspace_active: bool
+    session_revoked: bool
+    session_revision: int = Field(ge=0)
+    session_expires_at: datetime
+    checked_at: datetime
+    freshness_deadline: datetime
+
+    @model_validator(mode="after")
+    def validate_freshness(self) -> "PortalAuthorizationFactsV1":
+        if self.freshness_deadline <= self.checked_at:
+            raise ValueError("authorization freshness deadline must be in the future")
+        if (self.freshness_deadline - self.checked_at).total_seconds() > 1:
+            raise ValueError("authorization freshness deadline exceeds one second")
+        return self
 class BrowserAccountCreate(_ContractModel):
     workspace_id: str = Field(min_length=1, max_length=36)
     site: str = Field(min_length=1, max_length=255)
@@ -344,13 +596,14 @@ class BrowserAccountRead(_ContractModel):
     login_rule_id: str | None
     login_rule_version: str | None
     auth_required: bool
-    platform_identity: dict[str, Any] | None
+    platform_identity: ExternalIdentityV1 | None
     auth_evidence: BrowserAuthEvidence
     evidence_source: BrowserEvidenceSource | None
     evidence_observed_at: datetime | None
     manual_confirmed_by: str | None
     status: BrowserAccountStatus
     revision: int
+    paused: bool
     status_reason_code: str | None
     created_at: datetime
     updated_at: datetime
@@ -377,6 +630,7 @@ class BrowserAccountLeaseRead(_ContractModel):
 
 class BrowserAccountUpdate(_ContractModel):
     auth_required: bool | None = None
+    paused: bool | None = None
     status: BrowserAccountStatus | None = None
     status_reason_code: BrowserAccountErrorCode | None = None
     expected_revision: int = Field(ge=0)
@@ -431,8 +685,8 @@ class DurableCommandRead(_ContractModel):
     expires_at: datetime
     status: BrowserCommandStatus
     session_id: str | None
-    payload: dict[str, Any]
-    result: dict[str, Any] | None
+    payload: dict[str, object]
+    result: NodeEvidenceV1 | None
     error_code: BrowserAccountErrorCode | None
     claimed_at: datetime | None
     completed_at: datetime | None
@@ -479,12 +733,3 @@ class NodeCapacityFactRead(_ContractModel):
     valid: bool
     created_at: datetime
     updated_at: datetime
-
-
-# Short aliases used by service consumers while the V1 wire names remain the
-# canonical serialization contract.
-NodeClaim = NodeClaimV1
-NodeResult = NodeResultV1
-DurableCommand = DurableCommandV1
-LoginRule = LoginRuleV1
-LoginObservation = LoginObservationV1
