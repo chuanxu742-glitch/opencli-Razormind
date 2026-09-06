@@ -84,10 +84,16 @@ class _RegisteredRecordSession:
 _RECORD_SESSIONS: dict[str, _RegisteredRecordSession] = {}
 
 
-def _record_identity(record_session: Any) -> tuple[Any, Any, Any, Any]:
+def _record_identity(
+    record_session: Any,
+    frame_id: Any | None = None,
+) -> tuple[Any, Any, Any, Any]:
     identity = getattr(record_session, "binding_identity", None)
     if callable(identity):
-        value = identity()
+        try:
+            value = identity(frame_id)
+        except TypeError:
+            value = identity()
         if isinstance(value, tuple) and len(value) == 4:
             return value
     page = getattr(record_session, "page", None)
@@ -106,7 +112,10 @@ def _require_same_record_identity(
     registration: _RegisteredRecordSession,
     record_session: Any,
 ) -> None:
-    page, frame, document, reported_document = _record_identity(record_session)
+    page, frame, document, reported_document = _record_identity(
+        record_session,
+        registration.binding.target.frame_id,
+    )
     if page is not registration.page_identity:
         raise ValueError("record session page changed")
     if frame is not registration.frame_identity:
@@ -206,7 +215,8 @@ def register_portal_record_session(
     if record_id in _RECORD_SESSIONS:
         raise ValueError("record session id is already registered")
     page_identity, frame_identity, document_identity, reported_document = _record_identity(
-        record_session
+        record_session,
+        binding.target.frame_id,
     )
     completion = PortalRecordSessionContractV1(
         record_session_id=record_id,

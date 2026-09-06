@@ -57,7 +57,7 @@ async def test_start_wires_binding_init_script_and_navigate_handler():
 
     assert "__record_event" in fake_page.bindings
     assert len(fake_page.init_scripts) == 1
-    assert len(fake_page.evaluated) == 1  # the current already-loaded doc gets one manual inject
+    assert len(fake_page.evaluated) == 2  # install guard, then apply generation state
     assert "framenavigated" in fake_page.handlers
 
 

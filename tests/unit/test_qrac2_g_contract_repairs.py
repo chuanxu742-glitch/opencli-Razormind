@@ -61,6 +61,7 @@ from backend.services.browser_portal_contract import (
     issue_first_portal_ticket,
     redeem_portal_ticket,
     register_portal_record_session,
+    resolve_portal_record_session,
     route_portal_frame,
     build_account_revision_cas,
     decode_portal_wire_frame,
@@ -73,12 +74,16 @@ from backend.services.browser_portal_contract import (
 class _FrameProbe:
     def __init__(self, name: str) -> None:
         self.name = name
+        self.frame_id = name
         self.url = f"https://site.test/{name}"
         self.evaluations: list[tuple[object, object]] = []
+        self.fail_apply = False
 
-    async def evaluate(self, script: object, value: object) -> None:
+    async def evaluate(self, script: object, value: object) -> bool | None:
+        if self.fail_apply and isinstance(value, dict) and "generation" in value:
+            raise RuntimeError(f"{self.name} rejected capture state")
         self.evaluations.append((script, value))
-
+        return None
 
 class _PageProbe:
     def __init__(self) -> None:
@@ -167,12 +172,33 @@ async def test_record_capture_injects_existing_iframes_and_document_guard() -> N
     )
     await record.start()
     assert all(frame.evaluations for frame in record_page.frames)
+    await record.set_sensitive(True)
+    await record.set_sensitive(False)
+    assert len(record_page.init_scripts) == 1
     assert "ownerDocument" in str(record_page.frames[0].evaluations[0][0])
     generation = record._document_generation
     record._on_navigate(record_page.frames[1])
     assert record._document_generation == generation
     record._on_navigate(record_page.main_frame)
     assert record._document_generation == generation + 1
+
+
+@pytest.mark.asyncio
+async def test_record_frame_state_failure_locks_server_sensitive_gate() -> None:
+    record_page = _PageProbe()
+    record = RecordSession(
+        session_id="record-session",
+        domain="site",
+        capability="login",
+        page=record_page,
+    )
+    await record.start()
+    record_page.frames[1].fail_apply = True
+    with pytest.raises(RuntimeError):
+        await record.set_sensitive(False)
+    assert record.sensitive is True
+    assert record.is_common_listener_installed() is False
+    assert record.is_common_listener_revoked() is True
 
 
 class _RecordSessionProbe:
@@ -214,6 +240,34 @@ async def test_h5_freeze_rejects_binding_or_identity_before_side_effect() -> Non
     with pytest.raises(ValueError):
         await freeze_portal_record_session(binding, record)
     assert record.calls == []
+
+
+@pytest.mark.asyncio
+async def test_h5_target_iframe_navigation_advances_generation_binding() -> None:
+    _, ref, target, _, _, _ = _context()
+    target = target.model_copy(update={"frame_id": "iframe"})
+    binding = SensitiveSessionBindingV1(
+        account_ref=ref,
+        session_id="session",
+        epoch=2,
+        target=target,
+        view_generation=4,
+        record_session_id="record-session-iframe-generation",
+    )
+    record = RecordSession(
+        session_id="record-session-iframe-generation",
+        domain="site",
+        capability="login",
+        page=_PageProbe(),
+    )
+    await record.start()
+    register_portal_record_session(binding, record)
+    assert record.binding_identity("iframe")[2] == 0
+    record._on_navigate(record.page.frames[1])
+    await asyncio.sleep(0)
+    assert record.binding_identity("iframe")[2] == 1
+    with pytest.raises(ValueError):
+        await resolve_portal_record_session(binding)
 
 
 

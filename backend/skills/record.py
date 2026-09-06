@@ -72,17 +72,17 @@ CAPTURE_JS = r"""
 (sessionId) => {
   const boundKey = '__skillRecordBound_' + sessionId;
   const stateKey = boundKey + '_state';
-  const sensitiveKey = boundKey + '_sensitive';
   const currentDocument = document;
-  const state = window[stateKey] || {
+  const state = {
     document: currentDocument,
-    blocked: Boolean(window[sensitiveKey]),
+    generation: 0,
+    blocked: true,
     listenersInstalled: false,
-    listenerRevoked: false,
+    listenerRevoked: true,
     handlers: null,
   };
   const targetIsCurrent = (event) => {
-    if (state.blocked || window[sensitiveKey]) return false;
+    if (state.blocked) return false;
     if (state.document !== currentDocument || currentDocument.defaultView !== window) return false;
     const target = event && event.target;
     return Boolean(target && target.ownerDocument === currentDocument);
@@ -103,7 +103,7 @@ CAPTURE_JS = r"""
   const roleOf = (el) =>
     (el && el.getAttribute && el.getAttribute('role')) || ((el && el.tagName) || '').toLowerCase();
   const install = () => {
-    if (state.listenersInstalled || state.document !== currentDocument) return;
+    if (state.listenersInstalled || state.blocked || state.document !== currentDocument) return;
     const click = (e) => {
       if (!targetIsCurrent(e)) return;
       window.__record_event({ verb: 'click', name: nameOf(e.target), role: roleOf(e.target) });
@@ -133,8 +133,7 @@ CAPTURE_JS = r"""
     state.listenersInstalled = true;
     state.listenerRevoked = false;
   };
-  state.install = install;
-  state.revoke = () => {
+  const revoke = () => {
     if (!state.listenersInstalled || !state.handlers) {
       state.listenerRevoked = true;
       return;
@@ -146,22 +145,23 @@ CAPTURE_JS = r"""
     state.listenersInstalled = false;
     state.listenerRevoked = true;
   };
+  const apply = ({generation, enabled}) => {
+    if (!Number.isInteger(generation) || generation < state.generation) return false;
+    state.generation = generation;
+    state.blocked = Boolean(enabled);
+    if (state.blocked) revoke();
+    else install();
+    return true;
+  };
   window[stateKey] = state;
-  window[boundKey + '_install'] = install;
-  window[boundKey + '_revoke'] = state.revoke;
-  install();
+  window[boundKey + '_apply'] = apply;
 }
 """
-SENSITIVE_JS = r"""
-({sessionId, enabled}) => {
-  const boundKey = '__skillRecordBound_' + sessionId;
-  const sensitiveKey = boundKey + '_sensitive';
-  const state = window[boundKey + '_state'];
-  window[sensitiveKey] = Boolean(enabled);
-  if (!state) return;
-  state.blocked = Boolean(enabled);
-  if (enabled) state.revoke();
-  else state.install();
+APPLY_CAPTURE_STATE_JS = r"""
+({sessionId, generation, enabled}) => {
+  const apply = window['__skillRecordBound_' + sessionId + '_apply'];
+  if (typeof apply !== 'function') return false;
+  return apply({generation, enabled});
 }
 """
 
@@ -189,8 +189,11 @@ class RecordSession:
     _listener_installed: bool = field(default=False, init=False, repr=False)
     _listener_revoked: bool = field(default=False, init=False, repr=False)
     _pending_events_drained: bool = field(default=True, init=False, repr=False)
+    _capture_generation: int = field(default=0, init=False, repr=False)
     _document_generation: int = field(default=0, init=False, repr=False)
+    _frame_document_generations: dict[Any, int] = field(default_factory=dict, init=False, repr=False)
     _main_frame: Any = field(default=None, init=False, repr=False)
+    _frame_update_tasks: set[asyncio.Task[Any]] = field(default_factory=set, init=False, repr=False)
     stopped: bool = False
     sensitive: bool = False
     _trace: dict[str, Any] | None = field(default=None, init=False, repr=False)
@@ -205,34 +208,66 @@ class RecordSession:
             return list(frames)
         return [self._raw_page()]
 
-    async def _evaluate_frame(self, frame: Any, script: str, value: Any) -> None:
+    async def _evaluate_frame(self, frame: Any, script: str, value: Any) -> Any:
         evaluator = getattr(frame, "evaluate", None)
         if not callable(evaluator):
             raise RuntimeError("record page cannot evaluate capture lifecycle")
         result = evaluator(script, value)
         if hasattr(result, "__await__"):
-            await result
+            result = await result
+        return result
+
+    async def _apply_frame_state(self, frame: Any, generation: int, enabled: bool) -> None:
+        result = await self._evaluate_frame(
+            frame,
+            APPLY_CAPTURE_STATE_JS,
+            {
+                "sessionId": self.session_id,
+                "generation": generation,
+                "enabled": enabled,
+            },
+        )
+        if result is False:
+            raise RuntimeError("record page rejected capture generation")
+
+    def _lock_sensitive_state(self) -> None:
+        # This is deliberately synchronous and happens before any recovery
+        # attempt: Python callbacks must fail closed if a frame update fails.
+        self.sensitive = True
+        self._listener_installed = False
+        self._listener_revoked = True
 
     async def _set_page_capture_state(self, enabled: bool) -> None:
-        # Keep the flag in every future document; add_init_script is the only
-        # reliable way to carry sensitive mode across cross-origin navigation.
-        raw_page = self._raw_page()
-        add_init_script = getattr(raw_page, "add_init_script", None)
-        if not callable(add_init_script):
-            raise RuntimeError("record page cannot install capture lifecycle")
-        state = (
-            f'({SENSITIVE_JS})({{"sessionId": {self.session_id!r}, '
-            f'"enabled": {"true" if enabled else "false"}}})'
-        )
-        result = add_init_script(state)
-        if hasattr(result, "__await__"):
-            await result
-        for frame in self._frames():
-            await self._evaluate_frame(
-                frame,
-                SENSITIVE_JS,
-                {"sessionId": self.session_id, "enabled": enabled},
-            )
+        self._capture_generation += 1
+        generation = self._capture_generation
+        self._lock_sensitive_state()
+        try:
+            for frame in self._frames():
+                await self._apply_frame_state(frame, generation, enabled)
+        except Exception:
+            self._lock_sensitive_state()
+            raise
+        self.sensitive = enabled
+        self._listener_installed = not enabled
+        self._listener_revoked = enabled
+
+    async def _update_navigated_frame(self, frame: Any) -> None:
+        async with self._event_lock:
+            if self.stopped:
+                return
+            try:
+                await self._apply_frame_state(frame, self._capture_generation, self.sensitive)
+            except Exception:
+                self._lock_sensitive_state()
+
+    def _schedule_frame_update(self, frame: Any) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self._update_navigated_frame(frame))
+        self._frame_update_tasks.add(task)
+        task.add_done_callback(self._frame_update_tasks.discard)
 
     async def _drain_events(self) -> None:
         if self._pending_events:
@@ -249,20 +284,41 @@ class RecordSession:
             raise RuntimeError("record page cannot install capture lifecycle")
         await add_init_script(f"({CAPTURE_JS})({self.session_id!r})")
         frames = self._frames()
-        for frame in frames:
-            await self._evaluate_frame(frame, CAPTURE_JS, self.session_id)
         self._main_frame = getattr(raw_page, "main_frame", None)
+        self._capture_generation = 1
+        try:
+            for frame in frames:
+                self._frame_document_generations.setdefault(frame, 0)
+                await self._evaluate_frame(frame, CAPTURE_JS, self.session_id)
+                await self._apply_frame_state(frame, self._capture_generation, False)
+        except Exception:
+            self._lock_sensitive_state()
+            raise
         self._listener_installed = True
         self._listener_revoked = False
         self._pending_events_drained = True
         raw_page.on("framenavigated", self._on_navigate)
 
-    def binding_identity(self) -> tuple[Any, Any, int, Any]:
-        """Return page/frame/document identity without trusting payload fields."""
+    def _frame_for_target(self, frame_id: Any | None) -> Any:
+        frames = self._frames()
+        if frame_id is None:
+            return self._main_frame or frames[0]
+        for frame in frames:
+            for attr in ("frame_id", "id", "name"):
+                candidate = getattr(frame, attr, None)
+                if callable(candidate):
+                    candidate = candidate()
+                if candidate == frame_id:
+                    return frame
+        return self._main_frame or frames[0]
+
+    def binding_identity(self, frame_id: Any | None = None) -> tuple[Any, Any, int, Any]:
+        """Return page/frame/document-generation identity without payload fields."""
         raw_page = self._raw_page()
-        frame = self._main_frame or getattr(raw_page, "main_frame", None)
+        frame = self._frame_for_target(frame_id)
+        generation = self._frame_document_generations.get(frame, 0)
         reported_document = getattr(self, "document_id", None)
-        return raw_page, frame, self._document_generation, reported_document
+        return raw_page, frame, generation, reported_document
 
     def _append(self, *, verb: str, args: dict[str, Any], target: Any) -> None:
         now = time.monotonic()
@@ -280,14 +336,18 @@ class RecordSession:
         )
 
     def _on_navigate(self, frame: Any) -> None:
-        # Playwright's `on("framenavigated")` handler is sync; only the main
-        # frame counts as a step (iframe navigations are noise for this v1).
+        # Every frame has an independent document generation. Main-frame
+        # navigations remain trace steps; iframe navigations update binding
+        # identity but are not user actions in the v1 trace.
         raw_page = self._raw_page()
         main_frame = getattr(raw_page, "main_frame", None)
-        if frame is not main_frame:
-            return
-        self._document_generation += 1
-        if self.sensitive or self.stopped:
+        self._frame_document_generations[frame] = (
+            self._frame_document_generations.get(frame, 0) + 1
+        )
+        if frame is main_frame:
+            self._document_generation = self._frame_document_generations[frame]
+        self._schedule_frame_update(frame)
+        if frame is not main_frame or self.sensitive or self.stopped:
             return
         self._append(verb="navigate", args={"url": frame.url}, target=frame.url)
 
