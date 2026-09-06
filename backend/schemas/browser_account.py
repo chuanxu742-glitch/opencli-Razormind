@@ -78,6 +78,11 @@ LOGIN_SESSION_TAKEOVER_ROUTE = f"{LOGIN_SESSION_ROUTE}/takeover"
 LOGIN_SESSION_CONFIRM_ROUTE = f"{LOGIN_SESSION_ROUTE}/confirm"
 LOGIN_SESSION_CLOSE_ROUTE = f"{LOGIN_SESSION_ROUTE}/close"
 PORTAL_TICKET_ROUTE = f"{LOGIN_SESSION_ROUTE}/portal-ticket"
+ACCOUNT_AUTH_REQUIRED_ROUTE = f"{ACCOUNT_API_ROUTE}/{{account_id}}/auth-required"
+ACCOUNT_SUSPEND_ROUTE = f"{ACCOUNT_API_ROUTE}/{{account_id}}/suspend"
+ACCOUNT_RESUME_ROUTE = f"{ACCOUNT_API_ROUTE}/{{account_id}}/resume"
+ACCOUNT_MIGRATE_ROUTE = f"{ACCOUNT_API_ROUTE}/{{account_id}}/migration"
+ACCOUNT_OPERATION_METHOD = "POST"
 PORTAL_TICKET_ISSUE_ROUTE = f"{PORTAL_TICKET_ROUTE}/issue"
 PORTAL_TICKET_REDEEM_ROUTE = f"{PORTAL_TICKET_ROUTE}/redeem"
 PORTAL_WS_ROUTE = f"{LOGIN_SESSION_ROUTE}/portal"
@@ -1039,7 +1044,7 @@ class PortalTransientV1(_ContractModel):
 class PortalWireLayoutV1(_ContractModel):
     """Explicit wire header and metadata/payload byte layout."""
 
-    magic: Literal["QRAC2P1"] = "QRAC2P1"
+    magic: Literal["Q2P1"] = "Q2P1"
     byte_order: Literal["big-endian"] = "big-endian"
     header_bytes: Literal[16] = 16
     metadata_bytes: int = Field(gt=0, le=65_535)
@@ -1379,6 +1384,91 @@ class BrowserAccountLeaseRead(_ContractModel):
     expires_at: datetime
     released_at: datetime | None
     isolation_evidence_ref: str | None
+
+
+class BrowserAccountRevisionPreconditionV1(_ContractModel):
+    """If-Match is authoritative when supplied; body revision is fallback."""
+
+    if_match: str | None = Field(default=None, min_length=1, max_length=64)
+    body_revision: int | None = Field(default=None, ge=0)
+
+    @property
+    def effective_revision(self) -> int | None:
+        if self.if_match is None:
+            return self.body_revision
+        token = self.if_match.strip()
+        if token.startswith('"') and token.endswith('"'):
+            token = token[1:-1]
+        if not token.isdigit():
+            raise ValueError("If-Match must contain an integer revision")
+        header_revision = int(token)
+        if self.body_revision is not None and self.body_revision != header_revision:
+            raise ValueError("If-Match and body revision differ")
+        return header_revision
+
+
+class BrowserAccountOperationRequestV1(_ContractModel):
+    """Body contract shared by auth-required, pause, resume, and migration."""
+
+    account_ref: AccountRef
+    expected_revision: int = Field(ge=0)
+    operation: Literal["auth_required", "suspend", "resume", "migrate"]
+    auth_required: bool | None = None
+    target_node_id: str | None = Field(default=None, min_length=1, max_length=36)
+    isolation_evidence_ref: str | None = Field(default=None, min_length=1, max_length=255)
+
+    @model_validator(mode="after")
+    def validate_operation_body(self) -> "BrowserAccountOperationRequestV1":
+        if self.operation == "auth_required" and self.auth_required is None:
+            raise ValueError("auth-required operation requires auth_required")
+        if self.operation != "auth_required" and self.auth_required is not None:
+            raise ValueError("auth_required is only valid for auth-required operation")
+        if self.operation == "migrate" and (
+            self.target_node_id is None or self.isolation_evidence_ref is None
+        ):
+            raise ValueError("migration requires target_node_id and isolation evidence")
+        if self.operation != "migrate" and (
+            self.target_node_id is not None or self.isolation_evidence_ref is not None
+        ):
+            raise ValueError("migration fields are only valid for migrate operation")
+        return self
+
+
+class BrowserAccountOperationResponseV1(_ContractModel):
+    """Non-secret response returned after one account revision CAS."""
+
+    contract_version: Literal[1] = QRAC2_CONTRACT_VERSION
+    http_status: Literal[200] = 200
+    account_ref: AccountRef
+    operation: Literal["auth_required", "suspend", "resume", "migrate"]
+    revision: int = Field(ge=0)
+    status: BrowserAccountStatus
+    auth_required: bool
+    paused: bool
+
+ACCOUNT_OPERATION_ROUTES: dict[str, str] = {
+    "auth_required": ACCOUNT_AUTH_REQUIRED_ROUTE,
+    "suspend": ACCOUNT_SUSPEND_ROUTE,
+    "resume": ACCOUNT_RESUME_ROUTE,
+    "migrate": ACCOUNT_MIGRATE_ROUTE,
+}
+
+
+class BrowserAccountRevisionCASV1(_ContractModel):
+    """Owner transaction condition and resulting monotonic revision."""
+
+    account_ref: AccountRef
+    expected_revision: int = Field(ge=0)
+    next_revision: int = Field(ge=1)
+    predicate: Literal["workspace_account_revision_equals"] = (
+        "workspace_account_revision_equals"
+    )
+
+    @model_validator(mode="after")
+    def validate_next_revision(self) -> "BrowserAccountRevisionCASV1":
+        if self.next_revision != self.expected_revision + 1:
+            raise ValueError("account CAS must increment revision exactly once")
+        return self
 
 
 class BrowserAccountUpdate(_ContractModel):

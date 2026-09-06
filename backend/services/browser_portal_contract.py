@@ -1,39 +1,51 @@
 """Pure C2/A/R contract gates for the QRAC2 browser portal.
 
-This module deliberately does not persist state or perform browser side effects.
-The owning service must call these gates before its transaction/transport work,
-then atomically consume a validated ticket in the same database transaction.
+This module does not own persistence or transport. It invokes the real
+RecordSession lifecycle at the sensitive boundary, then leaves ticket CAS and
+owner transport commits to their owning services.
 """
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, TypeVar
 import hashlib
 import hmac
+import inspect
+import json
 import secrets
+import struct
+from typing import Any, Callable, TypeVar
 
 from pydantic import SecretStr
 
 from backend.schemas.browser_account import (
+    AccountRef,
     BrowserAccountErrorCode,
+    BrowserAccountRevisionCASV1,
+    BrowserAccountRevisionPreconditionV1,
     CommandExecutionGuardV1,
     DurableCommandV1,
     ERROR_HTTP_STATUS,
     NodeClaimV1,
+    PortalControlMessageV1,
     PortalEntryBlockedV1,
     PortalEntryResponseV1,
     PortalModelDecisionV1,
+    PortalOuterBindingV1,
     PortalOwnerRouteV1,
     PortalPerceptionV1,
     PortalPreEntryHandoffV1,
     PortalRecordSessionContractV1,
+    PortalSensitivePayloadV1,
     PortalTicketConsumeCASV1,
     PortalTicketGrantV1,
     PortalTicketIssueRequestV1,
     PortalTicketIssuedV1,
     PortalTicketRecordV1,
     PortalTicketRedeemRequestV1,
+    PortalTransientV1,
     PortalWireFrameV1,
+    PortalWireLayoutV1,
+    PortalPixelFrameV1,
     SessionEnvelopeV1,
     SensitiveSessionBindingV1,
 )
@@ -68,14 +80,34 @@ class _RegisteredRecordSession:
 _RECORD_SESSIONS: dict[str, _RegisteredRecordSession] = {}
 
 
-def _runtime_method(record_session: Any, name: str) -> Callable[..., Any]:
+async def _call_async(record_session: Any, name: str, *args: Any) -> Any:
     method = getattr(record_session, name, None)
     if not callable(method):
-        raise ValueError(f"record session does not implement {name}")
-    return method
+        raise ValueError(f"record session does not implement async {name}")
+    result = method(*args)
+    if not inspect.isawaitable(result):
+        raise ValueError(f"record session {name} must be async")
+    return await result
 
 
-def admit_portal_entry(
+
+async def _page_is_closed(page: Any) -> bool:
+    raw_page = getattr(page, "page", page)
+    checker = getattr(raw_page, "is_closed", None)
+    if callable(checker):
+        result = checker()
+        if inspect.isawaitable(result):
+            result = await result
+        return bool(result)
+    return bool(getattr(raw_page, "closed", False))
+
+
+async def _require_open_page(page: Any) -> None:
+    if await _page_is_closed(page):
+        raise ValueError("record session page is closed")
+
+
+async def admit_portal_entry(
     command: DurableCommandV1,
     claim: NodeClaimV1,
     session: SessionEnvelopeV1,
@@ -85,10 +117,10 @@ def admit_portal_entry(
     model_decision: PortalModelDecisionV1,
     record_session: Any,
 ) -> PortalPreEntryHandoffV1:
-    """Stop common capture and drain events before freezing portal handoff."""
+    """Await real sensitive-mode transition before exposing the handoff."""
 
     guard = admit_command_before_side_effects(command, claim, session)
-    freeze_portal_record_session(binding, record_session)
+    await freeze_portal_record_session(binding, record_session)
     registration = _RECORD_SESSIONS[binding.record_session_id or ""]
     handoff = PortalPreEntryHandoffV1(
         guard=guard,
@@ -108,7 +140,7 @@ def register_portal_record_session(
     *,
     page: Any | None = None,
 ) -> PortalRecordSessionContractV1:
-    """Register a real RecordSession and derive its live listener state."""
+    """Register a real RecordSession before its async sensitive transition."""
 
     record_id = binding.record_session_id
     actual_id = getattr(record_session, "session_id", None)
@@ -117,12 +149,8 @@ def register_portal_record_session(
         raise ValueError("record session must expose its real id and page")
     if page is not None and page is not actual_page:
         raise ValueError("record session page does not match registration")
-    if getattr(record_session, "stopped", False):
-        raise ValueError("stopped record session cannot be registered")
-    is_installed = _runtime_method(record_session, "is_common_listener_installed")
-    is_revoked = _runtime_method(record_session, "is_common_listener_revoked")
-    if not is_installed() or is_revoked():
-        raise ValueError("record session listener is not active")
+    if getattr(record_session, "stopped", False) or getattr(record_session, "sensitive", False):
+        raise ValueError("stopped or sensitive record session cannot be registered")
     completion = PortalRecordSessionContractV1(
         record_session_id=record_id,
         target=binding.target,
@@ -142,25 +170,23 @@ def register_portal_record_session(
     return completion
 
 
-def freeze_portal_record_session(
+async def freeze_portal_record_session(
     binding: SensitiveSessionBindingV1,
     record_session: Any,
 ) -> PortalRecordSessionContractV1:
-    """Perform the real listener-stop and pending-event-drain transition."""
+    """Await RecordSession.set_sensitive(True), including listener drain."""
 
     registration = _RECORD_SESSIONS.get(binding.record_session_id or "")
     if registration is None or registration.session is not record_session:
         raise ValueError("record session is not registered for this binding")
     if registration.contract.status != "active":
         raise ValueError("record session is not in active pre-entry state")
-    _runtime_method(record_session, "stop_common_listener")()
-    if not _runtime_method(record_session, "drain_pending_events")():
-        raise ValueError("record session pending events were not drained")
-    is_installed = _runtime_method(record_session, "is_common_listener_installed")
-    is_revoked = _runtime_method(record_session, "is_common_listener_revoked")
-    has_pending = _runtime_method(record_session, "has_pending_events")
-    if is_installed() or not is_revoked() or has_pending():
-        raise ValueError("record listener stop/drain state was not confirmed")
+    if getattr(record_session, "stopped", False):
+        raise ValueError("stopped record session cannot enter sensitive mode")
+    await _require_open_page(registration.page)
+    result = await _call_async(record_session, "set_sensitive", True)
+    if result is False or getattr(record_session, "sensitive", False) is not True:
+        raise ValueError("record session sensitive transition did not complete")
     registration.contract = PortalRecordSessionContractV1(
         record_session_id=binding.record_session_id or "",
         target=binding.target,
@@ -174,49 +200,53 @@ def freeze_portal_record_session(
     return registration.contract
 
 
-def resolve_portal_record_session(binding: SensitiveSessionBindingV1) -> Any:
-    """Resolve the registered RecordSession and enforce its page identity."""
+async def resolve_portal_record_session(binding: SensitiveSessionBindingV1) -> Any:
+    """Resolve page/document lineage before sensitive transport."""
 
     registration = _RECORD_SESSIONS.get(binding.record_session_id or "")
     if registration is None or registration.binding != binding:
         raise ValueError("portal record session is not registered for this binding")
     if registration.contract.status not in {"active", "sensitive"}:
         raise ValueError("portal record session is no longer active")
+    if getattr(registration.session, "stopped", False):
+        raise ValueError("portal record session is stopped")
     if getattr(registration.session, "page", None) is not registration.page:
         raise ValueError("portal record session page changed")
+    await _require_open_page(registration.page)
+    document_id = getattr(registration.session, "document_id", None)
+    if document_id is not None and document_id != binding.target.document_id:
+        raise ValueError("portal record session document changed")
     return registration.session
 
 
-def _resolve_frozen_portal_record_session(binding: SensitiveSessionBindingV1) -> Any:
+async def _resolve_frozen_portal_record_session(binding: SensitiveSessionBindingV1) -> Any:
     """Resolve only the post-stop session permitted for sensitive routing."""
 
-    session = resolve_portal_record_session(binding)
+    session = await resolve_portal_record_session(binding)
     registration = _RECORD_SESSIONS[binding.record_session_id or ""]
     if registration.contract.status != "sensitive":
         raise ValueError("portal record session is not frozen for sensitive routing")
     return session
 
 
-def complete_portal_record_session(
+async def complete_portal_record_session(
     binding: SensitiveSessionBindingV1,
     *,
     aborted: bool = False,
 ) -> PortalRecordSessionContractV1:
-    """Require actual stop/listener-drain state, then release registration."""
+    """Await real RecordSession.stop, verify closed state, then release."""
 
     registration = _RECORD_SESSIONS.get(binding.record_session_id or "")
     if registration is None or registration.binding != binding:
         raise ValueError("portal record session is not registered for this binding")
     if registration.contract.status != "sensitive":
         raise ValueError("portal record session was not frozen before completion")
+    if getattr(registration.session, "stopped", False):
+        raise ValueError("record session is already stopped")
+    await _call_async(registration.session, "stop")
     if not getattr(registration.session, "stopped", False):
         raise ValueError("record completion requires RecordSession.stop")
-    if (
-        _runtime_method(registration.session, "is_common_listener_installed")()
-        or not _runtime_method(registration.session, "is_common_listener_revoked")()
-        or _runtime_method(registration.session, "has_pending_events")()
-    ):
-        raise ValueError("record completion requires revoked listener and drained events")
+    await _require_open_page(registration.page)
     completed = PortalRecordSessionContractV1(
         record_session_id=binding.record_session_id or "",
         target=binding.target,
@@ -233,6 +263,33 @@ def complete_portal_record_session(
 
 def _digest(value: SecretStr) -> str:
     return hashlib.sha256(value.get_secret_value().encode("utf-8")).hexdigest()
+
+
+def resolve_account_revision_precondition(
+    *,
+    if_match: str | None,
+    body_revision: int | None,
+) -> int | None:
+    """Resolve If-Match/body revision with mismatch rejection."""
+
+    return BrowserAccountRevisionPreconditionV1(
+        if_match=if_match,
+        body_revision=body_revision,
+    ).effective_revision
+
+
+def build_account_revision_cas(
+    account_ref: AccountRef,
+    *,
+    expected_revision: int,
+) -> BrowserAccountRevisionCASV1:
+    """Build the exact owner transaction predicate; owner must commit it."""
+
+    return BrowserAccountRevisionCASV1(
+        account_ref=account_ref,
+        expected_revision=expected_revision,
+        next_revision=expected_revision + 1,
+    )
 
 
 def issue_first_portal_ticket(
@@ -354,9 +411,7 @@ def redeem_portal_ticket(
         websocket_path=websocket_path,
         consume_cas=cas,
     )
-
-
-def consume_portal_ticket_cas(
+async def consume_portal_ticket_cas(
     request: PortalTicketRedeemRequestV1,
     *,
     record: PortalTicketRecordV1,
@@ -364,9 +419,9 @@ def consume_portal_ticket_cas(
     now: datetime,
     cookie_name: str,
     websocket_path: str,
-    cas_update: Callable[[PortalTicketConsumeCASV1, datetime], bool],
+    cas_update: Callable[[PortalTicketConsumeCASV1, datetime], Any],
 ) -> PortalEntryResponseV1:
-    """Apply the owner persistence CAS; a concurrent loser receives 410."""
+    """Await the owner's transaction CAS; a concurrent loser receives 410."""
 
     outcome = redeem_portal_ticket(
         request,
@@ -378,10 +433,234 @@ def consume_portal_ticket_cas(
     )
     if not isinstance(outcome, PortalTicketGrantV1):
         return outcome
-    if not cas_update(outcome.consume_cas, now):
+    applied = cas_update(outcome.consume_cas, now)
+    if inspect.isawaitable(applied):
+        applied = await applied
+    if not applied:
         return _blocked(request, BrowserAccountErrorCode.SESSION_EXPIRED)
     return outcome
 
+_PORTAL_WIRE_HEADER = struct.Struct(">4sBBBBHIH")
+PORTAL_WIRE_HEADER_SIZE = 16
+PORTAL_WIRE_HEADER_LAYOUT = (
+    ("magic", 0, 4, "ASCII"),
+    ("version", 4, 1, "uint8"),
+    ("encoding", 5, 1, "uint8"),
+    ("flags", 6, 1, "uint8"),
+    ("padding", 7, 1, "zero"),
+    ("metadata_bytes", 8, 2, "uint16 big-endian"),
+    ("payload_bytes", 10, 4, "uint32 big-endian"),
+    ("reserved", 14, 2, "zero"),
+)
+_PORTAL_WIRE_MAGIC = b"Q2P1"
+_PORTAL_WIRE_VERSION = 1
+_PORTAL_WIRE_ENCODING_CONTROL = 0
+_PORTAL_WIRE_ENCODING_PIXEL = 1
+
+
+def _wire_metadata(frame: PortalWireFrameV1) -> tuple[dict[str, Any], bytes]:
+    payload = b""
+    if frame.transient.control is not None:
+        control = frame.transient.control
+        metadata_message = control.model_dump(mode="json", exclude={"sensitive_payload"})
+        sensitive = control.sensitive_payload
+        if sensitive is not None:
+            value = sensitive.value.get_secret_value() if sensitive.value is not None else None
+            metadata_message["sensitive_payload"] = {
+                "value_present": value is not None,
+                "key": sensitive.key,
+                "x": sensitive.x,
+                "y": sensitive.y,
+            }
+            if value is not None:
+                payload = value.encode("utf-8")
+    else:
+        pixel = frame.transient.pixel
+        assert pixel is not None
+        metadata_message = pixel.model_dump(mode="json", exclude={"frame_bytes"})
+        payload = pixel.frame_bytes.get_secret_value()
+    return (
+        {
+            "contract_version": frame.contract_version,
+            "protocol": frame.protocol,
+            "sequence": frame.sequence,
+            "encoding": frame.encoding,
+            "content_type": frame.content_type,
+            "mime_type": frame.mime_type,
+
+
+            "byte_length": frame.byte_length,
+            "binding": frame.transient.binding.model_dump(mode="json"),
+            "message": metadata_message,
+        },
+        payload,
+    )
+def portal_wire_metadata_length(frame: PortalWireFrameV1) -> int:
+    """Return canonical UTF-8 metadata length for the fixed header."""
+
+    metadata, _ = _wire_metadata(frame)
+    return len(
+        json.dumps(
+            metadata,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+
+
+def encode_portal_wire_frame(frame: PortalWireFrameV1) -> bytes:
+    """Encode a canonical frame using the fixed 16-byte big-endian header."""
+
+    metadata, payload = _wire_metadata(frame)
+    metadata_bytes = json.dumps(
+        metadata,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if not metadata_bytes or len(metadata_bytes) > 65_535:
+        raise ValueError("portal wire metadata exceeds uint16")
+    if len(payload) > 4_000_000:
+        raise ValueError("portal wire payload exceeds contract limit")
+    if frame.layout.metadata_bytes != len(metadata_bytes):
+        raise ValueError("portal wire metadata length differs")
+    if frame.layout.payload_bytes != len(payload):
+        raise ValueError("portal wire payload length differs")
+    encoding = (
+        _PORTAL_WIRE_ENCODING_CONTROL
+        if frame.encoding == "control-json"
+        else _PORTAL_WIRE_ENCODING_PIXEL
+    )
+    header = _PORTAL_WIRE_HEADER.pack(
+        _PORTAL_WIRE_MAGIC,
+        _PORTAL_WIRE_VERSION,
+        encoding,
+        0,
+        0,
+        len(metadata_bytes),
+        len(payload),
+        0,
+    )
+    return header + metadata_bytes + payload
+
+
+def decode_portal_wire_frame(data: bytes) -> PortalWireFrameV1:
+    """Decode transient bytes and wipe the mutable receive buffer."""
+
+    buffer = bytearray(data)
+    try:
+        if len(buffer) < _PORTAL_WIRE_HEADER.size:
+            raise ValueError("portal wire frame is shorter than header")
+        magic, version, encoding_code, flags, padding, metadata_len, payload_len, reserved = (
+            _PORTAL_WIRE_HEADER.unpack(buffer[: _PORTAL_WIRE_HEADER.size])
+        )
+        if (
+            magic != _PORTAL_WIRE_MAGIC
+            or version != _PORTAL_WIRE_VERSION
+            or encoding_code not in {_PORTAL_WIRE_ENCODING_CONTROL, _PORTAL_WIRE_ENCODING_PIXEL}
+            or flags != 0
+            or padding != 0
+            or reserved != 0
+        ):
+            raise ValueError("portal wire header is invalid")
+        if metadata_len == 0 or payload_len > 4_000_000:
+            raise ValueError("portal wire lengths are invalid")
+        start = _PORTAL_WIRE_HEADER.size
+        metadata_end = start + metadata_len
+        payload_end = metadata_end + payload_len
+        if payload_end != len(buffer):
+            raise ValueError("portal wire lengths do not match frame bytes")
+        metadata = json.loads(bytes(buffer[start:metadata_end]).decode("utf-8"))
+        expected_keys = {
+            "binding",
+            "byte_length",
+            "content_type",
+            "contract_version",
+            "encoding",
+            "message",
+            "mime_type",
+            "protocol",
+            "sequence",
+        }
+        if not isinstance(metadata, dict) or set(metadata) != expected_keys:
+            raise ValueError("portal wire metadata object is not canonical")
+        expected_encoding = (
+            "control-json" if encoding_code == _PORTAL_WIRE_ENCODING_CONTROL else "pixel-binary"
+        )
+        if metadata["encoding"] != expected_encoding:
+            raise ValueError("portal wire header and metadata encoding differ")
+        binding = PortalOuterBindingV1.model_validate(metadata["binding"])
+        payload = bytes(buffer[metadata_end:payload_end])
+        message = metadata["message"]
+        if not isinstance(message, dict):
+            raise ValueError("portal wire message metadata is invalid")
+        if expected_encoding == "control-json":
+            sensitive = message.pop("sensitive_payload", None)
+            if sensitive is not None:
+                if not isinstance(sensitive, dict) or set(sensitive) != {
+                    "key",
+                    "value_present",
+                    "x",
+                    "y",
+                }:
+                    raise ValueError("portal sensitive metadata is invalid")
+                if sensitive["value_present"]:
+                    if not payload:
+                        raise ValueError("portal sensitive payload is empty")
+                    value = SecretStr(payload.decode("utf-8"))
+                else:
+                    if payload:
+                        raise ValueError("portal unexpected control payload bytes")
+                    value = None
+                message["sensitive_payload"] = PortalSensitivePayloadV1(
+                    value=value,
+                    key=sensitive["key"],
+                    x=sensitive["x"],
+                    y=sensitive["y"],
+                )
+            elif payload:
+                raise ValueError("portal unexpected control payload bytes")
+            control = PortalControlMessageV1.model_validate(message)
+            transient = PortalTransientV1(binding=binding, control=control)
+            return PortalWireFrameV1(
+                contract_version=metadata["contract_version"],
+                protocol=metadata["protocol"],
+                sequence=metadata["sequence"],
+                encoding=expected_encoding,
+                content_type=metadata["content_type"],
+                mime_type=metadata["mime_type"],
+                byte_length=None,
+                layout=PortalWireLayoutV1(
+                    metadata_bytes=metadata_len,
+                    payload_bytes=payload_len,
+                ),
+                transient=transient,
+            )
+        pixel = PortalPixelFrameV1.model_validate(
+            {**message, "frame_bytes": payload, "byte_length": payload_len}
+        )
+        transient = PortalTransientV1(binding=binding, pixel=pixel)
+        return PortalWireFrameV1(
+            contract_version=metadata["contract_version"],
+            protocol=metadata["protocol"],
+            sequence=metadata["sequence"],
+            encoding=expected_encoding,
+            content_type=metadata["content_type"],
+            mime_type=metadata["mime_type"],
+            byte_length=metadata["byte_length"],
+            layout=PortalWireLayoutV1(
+                metadata_bytes=metadata_len,
+                payload_bytes=payload_len,
+            ),
+            transient=transient,
+        )
+    except Exception as exc:
+        if isinstance(exc, ValueError) and str(exc).startswith("portal "):
+            raise
+        raise ValueError("portal wire frame cannot be decoded") from None
+    finally:
+        buffer[:] = b"\x00" * len(buffer)
 
 def _clip_contains(container: Any, candidate: Any) -> bool:
     return (
@@ -392,15 +671,14 @@ def _clip_contains(container: Any, candidate: Any) -> bool:
     )
 
 
-def route_portal_frame(
+async def route_portal_frame(
     owner_route: PortalOwnerRouteV1,
     frame: PortalWireFrameV1,
     *,
     now: datetime | None = None,
 ) -> PortalWireFrameV1:
-    """Validate expiry, page/record lineage, focus, and bounded frame bytes."""
+    """Validate complete wire binding before resolving the live page."""
 
-    _resolve_frozen_portal_record_session(owner_route.binding)
     checked_at = now or datetime.now(timezone.utc)
     if owner_route.route_expires_at <= checked_at:
         raise ValueError("portal owner route has expired")
@@ -415,6 +693,7 @@ def route_portal_frame(
         or binding.view_generation != route_binding.view_generation
     ):
         raise ValueError("portal frame is outside the owner route binding")
+    await _resolve_frozen_portal_record_session(owner_route.binding)
     if frame.contract_version != owner_route.contract_version:
         raise ValueError("portal frame and owner route contract versions differ")
     if frame.encoding == "pixel-binary":
@@ -448,7 +727,7 @@ def route_portal_frame(
     return frame
 
 
-def invoke_portal_owner_transport(
+async def invoke_portal_owner_transport(
     owner_route: PortalOwnerRouteV1,
     frame: PortalWireFrameV1,
     *,
@@ -458,7 +737,7 @@ def invoke_portal_owner_transport(
 ) -> _TransportResult:
     """Authenticate the node tunnel, then invoke R after A-side validation."""
 
-    validated = route_portal_frame(owner_route, frame, now=now)
+    validated = await route_portal_frame(owner_route, frame, now=now)
     if not authenticate_owner(owner_route):
         raise ValueError("portal owner transport authentication failed")
     return transport(owner_route, validated)

@@ -87,10 +87,14 @@ CAPTURE_JS = r"""
   };
   const roleOf = (el) =>
     (el && el.getAttribute && el.getAttribute('role')) || ((el && el.tagName) || '').toLowerCase();
+  const sensitiveKey = boundKey + '_sensitive';
+  const blocked = () => Boolean(window[sensitiveKey]);
   document.addEventListener('click', (e) => {
+    if (blocked()) return;
     window.__record_event({ verb: 'click', name: nameOf(e.target), role: roleOf(e.target) });
   }, true);
   document.addEventListener('change', (e) => {
+    if (blocked()) return;
     const tag = ((e.target && e.target.tagName) || '').toLowerCase();
     const isSelect = tag === 'select';
     const inputType = ((e.target && e.target.type) || '').toLowerCase();
@@ -104,8 +108,14 @@ CAPTURE_JS = r"""
     });
   }, true);
   document.addEventListener('submit', (e) => {
+    if (blocked()) return;
     window.__record_event({ verb: 'submit', name: nameOf(e.target), role: 'form' });
   }, true);
+}
+"""
+SENSITIVE_JS = r"""
+(sessionId) => {
+  window['__skillRecordBound_' + sessionId + '_sensitive'] = true;
 }
 """
 
@@ -128,6 +138,7 @@ class RecordSession:
     steps: list[StepRecord] = field(default_factory=list)
     _last_ts: float = field(default_factory=time.monotonic, repr=False)
     stopped: bool = False
+    sensitive: bool = False
 
     async def start(self) -> None:
         """Wire the capture binding + listener onto the live page.
@@ -166,10 +177,14 @@ class RecordSession:
         # frame counts as a step (iframe navigations are noise for this v1).
         if frame is not self.page.page.main_frame:
             return
+        if self.sensitive or self.stopped:
+            return
         self._append(verb="navigate", args={"url": frame.url}, target=frame.url)
 
     async def _on_event(self, source: dict[str, Any], payload: dict[str, Any]) -> None:
         """`page.expose_binding` callback — one call per captured DOM event."""
+        if self.sensitive or self.stopped:
+            return
         verb = payload.get("verb")
         name = payload.get("name") or ""
         role = payload.get("role") or ""
@@ -185,7 +200,20 @@ class RecordSession:
             return
         self._append(verb=verb, args=args, target=name)
 
-    async def stop(self, *, status: str, note: str | None = None) -> dict[str, Any]:
+    async def set_sensitive(self, enabled: bool = True) -> bool:
+        """Disable the page listener before a sensitive portal handoff."""
+        if self.stopped and enabled:
+            raise RuntimeError("stopped recording cannot enter sensitive mode")
+        if enabled:
+            evaluator = getattr(self.page.page, "evaluate", None)
+            if not callable(evaluator):
+                raise RuntimeError("record page cannot disable its capture listener")
+            await evaluator(SENSITIVE_JS, self.session_id)
+        self.sensitive = enabled
+        return True
+
+
+    async def stop(self, *, status: str = "success", note: str | None = None) -> dict[str, Any]:
         """Human marks the demo done — append a ``done`` step and assemble the
         full ``journey_trace_v1`` (unchanged :func:`assemble_trace`, same shape
         the execute leg produces). Does **not** persist a Skill row — the

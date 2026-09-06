@@ -4,8 +4,18 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from pydantic import SecretStr
 
+from backend.skills.record import RecordSession
 from backend.models.browser import BrowserAccountStatus, BrowserAuthEvidence, BrowserCommandKind
 from backend.schemas.browser_account import (
+    ACCOUNT_AUTH_REQUIRED_ROUTE,
+    ACCOUNT_MIGRATE_ROUTE,
+    ACCOUNT_OPERATION_METHOD,
+    ACCOUNT_RESUME_ROUTE,
+    ACCOUNT_SUSPEND_ROUTE,
+    BrowserAccountOperationRequestV1,
+    BrowserAccountOperationResponseV1,
+    BrowserAccountRevisionCASV1,
+    BrowserAccountRevisionPreconditionV1,
     AccountRef,
     AccountStateSnapshotV1,
     AccountStateViewV1,
@@ -18,12 +28,14 @@ from backend.schemas.browser_account import (
     NodeIdentityV1,
     PortalClipV1,
     PortalEntryBlockedV1,
+    PortalControlMessageV1,
     PortalEntryWaitingV1,
     PortalModelDecisionV1,
     PortalOwnerRouteV1,
     PortalPerceptionElementV1,
     PortalPerceptionV1,
     PortalPixelFrameV1,
+    PortalSensitivePayloadV1,
     PortalRegionFocusV1,
     PortalOuterBindingV1,
     PortalRecordSessionContractV1,
@@ -49,36 +61,59 @@ from backend.services.browser_portal_contract import (
     redeem_portal_ticket,
     register_portal_record_session,
     route_portal_frame,
+    build_account_revision_cas,
+    decode_portal_wire_frame,
+    encode_portal_wire_frame,
+    portal_wire_metadata_length,
+    resolve_account_revision_precondition,
     consume_portal_ticket_cas,
     ticket_record_from_issue,
 )
+class _PageProbe:
+    def __init__(self) -> None:
+        self.closed = False
+        self.page = self
+        self.evaluations: list[tuple[object, object]] = []
+
+    async def is_closed(self) -> bool:
+        return self.closed
+
+    async def evaluate(self, script: object, value: object) -> None:
+        self.evaluations.append((script, value))
+
+
+@pytest.mark.asyncio
+async def test_real_record_session_sensitive_transition_stops_event_capture() -> None:
+    record_page = _PageProbe()
+    record = RecordSession(
+        session_id="record-session",
+        domain="site",
+        capability="login",
+        page=record_page,
+    )
+    assert await record.set_sensitive() is True
+    await record._on_event({}, {"verb": "type", "name": "otp", "role": "input", "value": "secret"})
+    assert record.steps == []
+    await record.stop()
+    assert record.stopped is True
+
+
 class _RecordSessionProbe:
     def __init__(self) -> None:
         self.session_id = "record-session"
-        self.page = object()
+        self.page = _PageProbe()
+        self.document_id = "document"
         self.stopped = False
-        self._listener_installed = True
-        self._listener_revoked = False
-        self._pending_events = 1
+        self.sensitive = False
+        self.calls: list[str] = []
 
-    def is_common_listener_installed(self) -> bool:
-        return self._listener_installed
-
-    def is_common_listener_revoked(self) -> bool:
-        return self._listener_revoked
-
-    def stop_common_listener(self) -> None:
-        self._listener_installed = False
-        self._listener_revoked = True
-
-    def drain_pending_events(self) -> bool:
-        self._pending_events = 0
+    async def set_sensitive(self, enabled: bool = True) -> bool:
+        self.calls.append(f"set_sensitive:{enabled}")
+        self.sensitive = enabled
         return True
 
-    def has_pending_events(self) -> bool:
-        return self._pending_events != 0
-
-    def stop(self) -> None:
+    async def stop(self) -> None:
+        self.calls.append("stop")
         self.stopped = True
 
 
@@ -384,7 +419,37 @@ def test_h5_pixel_mime_bytes_and_owner_route_are_bounded() -> None:
         )
 
 
-def test_h3_first_ticket_redeem_binds_csrf_session_and_replay() -> None:
+def test_h3_account_operation_handoff_pins_http_and_revision_cas() -> None:
+    _, ref, _, _, _, _ = _context()
+    assert ACCOUNT_OPERATION_METHOD == "POST"
+    assert ACCOUNT_AUTH_REQUIRED_ROUTE.endswith("/auth-required")
+    assert ACCOUNT_SUSPEND_ROUTE.endswith("/suspend")
+    assert ACCOUNT_RESUME_ROUTE.endswith("/resume")
+    assert ACCOUNT_MIGRATE_ROUTE.endswith("/migration")
+    request = BrowserAccountOperationRequestV1(
+        account_ref=ref,
+        expected_revision=7,
+        operation="suspend",
+    )
+    response = BrowserAccountOperationResponseV1(
+        account_ref=ref,
+        operation=request.operation,
+        revision=8,
+        status=BrowserAccountStatus.DORMANT,
+        auth_required=False,
+        paused=True,
+    )
+    assert response.revision == request.expected_revision + 1
+    cas = build_account_revision_cas(ref, expected_revision=request.expected_revision)
+    assert isinstance(cas, BrowserAccountRevisionCASV1)
+    assert cas.next_revision == response.revision
+    assert resolve_account_revision_precondition(if_match='"7"', body_revision=7) == 7
+    with pytest.raises(ValueError):
+        resolve_account_revision_precondition(if_match='"7"', body_revision=8)
+
+
+@pytest.mark.asyncio
+async def test_h3_first_ticket_redeem_binds_csrf_session_and_replay() -> None:
     now, ref, target, _, _, _ = _context()
     csrf = SecretStr("csrf-token-012345")
     ticket = SecretStr("ticket-secret-012345")
@@ -422,7 +487,7 @@ def test_h3_first_ticket_redeem_binds_csrf_session_and_replay() -> None:
         websocket_path="/portal",
     )
     assert isinstance(grant, PortalTicketGrantV1)
-    cas_loser = consume_portal_ticket_cas(
+    cas_loser = await consume_portal_ticket_cas(
         redeem,
         record=record,
         authenticated_subject="operator",
@@ -454,8 +519,57 @@ def test_h3_first_ticket_redeem_binds_csrf_session_and_replay() -> None:
     assert getattr(mismatch, "status") == "blocked"
     assert getattr(mismatch, "http_status") == 404
 
+@pytest.mark.asyncio
+async def test_h4_control_wire_keeps_secret_in_transient_payload() -> None:
+    now, ref, target, _, _, _ = _context()
+    secret = "密碼"
+    binding = PortalOuterBindingV1(
+        workspace_id=ref.workspace_id,
+        account_id=ref.account_id,
+        session_id="session",
+        epoch=2,
+        target=target,
+        view_generation=4,
+    )
+    control = PortalControlMessageV1(
+        workspace_id=ref.workspace_id,
+        account_id=ref.account_id,
+        session_id="session",
+        epoch=2,
+        target=target,
+        view_generation=4,
+        sequence=3,
+        kind="field_input",
+        field_ref="otp",
+        sensitive_payload=PortalSensitivePayloadV1(value=SecretStr(secret)),
+    )
+    wire = PortalWireFrameV1(
+        sequence=3,
+        encoding="control-json",
+        content_type="application/json",
+        mime_type="application/json",
+        layout=PortalWireLayoutV1(metadata_bytes=1, payload_bytes=len(secret.encode("utf-8"))),
+        transient=PortalTransientV1(binding=binding, control=control),
+    )
+    wire = wire.model_copy(
+        update={
+            "layout": PortalWireLayoutV1(
+                metadata_bytes=portal_wire_metadata_length(wire),
+                payload_bytes=len(secret.encode("utf-8")),
+            )
+        }
+    )
+    encoded = encode_portal_wire_frame(wire)
+    assert secret.encode("utf-8") not in encoded[:-len(secret.encode("utf-8"))]
+    decoded = decode_portal_wire_frame(encoded)
+    assert decoded.transient.control is not None
+    assert decoded.transient.control.sensitive_payload is not None
+    assert decoded.transient.control.sensitive_payload.value.get_secret_value() == secret
 
-def test_h5_owner_route_applies_real_wire_binding() -> None:
+
+
+@pytest.mark.asyncio
+async def test_h5_owner_route_applies_real_wire_binding() -> None:
     now, ref, target, _, _, _ = _context()
     raw = b"\x89PNG\r\n\x1a\n"
     frame = PortalPixelFrameV1(
@@ -479,7 +593,7 @@ def test_h5_owner_route_applies_real_wire_binding() -> None:
         content_type="application/octet-stream",
         mime_type="image/png",
         byte_length=len(raw),
-        layout=PortalWireLayoutV1(metadata_bytes=16, payload_bytes=len(raw)),
+        layout=PortalWireLayoutV1(metadata_bytes=1, payload_bytes=len(raw)),
         transient=PortalTransientV1(
             binding=PortalOuterBindingV1(
                 workspace_id=ref.workspace_id,
@@ -492,6 +606,27 @@ def test_h5_owner_route_applies_real_wire_binding() -> None:
             pixel=frame,
         ),
     )
+    wire = wire.model_copy(
+        update={
+            "layout": PortalWireLayoutV1(
+                metadata_bytes=portal_wire_metadata_length(wire),
+                payload_bytes=len(raw),
+            )
+        }
+    )
+    encoded = encode_portal_wire_frame(wire)
+    assert encoded[:4] == b"Q2P1"
+    assert encoded[4:8] == bytes((1, 1, 0, 0))
+    assert int.from_bytes(encoded[8:10], "big") == wire.layout.metadata_bytes
+    assert int.from_bytes(encoded[10:14], "big") == wire.layout.payload_bytes
+    bad_header = bytearray(encoded)
+    bad_header[7] = 1
+    with pytest.raises(ValueError):
+        decode_portal_wire_frame(bytes(bad_header))
+    decoded = decode_portal_wire_frame(encoded)
+    assert decoded.sequence == wire.sequence
+    assert decoded.transient.pixel is not None
+    assert decoded.transient.pixel.frame_bytes.get_secret_value() == raw
     with pytest.raises(ValueError):
         PortalWireFrameV1(
             sequence=2,
@@ -512,7 +647,7 @@ def test_h5_owner_route_applies_real_wire_binding() -> None:
     )
     record_session = _RecordSessionProbe()
     register_portal_record_session(binding, record_session)
-    freeze_portal_record_session(binding, record_session)
+    await freeze_portal_record_session(binding, record_session)
     route = PortalOwnerRouteV1(
         binding=binding,
         node_identity=NodeIdentityV1(node_id="node", boot_id="boot"),
@@ -531,10 +666,10 @@ def test_h5_owner_route_applies_real_wire_binding() -> None:
         max_frame_bytes=4_000_000,
         max_input_bytes=4_096,
     )
-    assert route_portal_frame(route, wire) is wire
+    assert await route_portal_frame(route, wire) is wire
     seen: list[tuple[str, int]] = []
     assert (
-        invoke_portal_owner_transport(
+        await invoke_portal_owner_transport(
             route,
             wire,
             authenticate_owner=lambda owner: owner.tunnel_handle == "tunnel-handle"
@@ -548,7 +683,7 @@ def test_h5_owner_route_applies_real_wire_binding() -> None:
     )
     assert seen == [("node", 2)]
     with pytest.raises(ValueError):
-        invoke_portal_owner_transport(
+        await invoke_portal_owner_transport(
             route,
             wire,
             authenticate_owner=lambda _: False,
@@ -556,7 +691,7 @@ def test_h5_owner_route_applies_real_wire_binding() -> None:
             transport=lambda *_: pytest.fail("unauthenticated route reached owner transport"),
         )
     with pytest.raises(ValueError):
-        invoke_portal_owner_transport(
+        await invoke_portal_owner_transport(
             route.model_copy(update={"route_expires_at": now - timedelta(seconds=1)}),
             wire,
             authenticate_owner=lambda _: True,
@@ -564,7 +699,7 @@ def test_h5_owner_route_applies_real_wire_binding() -> None:
             transport=lambda *_: pytest.fail("expired route reached owner transport"),
         )
     with pytest.raises(ValueError):
-        route_portal_frame(
+        await route_portal_frame(
             route,
             wire.model_copy(
                 update={
@@ -574,14 +709,18 @@ def test_h5_owner_route_applies_real_wire_binding() -> None:
                 }
             ),
         )
-    record_session.stop()
-    completed = complete_portal_record_session(binding)
+    record_session.page.closed = True
+    with pytest.raises(ValueError):
+        await route_portal_frame(route, wire, now=now)
+    record_session.page.closed = False
+    completed = await complete_portal_record_session(binding)
     assert completed.status == "completed"
     with pytest.raises(ValueError):
-        route_portal_frame(route, wire, now=now)
+        await route_portal_frame(route, wire, now=now)
 
 
-def test_h1_pre_entry_freezes_perception_model_and_record_tuple() -> None:
+@pytest.mark.asyncio
+async def test_h1_pre_entry_freezes_perception_model_and_record_tuple() -> None:
     now, ref, target, session, command, claim = _context()
     binding = SensitiveSessionBindingV1(
         account_ref=ref,
@@ -600,7 +739,7 @@ def test_h1_pre_entry_freezes_perception_model_and_record_tuple() -> None:
     )
     record_session = _RecordSessionProbe()
     register_portal_record_session(binding, record_session)
-    handoff = admit_portal_entry(
+    handoff = await admit_portal_entry(
         command,
         claim,
         session,
@@ -620,10 +759,11 @@ def test_h1_pre_entry_freezes_perception_model_and_record_tuple() -> None:
         record_session=record_session,
     )
     assert handoff.guard.command.command_id == "command"
+    assert record_session.calls == ["set_sensitive:True"]
     with pytest.raises(ValueError):
         PortalPerceptionElementV1(ref="secret", role="input", name="OTP")
     with pytest.raises(ValueError):
-        admit_portal_entry(
+        await admit_portal_entry(
             command,
             claim,
             session,
