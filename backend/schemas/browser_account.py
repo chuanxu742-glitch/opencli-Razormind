@@ -750,9 +750,13 @@ class SensitiveGuardStateV1(_ContractModel):
 
 
 class PortalSensitivePayloadV1(_ContractModel):
-    """Short-lived sensitive input; SecretStr prevents repr/log disclosure."""
+    """Short-lived sensitive input; empty ``SecretStr`` is a valid value.
 
-    value: SecretStr | None = None
+    ``None`` means no value was supplied; an empty string is intentionally
+    distinct and is preserved by the transient wire codec.
+    """
+
+    value: SecretStr | None = Field(default=None)
     key: str | None = Field(default=None, min_length=1, max_length=32)
     x: int | None = Field(default=None, ge=0, le=4096)
     y: int | None = Field(default=None, ge=0, le=4096)

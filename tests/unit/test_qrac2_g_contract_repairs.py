@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 
@@ -69,18 +70,45 @@ from backend.services.browser_portal_contract import (
     consume_portal_ticket_cas,
     ticket_record_from_issue,
 )
-class _PageProbe:
-    def __init__(self) -> None:
-        self.closed = False
-        self.page = self
+class _FrameProbe:
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.url = f"https://site.test/{name}"
         self.evaluations: list[tuple[object, object]] = []
-
-    async def is_closed(self) -> bool:
-        return self.closed
 
     async def evaluate(self, script: object, value: object) -> None:
         self.evaluations.append((script, value))
 
+
+class _PageProbe:
+    def __init__(self) -> None:
+        self.closed = False
+        self.page = self
+        self.document = object()
+        self.main_frame = _FrameProbe("main")
+        self.frames = [self.main_frame, _FrameProbe("iframe")]
+        self.evaluations: list[tuple[object, object]] = []
+        self.init_scripts: list[str] = []
+        self.handlers: dict[str, object] = {}
+
+    async def is_closed(self) -> bool:
+        return self.closed
+
+    async def evaluate(self, script: object, value: object = None) -> None:
+        self.evaluations.append((script, value))
+
+    async def expose_binding(self, name: str, callback: object) -> None:
+        self.evaluations.append((name, callback))
+
+    async def add_init_script(self, script: str) -> None:
+        self.init_scripts.append(script)
+
+    def on(self, event: str, handler: object) -> None:
+        self.handlers[event] = handler
+
+    def remove_listener(self, event: str, handler: object) -> None:
+        if self.handlers.get(event) is handler:
+            del self.handlers[event]
 
 @pytest.mark.asyncio
 async def test_real_record_session_sensitive_transition_stops_event_capture() -> None:
@@ -92,17 +120,65 @@ async def test_real_record_session_sensitive_transition_stops_event_capture() ->
         page=record_page,
     )
     assert await record.set_sensitive() is True
+    assert record.sensitive is True
+    assert record._listener_revoked is True
     await record._on_event({}, {"verb": "type", "name": "otp", "role": "input", "value": "secret"})
     assert record.steps == []
+    assert await record.set_sensitive(False) is True
+    assert record.sensitive is False
+    assert record._listener_installed is True
+    assert record._listener_revoked is False
+    await record._on_event({}, {"verb": "type", "name": "email", "role": "input", "value": "ok"})
+    assert record.steps[-1].args["text"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_record_sensitive_transition_drains_inflight_event() -> None:
+    record = RecordSession(
+        session_id="record-session",
+        domain="site",
+        capability="login",
+        page=_PageProbe(),
+    )
+    await record.set_sensitive(False)
+    await record._event_lock.acquire()
+    event_task = asyncio.create_task(
+        record._on_event({}, {"verb": "type", "name": "email", "role": "input", "value": "ok"})
+    )
+    await asyncio.sleep(0)
+    assert record.has_pending_events()
+    record._event_lock.release()
+    await record.set_sensitive(True)
+    await event_task
+    assert record._pending_events_drained is True
     await record.stop()
     assert record.stopped is True
+    assert record._listener_revoked is True
+
+
+@pytest.mark.asyncio
+async def test_record_capture_injects_existing_iframes_and_document_guard() -> None:
+    record_page = _PageProbe()
+    record = RecordSession(
+        session_id="record-session",
+        domain="site",
+        capability="login",
+        page=record_page,
+    )
+    await record.start()
+    assert all(frame.evaluations for frame in record_page.frames)
+    assert "ownerDocument" in str(record_page.frames[0].evaluations[0][0])
+    generation = record._document_generation
+    record._on_navigate(record_page.frames[1])
+    assert record._document_generation == generation
+    record._on_navigate(record_page.main_frame)
+    assert record._document_generation == generation + 1
 
 
 class _RecordSessionProbe:
-    def __init__(self) -> None:
-        self.session_id = "record-session"
+    def __init__(self, session_id: str = "record-session") -> None:
+        self.session_id = session_id
         self.page = _PageProbe()
-        self.document_id = "document"
         self.stopped = False
         self.sensitive = False
         self.calls: list[str] = []
@@ -116,6 +192,28 @@ class _RecordSessionProbe:
         self.calls.append("stop")
         self.stopped = True
 
+
+
+@pytest.mark.asyncio
+async def test_h5_freeze_rejects_binding_or_identity_before_side_effect() -> None:
+    _, ref, target, _, _, _ = _context()
+    binding = SensitiveSessionBindingV1(
+        account_ref=ref,
+        session_id="session",
+        epoch=2,
+        target=target,
+        view_generation=4,
+        record_session_id="record-session-identity",
+    )
+    record = _RecordSessionProbe("record-session-identity")
+    register_portal_record_session(binding, record)
+    with pytest.raises(ValueError):
+        await freeze_portal_record_session(binding.model_copy(update={"epoch": 3}), record)
+    assert record.calls == []
+    record.page.document = object()
+    with pytest.raises(ValueError):
+        await freeze_portal_record_session(binding, record)
+    assert record.calls == []
 
 
 
@@ -565,6 +663,55 @@ async def test_h4_control_wire_keeps_secret_in_transient_payload() -> None:
     assert decoded.transient.control is not None
     assert decoded.transient.control.sensitive_payload is not None
     assert decoded.transient.control.sensitive_payload.value.get_secret_value() == secret
+
+
+def test_h4_control_wire_preserves_empty_secret_and_absent_value() -> None:
+    now, ref, target, _, _, _ = _context()
+    binding = PortalOuterBindingV1(
+        workspace_id=ref.workspace_id,
+        account_id=ref.account_id,
+        session_id="session",
+        epoch=2,
+        target=target,
+        view_generation=4,
+    )
+    for payload, expected in (
+        (PortalSensitivePayloadV1(value=SecretStr("")), ""),
+        (PortalSensitivePayloadV1(value=None, key="otp"), None),
+    ):
+        control = PortalControlMessageV1(
+            workspace_id=ref.workspace_id,
+            account_id=ref.account_id,
+            session_id="session",
+            epoch=2,
+            target=target,
+            view_generation=4,
+            sequence=3,
+            kind="field_input",
+            field_ref="otp",
+            sensitive_payload=payload,
+        )
+        frame = PortalWireFrameV1(
+            sequence=3,
+            encoding="control-json",
+            content_type="application/json",
+            mime_type="application/json",
+            layout=PortalWireLayoutV1(metadata_bytes=1, payload_bytes=0),
+            transient=PortalTransientV1(binding=binding, control=control),
+        )
+        frame = frame.model_copy(
+            update={
+                "layout": PortalWireLayoutV1(
+                    metadata_bytes=portal_wire_metadata_length(frame),
+                    payload_bytes=0,
+                )
+            }
+        )
+        decoded = decode_portal_wire_frame(encode_portal_wire_frame(frame))
+        assert decoded.transient.control is not None
+        assert decoded.transient.control.sensitive_payload is not None
+        value = decoded.transient.control.sensitive_payload.value
+        assert value is None or value.get_secret_value() == expected
 
 
 

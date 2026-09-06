@@ -75,9 +75,49 @@ class _RegisteredRecordSession:
     page: Any
     binding: SensitiveSessionBindingV1
     contract: PortalRecordSessionContractV1
+    page_identity: Any
+    frame_identity: Any
+    document_identity: Any
+    _reported_document: Any
 
 
 _RECORD_SESSIONS: dict[str, _RegisteredRecordSession] = {}
+
+
+def _record_identity(record_session: Any) -> tuple[Any, Any, Any, Any]:
+    identity = getattr(record_session, "binding_identity", None)
+    if callable(identity):
+        value = identity()
+        if isinstance(value, tuple) and len(value) == 4:
+            return value
+    page = getattr(record_session, "page", None)
+    raw_page = getattr(page, "page", page)
+    frame = getattr(raw_page, "main_frame", None)
+    if callable(frame):
+        frame = frame()
+    document = getattr(raw_page, "document", None)
+    if document is None:
+        document = getattr(raw_page, "document_id", None)
+    url = getattr(raw_page, "url", None)
+    return raw_page, frame, (document, url), None
+
+
+def _require_same_record_identity(
+    registration: _RegisteredRecordSession,
+    record_session: Any,
+) -> None:
+    page, frame, document, reported_document = _record_identity(record_session)
+    if page is not registration.page_identity:
+        raise ValueError("record session page changed")
+    if frame is not registration.frame_identity:
+        raise ValueError("record session frame changed")
+    if document != registration.document_identity:
+        raise ValueError("record session document changed")
+    if (
+        registration._reported_document is not None
+        and reported_document != registration._reported_document
+    ):
+        raise ValueError("record session document changed")
 
 
 async def _call_async(record_session: Any, name: str, *args: Any) -> Any:
@@ -105,6 +145,18 @@ async def _page_is_closed(page: Any) -> bool:
 async def _require_open_page(page: Any) -> None:
     if await _page_is_closed(page):
         raise ValueError("record session page is closed")
+
+
+def _listener_state(record_session: Any) -> tuple[bool, bool, bool]:
+    installed = getattr(record_session, "is_common_listener_installed", None)
+    revoked = getattr(record_session, "is_common_listener_revoked", None)
+    pending = getattr(record_session, "has_pending_events", None)
+    sensitive = bool(getattr(record_session, "sensitive", False))
+    return (
+        bool(installed()) if callable(installed) else not sensitive,
+        bool(revoked()) if callable(revoked) else sensitive,
+        bool(pending()) if callable(pending) else False,
+    )
 
 
 async def admit_portal_entry(
@@ -151,6 +203,11 @@ def register_portal_record_session(
         raise ValueError("record session page does not match registration")
     if getattr(record_session, "stopped", False) or getattr(record_session, "sensitive", False):
         raise ValueError("stopped or sensitive record session cannot be registered")
+    if record_id in _RECORD_SESSIONS:
+        raise ValueError("record session id is already registered")
+    page_identity, frame_identity, document_identity, reported_document = _record_identity(
+        record_session
+    )
     completion = PortalRecordSessionContractV1(
         record_session_id=record_id,
         target=binding.target,
@@ -166,6 +223,10 @@ def register_portal_record_session(
         page=actual_page,
         binding=binding,
         contract=completion,
+        page_identity=page_identity,
+        frame_identity=frame_identity,
+        document_identity=document_identity,
+        _reported_document=reported_document,
     )
     return completion
 
@@ -177,15 +238,27 @@ async def freeze_portal_record_session(
     """Await RecordSession.set_sensitive(True), including listener drain."""
 
     registration = _RECORD_SESSIONS.get(binding.record_session_id or "")
-    if registration is None or registration.session is not record_session:
+    if (
+        registration is None
+        or registration.session is not record_session
+        or registration.binding != binding
+    ):
         raise ValueError("record session is not registered for this binding")
     if registration.contract.status != "active":
         raise ValueError("record session is not in active pre-entry state")
     if getattr(record_session, "stopped", False):
         raise ValueError("stopped record session cannot enter sensitive mode")
+    _require_same_record_identity(registration, record_session)
     await _require_open_page(registration.page)
     result = await _call_async(record_session, "set_sensitive", True)
-    if result is False or getattr(record_session, "sensitive", False) is not True:
+    installed, revoked, pending = _listener_state(record_session)
+    if (
+        result is False
+        or getattr(record_session, "sensitive", False) is not True
+        or installed
+        or not revoked
+        or pending
+    ):
         raise ValueError("record session sensitive transition did not complete")
     registration.contract = PortalRecordSessionContractV1(
         record_session_id=binding.record_session_id or "",
@@ -212,10 +285,8 @@ async def resolve_portal_record_session(binding: SensitiveSessionBindingV1) -> A
         raise ValueError("portal record session is stopped")
     if getattr(registration.session, "page", None) is not registration.page:
         raise ValueError("portal record session page changed")
+    _require_same_record_identity(registration, registration.session)
     await _require_open_page(registration.page)
-    document_id = getattr(registration.session, "document_id", None)
-    if document_id is not None and document_id != binding.target.document_id:
-        raise ValueError("portal record session document changed")
     return registration.session
 
 
@@ -239,26 +310,34 @@ async def complete_portal_record_session(
     registration = _RECORD_SESSIONS.get(binding.record_session_id or "")
     if registration is None or registration.binding != binding:
         raise ValueError("portal record session is not registered for this binding")
+    if getattr(registration.session, "stopped", False):
+        _RECORD_SESSIONS.pop(binding.record_session_id or "", None)
+        raise ValueError("record session is already stopped")
     if registration.contract.status != "sensitive":
         raise ValueError("portal record session was not frozen before completion")
-    if getattr(registration.session, "stopped", False):
-        raise ValueError("record session is already stopped")
-    await _call_async(registration.session, "stop")
-    if not getattr(registration.session, "stopped", False):
-        raise ValueError("record completion requires RecordSession.stop")
-    await _require_open_page(registration.page)
-    completed = PortalRecordSessionContractV1(
-        record_session_id=binding.record_session_id or "",
-        target=binding.target,
-        view_generation=binding.view_generation,
-        status="aborted" if aborted else "completed",
-        page_bound=True,
-        listener_installed=False,
-        listener_revoked=True,
-        pending_events_drained=True,
-    )
-    del _RECORD_SESSIONS[binding.record_session_id or ""]
-    return completed
+    try:
+        await _call_async(registration.session, "stop")
+        installed, revoked, pending = _listener_state(registration.session)
+        if (
+            not getattr(registration.session, "stopped", False)
+            or installed
+            or not revoked
+            or pending
+        ):
+            raise ValueError("record completion requires revoked listener and drained events")
+        completed = PortalRecordSessionContractV1(
+            record_session_id=binding.record_session_id or "",
+            target=binding.target,
+            view_generation=binding.view_generation,
+            status="aborted" if aborted else "completed",
+            page_bound=True,
+            listener_installed=installed,
+            listener_revoked=revoked,
+            pending_events_drained=not pending,
+        )
+        return completed
+    finally:
+        _RECORD_SESSIONS.pop(binding.record_session_id or "", None)
 
 
 def _digest(value: SecretStr) -> str:
@@ -606,8 +685,6 @@ def decode_portal_wire_frame(data: bytes) -> PortalWireFrameV1:
                 }:
                     raise ValueError("portal sensitive metadata is invalid")
                 if sensitive["value_present"]:
-                    if not payload:
-                        raise ValueError("portal sensitive payload is empty")
                     value = SecretStr(payload.decode("utf-8"))
                 else:
                     if payload:

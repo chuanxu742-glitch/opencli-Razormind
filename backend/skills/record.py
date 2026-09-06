@@ -40,6 +40,7 @@ Design (mirrors the execute leg's substrate — no new browser plumbing):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import uuid
@@ -70,8 +71,22 @@ logger = logging.getLogger(__name__)
 CAPTURE_JS = r"""
 (sessionId) => {
   const boundKey = '__skillRecordBound_' + sessionId;
-  if (window[boundKey]) return;
-  window[boundKey] = true;
+  const stateKey = boundKey + '_state';
+  const sensitiveKey = boundKey + '_sensitive';
+  const currentDocument = document;
+  const state = window[stateKey] || {
+    document: currentDocument,
+    blocked: Boolean(window[sensitiveKey]),
+    listenersInstalled: false,
+    listenerRevoked: false,
+    handlers: null,
+  };
+  const targetIsCurrent = (event) => {
+    if (state.blocked || window[sensitiveKey]) return false;
+    if (state.document !== currentDocument || currentDocument.defaultView !== window) return false;
+    const target = event && event.target;
+    return Boolean(target && target.ownerDocument === currentDocument);
+  };
   const nameOf = (el) => {
     if (!el || !el.getAttribute) return '';
     let name = (
@@ -87,35 +102,66 @@ CAPTURE_JS = r"""
   };
   const roleOf = (el) =>
     (el && el.getAttribute && el.getAttribute('role')) || ((el && el.tagName) || '').toLowerCase();
-  const sensitiveKey = boundKey + '_sensitive';
-  const blocked = () => Boolean(window[sensitiveKey]);
-  document.addEventListener('click', (e) => {
-    if (blocked()) return;
-    window.__record_event({ verb: 'click', name: nameOf(e.target), role: roleOf(e.target) });
-  }, true);
-  document.addEventListener('change', (e) => {
-    if (blocked()) return;
-    const tag = ((e.target && e.target.tagName) || '').toLowerCase();
-    const isSelect = tag === 'select';
-    const inputType = ((e.target && e.target.type) || '').toLowerCase();
-    const isSensitive = inputType === 'password';
-    window.__record_event({
-      verb: isSelect ? 'select' : 'type',
-      name: nameOf(e.target),
-      role: roleOf(e.target),
-      value: isSensitive ? '' : String((e.target && e.target.value) ?? ''),
-      redacted: isSensitive,
-    });
-  }, true);
-  document.addEventListener('submit', (e) => {
-    if (blocked()) return;
-    window.__record_event({ verb: 'submit', name: nameOf(e.target), role: 'form' });
-  }, true);
+  const install = () => {
+    if (state.listenersInstalled || state.document !== currentDocument) return;
+    const click = (e) => {
+      if (!targetIsCurrent(e)) return;
+      window.__record_event({ verb: 'click', name: nameOf(e.target), role: roleOf(e.target) });
+    };
+    const change = (e) => {
+      if (!targetIsCurrent(e)) return;
+      const tag = ((e.target && e.target.tagName) || '').toLowerCase();
+      const isSelect = tag === 'select';
+      const inputType = ((e.target && e.target.type) || '').toLowerCase();
+      const isSensitive = inputType === 'password';
+      window.__record_event({
+        verb: isSelect ? 'select' : 'type',
+        name: nameOf(e.target),
+        role: roleOf(e.target),
+        value: isSensitive ? '' : String((e.target && e.target.value) ?? ''),
+        redacted: isSensitive,
+      });
+    };
+    const submit = (e) => {
+      if (!targetIsCurrent(e)) return;
+      window.__record_event({ verb: 'submit', name: nameOf(e.target), role: 'form' });
+    };
+    state.handlers = { click, change, submit };
+    document.addEventListener('click', click, true);
+    document.addEventListener('change', change, true);
+    document.addEventListener('submit', submit, true);
+    state.listenersInstalled = true;
+    state.listenerRevoked = false;
+  };
+  state.install = install;
+  state.revoke = () => {
+    if (!state.listenersInstalled || !state.handlers) {
+      state.listenerRevoked = true;
+      return;
+    }
+    document.removeEventListener('click', state.handlers.click, true);
+    document.removeEventListener('change', state.handlers.change, true);
+    document.removeEventListener('submit', state.handlers.submit, true);
+    state.handlers = null;
+    state.listenersInstalled = false;
+    state.listenerRevoked = true;
+  };
+  window[stateKey] = state;
+  window[boundKey + '_install'] = install;
+  window[boundKey + '_revoke'] = state.revoke;
+  install();
 }
 """
 SENSITIVE_JS = r"""
-(sessionId) => {
-  window['__skillRecordBound_' + sessionId + '_sensitive'] = true;
+({sessionId, enabled}) => {
+  const boundKey = '__skillRecordBound_' + sessionId;
+  const sensitiveKey = boundKey + '_sensitive';
+  const state = window[boundKey + '_state'];
+  window[sensitiveKey] = Boolean(enabled);
+  if (!state) return;
+  state.blocked = Boolean(enabled);
+  if (enabled) state.revoke();
+  else state.install();
 }
 """
 
@@ -137,25 +183,86 @@ class RecordSession:
     page: SkillPage
     steps: list[StepRecord] = field(default_factory=list)
     _last_ts: float = field(default_factory=time.monotonic, repr=False)
+    _event_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    _drain_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    _pending_events: int = field(default=0, init=False, repr=False)
+    _listener_installed: bool = field(default=False, init=False, repr=False)
+    _listener_revoked: bool = field(default=False, init=False, repr=False)
+    _pending_events_drained: bool = field(default=True, init=False, repr=False)
+    _document_generation: int = field(default=0, init=False, repr=False)
+    _main_frame: Any = field(default=None, init=False, repr=False)
     stopped: bool = False
     sensitive: bool = False
+    _trace: dict[str, Any] | None = field(default=None, init=False, repr=False)
+    def _raw_page(self) -> Any:
+        return getattr(self.page, "page", self.page)
+
+    def _frames(self) -> list[Any]:
+        frames = getattr(self._raw_page(), "frames", None)
+        if callable(frames):
+            frames = frames()
+        if frames:
+            return list(frames)
+        return [self._raw_page()]
+
+    async def _evaluate_frame(self, frame: Any, script: str, value: Any) -> None:
+        evaluator = getattr(frame, "evaluate", None)
+        if not callable(evaluator):
+            raise RuntimeError("record page cannot evaluate capture lifecycle")
+        result = evaluator(script, value)
+        if hasattr(result, "__await__"):
+            await result
+
+    async def _set_page_capture_state(self, enabled: bool) -> None:
+        # Keep the flag in every future document; add_init_script is the only
+        # reliable way to carry sensitive mode across cross-origin navigation.
+        raw_page = self._raw_page()
+        add_init_script = getattr(raw_page, "add_init_script", None)
+        if not callable(add_init_script):
+            raise RuntimeError("record page cannot install capture lifecycle")
+        state = (
+            f'({SENSITIVE_JS})({{"sessionId": {self.session_id!r}, '
+            f'"enabled": {"true" if enabled else "false"}}})'
+        )
+        result = add_init_script(state)
+        if hasattr(result, "__await__"):
+            await result
+        for frame in self._frames():
+            await self._evaluate_frame(
+                frame,
+                SENSITIVE_JS,
+                {"sessionId": self.session_id, "enabled": enabled},
+            )
+
+    async def _drain_events(self) -> None:
+        if self._pending_events:
+            self._drain_event.clear()
+            await self._drain_event.wait()
+        self._pending_events_drained = True
 
     async def start(self) -> None:
-        """Wire the capture binding + listener onto the live page.
+        """Wire the capture binding and listener onto every live frame."""
+        raw_page = self._raw_page()
+        await raw_page.expose_binding("__record_event", self._on_event)
+        add_init_script = getattr(raw_page, "add_init_script", None)
+        if not callable(add_init_script):
+            raise RuntimeError("record page cannot install capture lifecycle")
+        await add_init_script(f"({CAPTURE_JS})({self.session_id!r})")
+        frames = self._frames()
+        for frame in frames:
+            await self._evaluate_frame(frame, CAPTURE_JS, self.session_id)
+        self._main_frame = getattr(raw_page, "main_frame", None)
+        self._listener_installed = True
+        self._listener_revoked = False
+        self._pending_events_drained = True
+        raw_page.on("framenavigated", self._on_navigate)
 
-        ``expose_binding`` (Playwright-native) persists across navigations on
-        its own; ``add_init_script`` re-runs :data:`CAPTURE_JS` on every new
-        document automatically, so a human navigating mid-demo keeps being
-        captured with no manual re-injection. The *current* already-loaded
-        document predates both, so it gets one manual injection too.
-        """
-        await self.page.page.expose_binding("__record_event", self._on_event)
-        # `add_init_script` only takes raw JS source (no separate-arg form like
-        # `evaluate`), so the session id is inlined as a JS string literal here
-        # (safe — `session_id` is a `uuid.uuid4().hex`, pure alphanumeric).
-        await self.page.page.add_init_script(f"({CAPTURE_JS})({self.session_id!r})")
-        await self.page.page.evaluate(CAPTURE_JS, self.session_id)
-        self.page.page.on("framenavigated", self._on_navigate)
+    def binding_identity(self) -> tuple[Any, Any, int, Any]:
+        """Return page/frame/document identity without trusting payload fields."""
+        raw_page = self._raw_page()
+        frame = self._main_frame or getattr(raw_page, "main_frame", None)
+        reported_document = getattr(self, "document_id", None)
+        return raw_page, frame, self._document_generation, reported_document
 
     def _append(self, *, verb: str, args: dict[str, Any], target: Any) -> None:
         now = time.monotonic()
@@ -175,53 +282,95 @@ class RecordSession:
     def _on_navigate(self, frame: Any) -> None:
         # Playwright's `on("framenavigated")` handler is sync; only the main
         # frame counts as a step (iframe navigations are noise for this v1).
-        if frame is not self.page.page.main_frame:
+        raw_page = self._raw_page()
+        main_frame = getattr(raw_page, "main_frame", None)
+        if frame is not main_frame:
             return
+        self._document_generation += 1
         if self.sensitive or self.stopped:
             return
         self._append(verb="navigate", args={"url": frame.url}, target=frame.url)
 
     async def _on_event(self, source: dict[str, Any], payload: dict[str, Any]) -> None:
         """`page.expose_binding` callback — one call per captured DOM event."""
-        if self.sensitive or self.stopped:
-            return
-        verb = payload.get("verb")
-        name = payload.get("name") or ""
-        role = payload.get("role") or ""
-        if verb == "click":
-            args: dict[str, Any] = {"name": name, "role": role}
-        elif verb == "type":
-            args = {"name": name, "role": role, "text": payload.get("value", "")}
-        elif verb == "select":
-            args = {"name": name, "role": role, "value": payload.get("value", "")}
-        elif verb == "submit":
-            args = {"name": name}
-        else:  # pragma: no cover - CAPTURE_JS never emits anything else
-            return
-        self._append(verb=verb, args=args, target=name)
+        self._pending_events += 1
+        self._pending_events_drained = False
+        self._drain_event.clear()
+        try:
+            async with self._event_lock:
+                if self.sensitive or self.stopped or self._listener_revoked:
+                    return
+                verb = payload.get("verb")
+                name = payload.get("name") or ""
+                role = payload.get("role") or ""
+                if verb == "click":
+                    args: dict[str, Any] = {"name": name, "role": role}
+                elif verb == "type":
+                    args = {"name": name, "role": role, "text": payload.get("value", "")}
+                elif verb == "select":
+                    args = {"name": name, "role": role, "value": payload.get("value", "")}
+                elif verb == "submit":
+                    args = {"name": name}
+                else:  # pragma: no cover - CAPTURE_JS never emits anything else
+                    return
+                self._append(verb=verb, args=args, target=name)
+        finally:
+            self._pending_events -= 1
+            if self._pending_events == 0:
+                self._pending_events_drained = True
+                self._drain_event.set()
+
+    async def stop_common_listener(self) -> None:
+        await self.set_sensitive(True)
+
+    async def restore_common_listener(self) -> None:
+        await self.set_sensitive(False)
+
+    async def drain_pending_events(self) -> bool:
+        await self._drain_events()
+        return self._pending_events == 0
+
+    def is_common_listener_installed(self) -> bool:
+        return self._listener_installed
+
+    def is_common_listener_revoked(self) -> bool:
+        return self._listener_revoked
+
+    def has_pending_events(self) -> bool:
+        return self._pending_events != 0
 
     async def set_sensitive(self, enabled: bool = True) -> bool:
-        """Disable the page listener before a sensitive portal handoff."""
-        if self.stopped and enabled:
-            raise RuntimeError("stopped recording cannot enter sensitive mode")
-        if enabled:
-            evaluator = getattr(self.page.page, "evaluate", None)
-            if not callable(evaluator):
-                raise RuntimeError("record page cannot disable its capture listener")
-            await evaluator(SENSITIVE_JS, self.session_id)
-        self.sensitive = enabled
+        """Revoke or restore the real capture listeners and drain callbacks."""
+        if self.stopped:
+            raise RuntimeError("stopped recording cannot change sensitive mode")
+        async with self._event_lock:
+            await self._set_page_capture_state(enabled)
+            self.sensitive = enabled
+            self._listener_installed = not enabled
+            self._listener_revoked = enabled
+        await self._drain_events()
         return True
 
-
     async def stop(self, *, status: str = "success", note: str | None = None) -> dict[str, Any]:
-        """Human marks the demo done — append a ``done`` step and assemble the
-        full ``journey_trace_v1`` (unchanged :func:`assemble_trace`, same shape
-        the execute leg produces). Does **not** persist a Skill row — the
-        caller reviews the returned trace first, then explicitly distills it
-        (mirrors the execute leg's propose→confirm philosophy: capture is
-        reversible/inspectable before it becomes a skill).
-        """
-        self.stopped = True
+        """Revoke capture, drain callbacks, and assemble the recorded trace."""
+        if self._trace is not None:
+            return self._trace
+        try:
+            if not self._listener_revoked:
+                try:
+                    await self.set_sensitive(True)
+                except RuntimeError:
+                    # Stopping a session must remain safe after page teardown.
+                    self.sensitive = True
+                    self._listener_installed = False
+                    self._listener_revoked = True
+            else:
+                await self._drain_events()
+        finally:
+            self.stopped = True
+            remove_listener = getattr(self._raw_page(), "remove_listener", None)
+            if callable(remove_listener):
+                remove_listener("framenavigated", self._on_navigate)
         self._append(
             verb="done",
             args={"status": status, "note": note},
@@ -231,7 +380,7 @@ class RecordSession:
         trace_id = f"record-{self.session_id}"
         outcome = outcome_from_loop("done_success" if status == "success" else "done_failed")
         outcome["trace_id"] = trace_id
-        return assemble_trace(
+        self._trace = assemble_trace(
             [s.to_dict() for s in self.steps],
             outcome,
             domain=self.domain,
@@ -239,6 +388,7 @@ class RecordSession:
             trace_id=trace_id,
             extra={"recorded": True, "step_count": len(self.steps)},
         )
+        return self._trace
 
 
 async def start_recording(cdp_endpoint: str, *, domain: str, capability: str) -> RecordSession:
