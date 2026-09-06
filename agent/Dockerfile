@@ -38,7 +38,7 @@ ARG CLOAKBROWSER_VERSION=0.5.10
 
 # Base system deps (always installed)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates git procps unzip \
+    curl ca-certificates git procps unzip util-linux \
     && curl -fsSL https://deb.nodesource.com/setup_26.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && if ! command -v npm >/dev/null 2>&1; then \

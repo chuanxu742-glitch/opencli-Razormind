@@ -143,9 +143,31 @@ if [ "$HAVE_CHROME" = "true" ]; then
     exit 1
   }
   echo "[agent] Browser engine: $BROWSER_ENGINE"
+  CHROME_SESSION_MODE=false
+  if command -v setsid >/dev/null 2>&1; then CHROME_SESSION_MODE=true; fi
   start_chrome() {
     verify_profile_ready
-    "$CHROME_BIN" --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --remote-allow-origins='*' --no-sandbox --disable-dev-shm-usage --no-first-run --no-default-browser-check --disable-session-crashed-bubble --disable-save-password-bubble --user-data-dir="$CHROME_PROFILE" --profile-directory=Default "${CHROME_EXTRA_FLAGS[@]}" --window-size=1280,900 "$@"
+    if [ "$CHROME_SESSION_MODE" = "true" ]; then
+      exec setsid "$CHROME_BIN" --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --remote-allow-origins='*' --no-sandbox --disable-dev-shm-usage --no-first-run --no-default-browser-check --disable-session-crashed-bubble --disable-save-password-bubble --user-data-dir="$CHROME_PROFILE" --profile-directory=Default "${CHROME_EXTRA_FLAGS[@]}" --window-size=1280,900 "$@"
+    else
+      exec "$CHROME_BIN" --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --remote-allow-origins='*' --no-sandbox --disable-dev-shm-usage --no-first-run --no-default-browser-check --disable-session-crashed-bubble --disable-save-password-bubble --user-data-dir="$CHROME_PROFILE" --profile-directory=Default "${CHROME_EXTRA_FLAGS[@]}" --window-size=1280,900 "$@"
+    fi
+  }
+  stop_chrome_tree() {
+    local pid="${1:-}"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+    if [ "$CHROME_SESSION_MODE" = "true" ]; then
+      kill -TERM -- "-$pid" 2>/dev/null || true
+      for _ in $(seq 1 40); do
+        kill -0 -- "-$pid" 2>/dev/null || break
+        sleep 0.1
+      done
+      kill -KILL -- "-$pid" 2>/dev/null || true
+    else
+      kill -TERM "$pid" 2>/dev/null || true
+      sleep 1
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
   }
   run_runtime_self_check() {
     for _ in $(seq 1 30); do
@@ -167,8 +189,11 @@ if [ "$HAVE_CHROME" = "true" ]; then
     return 1
   }
   (
+    trap 'stop_chrome_tree "${CHROME_PID:-}"; exit 143' TERM INT
+    trap 'stop_chrome_tree "${CHROME_PID:-}"' EXIT
     while true; do
       rm -f /tmp/browser-runtime-report.json
+      stop_chrome_tree "${CHROME_PID:-}"
       start_chrome "${STARTUP_PAGES[@]}" &
       CHROME_PID=$!
       run_runtime_self_check &

@@ -26,6 +26,7 @@ import tempfile
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -39,6 +40,9 @@ _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _POINTER_NAMES = {"current", "previous"}
 _SINGLETON_NAMES = {"SingletonLock", "SingletonCookie", "SingletonSocket"}
 _ALLOWED_SNAPSHOT_PASSWORD_STATES = {"not_present", "verified"}
+_PASSWORD_DATABASE_NAMES = {"Login Data", "Login Data For Account"}
+_PASSWORD_DATABASE_SIDECARS = {"Login Data-wal", "Login Data-shm", "Login Data-journal", "Login Data For Account-wal", "Login Data For Account-shm", "Login Data For Account-journal"}
+_MAX_PASSWORD_SCAN_ENTRIES = 100_000
 
 
 class BrowserRuntimeError(RuntimeError):
@@ -58,6 +62,11 @@ class PasswordInventory:
     status: str
     credential_count: int
     database_count: int
+    database_paths: tuple[str, ...] = ()
+    database_entries: tuple[dict[str, Any], ...] = ()
+    enumeration_complete: bool = True
+    directories_examined: int = 0
+    files_examined: int = 0
 
 
 @dataclass(frozen=True)
@@ -112,6 +121,14 @@ class ProfileRuntimePaths:
     @property
     def epoch_file(self) -> Path:
         return self.state_dir / "epoch.json"
+
+    @property
+    def epoch_lock_file(self) -> Path:
+        return self.state_dir / "epoch.lock"
+
+    @property
+    def snapshot_lock_file(self) -> Path:
+        return self.state_dir / "snapshot.lock"
 
     def read_state(self) -> dict[str, Any]:
         if not self.state_file.exists():
@@ -239,30 +256,86 @@ class EpochStore:
         self.paths.ensure()
         self._lock = threading.Lock()
 
+    @contextmanager
+    def _critical_section(self) -> Iterable[None]:
+        # The thread lock protects callers in one process; the durable lock
+        # protects separate workers sharing this profile state directory.
+        with self._lock:
+            with _exclusive_file_lock(self.paths.epoch_lock_file):
+                yield
+
     def _read(self) -> dict[str, Any]:
+        if self.paths.epoch_file.is_symlink():
+            raise BrowserRuntimeError("epoch_state_invalid", "epoch state path is a symlink")
         if not self.paths.epoch_file.exists():
             return {"max_epoch": 0, "boot_id": None}
         try:
             value = json.loads(self.paths.epoch_file.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             raise BrowserRuntimeError("epoch_state_corrupt", "epoch state cannot be read") from exc
-        if not isinstance(value, dict) or not isinstance(value.get("max_epoch"), int):
+        if not isinstance(value, dict) or type(value.get("max_epoch")) is not int:
             raise BrowserRuntimeError("epoch_state_corrupt", "epoch state shape is invalid")
         return value
 
+    @staticmethod
+    def _deadline(value: Any) -> datetime | None:
+        if value in (None, ""):
+            return None
+        if not isinstance(value, str):
+            raise BrowserRuntimeError("epoch_state_corrupt", "lease deadline is invalid")
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError as exc:
+            raise BrowserRuntimeError("epoch_state_corrupt", "lease deadline is invalid") from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise BrowserRuntimeError("epoch_state_corrupt", "lease deadline is invalid")
+        return parsed
+
+    @staticmethod
+    def _lease_payload(
+        *,
+        max_epoch: int,
+        boot_id: str | None,
+        owner_id: str | None = None,
+        node_id: str | None = None,
+        lease_expires_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        if owner_id is not None:
+            _validate_id(owner_id, "owner_id")
+        if node_id is not None:
+            _validate_id(node_id, "node_id")
+        if lease_expires_at is not None:
+            if lease_expires_at.tzinfo is None or lease_expires_at.utcoffset() is None:
+                raise BrowserRuntimeError("lease_deadline_invalid", "lease deadline must include a timezone")
+            if owner_id is None:
+                raise BrowserRuntimeError("lease_owner_invalid", "lease owner is required for a deadline")
+        return {
+            "max_epoch": int(max_epoch),
+            "boot_id": boot_id,
+            "owner_id": owner_id,
+            "node_id": node_id,
+            "lease_expires_at": lease_expires_at.isoformat() if lease_expires_at is not None else None,
+            "updated_at": _now().isoformat(),
+        }
+
     def begin_boot(self, boot_id: str | None = None) -> str:
-        with self._lock:
+        with self._critical_section():
             value = self._read()
             current_boot = boot_id or uuid.uuid4().hex
             _validate_id(current_boot, "boot_id")
-            _atomic_write_json(
-                self.paths.epoch_file,
-                {"max_epoch": max(0, int(value["max_epoch"])), "boot_id": current_boot, "updated_at": _now().isoformat()},
-            )
+            _atomic_write_json(self.paths.epoch_file, self._lease_payload(max_epoch=max(0, int(value["max_epoch"])), boot_id=current_boot))
             return current_boot
 
-    def allocate(self, requested_epoch: int | None = None, *, boot_id: str | None = None) -> int:
-        with self._lock:
+    def allocate(
+        self,
+        requested_epoch: int | None = None,
+        *,
+        boot_id: str | None = None,
+        owner_id: str | None = None,
+        node_id: str | None = None,
+        lease_expires_at: datetime | None = None,
+    ) -> int:
+        with self._critical_section():
             value = self._read()
             if boot_id is not None and value.get("boot_id") != boot_id:
                 raise BrowserRuntimeError("stale_boot", "boot generation is no longer current")
@@ -274,14 +347,68 @@ class EpochStore:
                 raise BrowserRuntimeError("epoch_invalid", "epoch must be non-negative")
             _atomic_write_json(
                 self.paths.epoch_file,
-                {"max_epoch": next_epoch, "boot_id": value.get("boot_id"), "updated_at": _now().isoformat()},
+                self._lease_payload(
+                    max_epoch=next_epoch,
+                    boot_id=value.get("boot_id"),
+                    owner_id=owner_id,
+                    node_id=node_id,
+                    lease_expires_at=lease_expires_at,
+                ),
             )
             return next_epoch
 
-    def assert_current(self, *, epoch: int, boot_id: str) -> None:
-        value = self._read()
-        if value.get("boot_id") != boot_id or int(value.get("max_epoch", -1)) != epoch:
-            raise BrowserRuntimeError("stale_epoch", "epoch or boot generation is no longer current")
+    def assert_current(self, *, epoch: int, boot_id: str, owner_id: str | None = None) -> None:
+        with self._critical_section():
+            value = self._read()
+            if value.get("boot_id") != boot_id or int(value.get("max_epoch", -1)) != epoch:
+                raise BrowserRuntimeError("stale_epoch", "epoch or boot generation is no longer current")
+            if owner_id is not None and value.get("owner_id") != owner_id:
+                raise BrowserRuntimeError("stale_owner", "lease owner is no longer current")
+
+    def renew(self, lease: EpochLease, *, expires_at: datetime) -> EpochLease:
+        """Atomically renew one exact lease; stale renewers cannot overwrite it."""
+
+        if expires_at.tzinfo is None or expires_at.utcoffset() is None:
+            raise BrowserRuntimeError("lease_deadline_invalid", "lease deadline must include a timezone")
+        with self._critical_section():
+            value = self._read()
+            persisted_deadline = self._deadline(value.get("lease_expires_at"))
+            if (
+                value.get("boot_id") != lease.boot_id
+                or int(value.get("max_epoch", -1)) != lease.epoch
+                or value.get("owner_id") != lease.owner_id
+                or (value.get("node_id") not in (None, lease.node_id))
+                or persisted_deadline != lease.expires_at
+            ):
+                raise BrowserRuntimeError("stale_lease", "lease generation or owner is no longer current")
+            lease.assert_valid()
+            if persisted_deadline is not None and expires_at <= persisted_deadline:
+                raise BrowserRuntimeError("lease_deadline_invalid", "renewal deadline must advance")
+            _atomic_write_json(
+                self.paths.epoch_file,
+                self._lease_payload(
+                    max_epoch=lease.epoch,
+                    boot_id=lease.boot_id,
+                    owner_id=lease.owner_id,
+                    node_id=lease.node_id,
+                    lease_expires_at=expires_at,
+                ),
+            )
+            return EpochLease(lease.node_id, lease.boot_id, lease.epoch, expires_at, lease.owner_id)
+
+    def assert_lease_current(self, lease: EpochLease, *, now: datetime | None = None) -> None:
+        lease.assert_valid(now)
+        with self._critical_section():
+            value = self._read()
+            persisted_deadline = self._deadline(value.get("lease_expires_at"))
+            if (
+                value.get("boot_id") != lease.boot_id
+                or int(value.get("max_epoch", -1)) != lease.epoch
+                or value.get("owner_id") != lease.owner_id
+                or (value.get("node_id") not in (None, lease.node_id))
+                or persisted_deadline != lease.expires_at
+            ):
+                raise BrowserRuntimeError("stale_lease", "lease generation or owner is no longer current")
 
 
 @dataclass(frozen=True)
@@ -389,6 +516,19 @@ def spawn_isolated_process(
         raise BrowserRuntimeError("process_start_failed", "runtime process could not start") from exc
 
 
+@dataclass(frozen=True)
+class ShutdownEvidence:
+    """Metadata proving that registered process groups were observed stopped."""
+
+    requested_pids: tuple[int, ...]
+    orphaned_pids: tuple[int, ...]
+    stopped_pids: tuple[int, ...]
+    forced: bool
+    confirmed: bool
+    completed_at: str
+    descendant_pids: tuple[int, ...] = ()
+
+
 class ProcessTreeSupervisor:
     """Stops every registered child before a lease can be released."""
 
@@ -396,6 +536,7 @@ class ProcessTreeSupervisor:
         self._processes: list[Any] = list(processes)
         self._lock = threading.Lock()
         self._stopping = False
+        self._last_shutdown: ShutdownEvidence | None = None
 
     def register(self, process: Any) -> None:
         with self._lock:
@@ -414,12 +555,48 @@ class ProcessTreeSupervisor:
     @property
     def stopped(self) -> bool:
         with self._lock:
-            return all(self._returncode(process) is not None for process in self._processes)
+            return all(not self._tree_alive(process) for process in self._processes)
+
+    @property
+    def last_shutdown(self) -> ShutdownEvidence | None:
+        with self._lock:
+            return self._last_shutdown
 
     @staticmethod
     def _pid(process: Any) -> int | None:
         value = getattr(process, "pid", None)
         return value if isinstance(value, int) and value > 0 else None
+
+    @classmethod
+    def _tree_alive(cls, process: Any) -> bool:
+        pid = cls._pid(process)
+        if pid is None:
+            return cls._returncode(process) is None
+        if os.name == "nt":
+            # ``poll`` only observes the registered parent.  A descendant can
+            # outlive it, so inspect parent PID links before deciding the tree
+            # is gone; this is the orphan case taskkill /PID /T cannot detect
+            # after the root exits.
+            if cls._returncode(process) is None:
+                return True
+            if _windows_descendant_pids(pid):
+                return True
+            try:
+                result = subprocess.run(
+                    ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                )
+                return result.returncode == 0 and str(pid) in result.stdout
+            except OSError:
+                return False
+        try:
+            os.killpg(pid, 0)
+            return True
+        except (OSError, ProcessLookupError):
+            return cls._returncode(process) is None
 
     @classmethod
     def _send_signal(cls, process: Any, sig: int) -> None:
@@ -439,6 +616,14 @@ class ProcessTreeSupervisor:
             return
         try:
             if os.name == "nt":
+                descendants = _windows_descendant_pids(pid)
+                for descendant in descendants:
+                    subprocess.run(
+                        ["taskkill", "/PID", str(descendant), "/T", "/F"],
+                        check=False,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
                 subprocess.run(
                     ["taskkill", "/PID", str(pid), "/T", "/F"],
                     check=False,
@@ -460,37 +645,70 @@ class ProcessTreeSupervisor:
             self._stopping = True
             processes = list(self._processes)
         kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+        requested_pids = tuple(pid for pid in (self._pid(p) for p in processes) if pid is not None)
+        descendant_pids = tuple(sorted({child for pid in requested_pids for child in _windows_descendant_pids(pid)}))
+        orphaned_pids = tuple(pid for process, pid in ((p, self._pid(p)) for p in processes) if pid is not None and self._returncode(process) is not None and self._tree_alive(process))
         for process in processes:
-            if self._returncode(process) is None:
+            if self._pid(process) is not None or self._returncode(process) is None:
                 self._send_signal(process, signal.SIGTERM)
         deadline = time.monotonic() + max(0.0, grace_seconds)
-        while time.monotonic() < deadline and not all(self._returncode(p) is not None for p in processes):
+        while time.monotonic() < deadline and not all(not self._tree_alive(p) for p in processes):
             time.sleep(0.05)
+        forced = any(self._tree_alive(process) for process in processes)
         for process in processes:
-            if self._returncode(process) is None:
+            if self._tree_alive(process):
                 self._send_signal(process, kill_signal)
         deadline = time.monotonic() + max(1.0, grace_seconds)
-        while time.monotonic() < deadline and not all(self._returncode(p) is not None for p in processes):
+        while time.monotonic() < deadline and not all(not self._tree_alive(p) for p in processes):
             time.sleep(0.05)
-        return all(self._returncode(process) is not None for process in processes)
+        confirmed = all(not self._tree_alive(process) for process in processes)
+        evidence = ShutdownEvidence(
+            requested_pids=requested_pids,
+            orphaned_pids=orphaned_pids,
+            stopped_pids=tuple(pid for pid in requested_pids if not any(self._pid(p) == pid and self._tree_alive(p) for p in processes)),
+            forced=forced,
+            confirmed=confirmed,
+            completed_at=_now().isoformat(),
+            descendant_pids=descendant_pids,
+        )
+        with self._lock:
+            self._last_shutdown = evidence
+        return confirmed
+
     async def stop_async(self, *, grace_seconds: float = 10.0) -> bool:
         with self._lock:
             self._stopping = True
             processes = list(self._processes)
         kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+        requested_pids = tuple(pid for pid in (self._pid(p) for p in processes) if pid is not None)
+        descendant_pids = tuple(sorted({child for pid in requested_pids for child in _windows_descendant_pids(pid)}))
+        orphaned_pids = tuple(pid for process, pid in ((p, self._pid(p)) for p in processes) if pid is not None and self._returncode(process) is not None and self._tree_alive(process))
         for process in processes:
-            if self._returncode(process) is None:
+            if self._pid(process) is not None or self._returncode(process) is None:
                 self._send_signal(process, signal.SIGTERM)
         deadline = asyncio.get_running_loop().time() + max(0.0, grace_seconds)
-        while asyncio.get_running_loop().time() < deadline and not all(self._returncode(p) is not None for p in processes):
+        while asyncio.get_running_loop().time() < deadline and not all(not self._tree_alive(p) for p in processes):
             await asyncio.sleep(0.05)
+        forced = any(self._tree_alive(process) for process in processes)
         for process in processes:
-            if self._returncode(process) is None:
+            if self._tree_alive(process):
                 self._send_signal(process, kill_signal)
         deadline = asyncio.get_running_loop().time() + max(1.0, grace_seconds)
-        while asyncio.get_running_loop().time() < deadline and not all(self._returncode(p) is not None for p in processes):
+        while asyncio.get_running_loop().time() < deadline and not all(not self._tree_alive(p) for p in processes):
             await asyncio.sleep(0.05)
-        return all(self._returncode(process) is not None for process in processes)
+        confirmed = all(not self._tree_alive(process) for process in processes)
+        evidence = ShutdownEvidence(
+            requested_pids=requested_pids,
+            orphaned_pids=orphaned_pids,
+            stopped_pids=tuple(pid for pid in requested_pids if not any(self._pid(p) == pid and self._tree_alive(p) for p in processes)),
+            forced=forced,
+            confirmed=confirmed,
+            completed_at=_now().isoformat(),
+            descendant_pids=descendant_pids,
+        )
+        with self._lock:
+            self._last_shutdown = evidence
+        return confirmed
 
 
 class LeaseSupervisor:
@@ -525,6 +743,10 @@ class LeaseSupervisor:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=max(0.0, timeout))
+
+    @property
+    def shutdown_evidence(self) -> ShutdownEvidence | None:
+        return self.process_supervisor.last_shutdown
 
     def _run(self) -> None:
         while not self._stop.wait(self.poll_seconds):
@@ -570,22 +792,29 @@ def verify_password_manager_policy(policy_path: str | os.PathLike[str] | None = 
 
 
 def inspect_password_inventory(profile_dir: str | os.PathLike[str]) -> PasswordInventory:
-    """Count credential rows without decrypting or selecting secret values."""
+    """Count credential rows with a complete, bounded store enumeration.
+
+    Only allowlisted Chromium password-store filenames are opened.  The
+    enumeration records every matching database and sidecar path so a
+    snapshot manifest can authorize the exact set rather than silently
+    dropping a nested or account-specific ``Login Data`` store.
+    """
 
     profile = Path(profile_dir)
     if not profile.is_absolute() or profile == Path("/") or profile.is_symlink() or not profile.is_dir():
         raise BrowserRuntimeError("profile_path_invalid", "profile path is invalid")
-    try:
-        databases = sorted(path for path in profile.glob("**/Login Data") if path.is_file() and not path.is_symlink())
-    except OSError as exc:
-        raise BrowserRuntimeError("password_inventory_blocked", "password metadata cannot be enumerated") from exc
-    if not databases:
-        return PasswordInventory("not_present", 0, 0)
+    stores, directories_examined, files_examined = _enumerate_password_store_paths(profile)
+    databases = [path for path in stores if path.name in _PASSWORD_DATABASE_NAMES]
     total = 0
     unknown_databases = 0
+    credential_counts: dict[Path, int] = {}
     for database in databases:
         safe_path = quote(str(database), safe="/\\:")
-        uri = f"file:{safe_path}?mode=ro"
+        # ``immutable=1`` guarantees SQLite cannot create a -shm sidecar while
+        # inventorying a stopped profile.  A pre-existing WAL/SHM is still
+        # enumerated below and makes the inventory unknown, so it cannot be
+        # mistaken for a complete checkpoint.
+        uri = f"file:{safe_path}?mode=ro&immutable=1"
         connection: sqlite3.Connection | None = None
         try:
             connection = sqlite3.connect(uri, uri=True)
@@ -600,7 +829,9 @@ def inspect_password_inventory(profile_dir: str | os.PathLike[str]) -> PasswordI
                 # password columns: even encrypted values must not leave the
                 # browser's credential database through this path.
                 row = connection.execute("SELECT COUNT(*) FROM logins").fetchone()
-                total += int(row[0] if row else 0)
+                count = int(row[0] if row else 0)
+                credential_counts[database] = count
+                total += count
             finally:
                 connection.close()
                 connection = None
@@ -608,9 +839,30 @@ def inspect_password_inventory(profile_dir: str | os.PathLike[str]) -> PasswordI
             if connection is not None:
                 connection.close()
             raise BrowserRuntimeError("password_inventory_blocked", "password metadata cannot be verified") from exc
-    if unknown_databases:
-        return PasswordInventory("unknown", total, len(databases))
-    return PasswordInventory("present" if total else "not_present", total, len(databases))
+    entries = tuple(
+        {
+            "path": path.relative_to(profile).as_posix(),
+            "role": "database" if path.name in _PASSWORD_DATABASE_NAMES else "sidecar",
+            "credential_count": credential_counts.get(path, 0),
+        }
+        for path in stores
+    )
+    if unknown_databases or any(path.name not in _PASSWORD_DATABASE_NAMES for path in stores):
+        status = "unknown"
+    else:
+        status = "present" if total else "not_present"
+    # A database count is deliberately limited to primary stores; sidecars are
+    # still included in ``database_paths`` and manifest metadata.
+    return PasswordInventory(
+        status,
+        total,
+        len(databases),
+        tuple(path.relative_to(profile).as_posix() for path in stores),
+        entries,
+        True,
+        directories_examined,
+        files_examined,
+    )
 
 
 def snapshot_profile(
@@ -663,6 +915,11 @@ def snapshot_profile(
             destination.parent.mkdir(parents=True, exist_ok=True)
             size, digest = _copy_and_hash(source, destination)
             checksums.append({"path": relative, "bytes": size, "sha256": digest})
+        # A browser can create Login Data (or its WAL/SHM sidecars) while the
+        # copy is in flight.  Require the exact pre/post inventory to match so
+        # the manifest never authorizes a partial or unlisted password store.
+        post_inventory = inspect_password_inventory(paths.profile_dir)
+        _assert_password_inventory_stable(inventory, post_inventory)
         checksums_payload = json.dumps(checksums, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         checksums_ref = "checksums.json"
         _atomic_write_bytes(staging / checksums_ref, checksums_payload)
@@ -686,29 +943,45 @@ def snapshot_profile(
             "committed_at": committed_at.isoformat(),
             "password_inventory_status": inventory.status,
             "password_credential_count": inventory.credential_count,
+            "password_databases": [dict(entry) for entry in inventory.database_entries],
+            "password_inventory": {
+                "enumeration_complete": inventory.enumeration_complete,
+                "directories_examined": inventory.directories_examined,
+                "files_examined": inventory.files_examined,
+                "database_count": inventory.database_count,
+                "database_paths": list(inventory.database_paths),
+            },
         }
         manifest_payload = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
         _atomic_write_bytes(staging / "manifest.json", manifest_payload)
         _atomic_write_bytes(staging / "complete.marker", f"sha256:{checksum_digest}\n".encode("ascii"))
         _fsync_tree(staging)
-        previous = _read_pointer(paths.snapshots_dir / "current")
-        previous_dir = paths.snapshots_dir / previous if previous is not None else None
-        if previous is not None and (
-            previous in _POINTER_NAMES
-            or not re.fullmatch(r"v[1-9][0-9]*", previous)
-            or previous_dir is None
-            or previous_dir.is_symlink()
-            or not previous_dir.is_dir()
-        ):
-            raise BrowserRuntimeError("profile_manifest_invalid", "current snapshot pointer is invalid")
-        final_dir = paths.snapshots_dir / f"v{version}"
-        os.replace(staging, final_dir)
-        if previous:
-            _atomic_write_text(paths.snapshots_dir / "previous", previous)
-        _atomic_write_text(paths.snapshots_dir / "current", final_dir.name)
-        _fsync_directory(paths.snapshots_dir)
-        paths.write_state("stopped", manifest_ref=f"snapshots/{final_dir.name}/manifest.json")
-        return manifest
+        # Serialize the final version/pointer decision.  Two stopped writers
+        # may copy concurrently, but only one can claim each deterministic
+        # version and advance current; the loser receives a fresh version.
+        with _exclusive_file_lock(paths.snapshot_lock_file):
+            version = _next_snapshot_version(paths.snapshots_dir)
+            manifest["version"] = version
+            _atomic_write_bytes(staging / "manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"))
+            _fsync_tree(staging)
+            previous = _read_pointer(paths.snapshots_dir / "current")
+            previous_dir = paths.snapshots_dir / previous if previous is not None else None
+            if previous is not None and (
+                previous in _POINTER_NAMES
+                or not re.fullmatch(r"v[1-9][0-9]*", previous)
+                or previous_dir is None
+                or previous_dir.is_symlink()
+                or not previous_dir.is_dir()
+            ):
+                raise BrowserRuntimeError("profile_manifest_invalid", "current snapshot pointer is invalid")
+            final_dir = paths.snapshots_dir / f"v{version}"
+            os.replace(staging, final_dir)
+            if previous:
+                _atomic_write_text(paths.snapshots_dir / "previous", previous)
+            _atomic_write_text(paths.snapshots_dir / "current", final_dir.name)
+            _fsync_directory(paths.snapshots_dir)
+            paths.write_state("stopped", manifest_ref=f"snapshots/{final_dir.name}/manifest.json")
+            return manifest
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
         raise
@@ -721,6 +994,10 @@ def validate_current_snapshot(
     expected_account_id: str | None = None,
     expected_profile_id: str | None = None,
     expected_node_id: str | None = None,
+    snapshot_version: int | None = None,
+    expected_runtime_version: str = _RUNTIME_VERSION,
+    expected_bundle: str | None = None,
+    expected_browser_version: str | None = None,
 ) -> tuple[dict[str, Any], Path]:
     """Validate the current manifest, marker and every copied file.
 
@@ -730,15 +1007,8 @@ def validate_current_snapshot(
     """
 
     paths.ensure()
-    pointer = _read_pointer(paths.snapshots_dir / "current")
-    if pointer is None:
-        raise BrowserRuntimeError("profile_missing", "no committed profile snapshot exists")
-    if pointer in _POINTER_NAMES or not re.fullmatch(r"v[1-9][0-9]*", pointer):
-        raise BrowserRuntimeError("profile_manifest_invalid", "snapshot pointer is invalid")
-    snapshot_dir = (paths.snapshots_dir / pointer).resolve()
     root = paths.snapshots_dir.resolve()
-    if snapshot_dir.parent != root or not snapshot_dir.is_dir():
-        raise BrowserRuntimeError("profile_manifest_invalid", "snapshot path escapes snapshot root")
+    snapshot_dir = _select_snapshot_dir(root, snapshot_version=snapshot_version)
     try:
         manifest = json.loads((snapshot_dir / "manifest.json").read_text(encoding="utf-8"))
         checksums = json.loads((snapshot_dir / "checksums.json").read_text(encoding="utf-8"))
@@ -747,8 +1017,8 @@ def validate_current_snapshot(
         raise BrowserRuntimeError("profile_manifest_invalid", "snapshot metadata is incomplete") from exc
     if not isinstance(manifest, dict) or not isinstance(checksums, list) or not marker.startswith("sha256:"):
         raise BrowserRuntimeError("profile_manifest_invalid", "snapshot metadata shape is invalid")
-    if manifest.get("runtime_version") != _RUNTIME_VERSION:
-        raise BrowserRuntimeError("profile_manifest_invalid", "snapshot runtime version is incompatible")
+    if manifest.get("runtime_version") != expected_runtime_version or expected_runtime_version != _RUNTIME_VERSION:
+        raise BrowserRuntimeError("profile_manifest_incompatible", "snapshot runtime version is incompatible")
     expected_identity = {
         "workspace_id": expected_workspace_id,
         "account_id": expected_account_id,
@@ -758,6 +1028,10 @@ def validate_current_snapshot(
     for field, expected in expected_identity.items():
         if expected is not None and manifest.get(field) != expected:
             raise BrowserRuntimeError("profile_identity_mismatch", "snapshot identity does not match account")
+    if expected_bundle is not None and manifest.get("bundle") != expected_bundle:
+        raise BrowserRuntimeError("profile_manifest_incompatible", "snapshot bundle is incompatible")
+    if expected_browser_version is not None and manifest.get("browser_version") != expected_browser_version:
+        raise BrowserRuntimeError("profile_manifest_incompatible", "snapshot browser version is incompatible")
     checksums_payload = json.dumps(checksums, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     if marker != f"sha256:{hashlib.sha256(checksums_payload).hexdigest()}":
         raise BrowserRuntimeError("profile_manifest_invalid", "snapshot marker does not match checksums")
@@ -780,6 +1054,8 @@ def validate_current_snapshot(
         total_bytes += size
     if total_bytes != manifest.get("total_bytes") or len(checksums) != manifest.get("files_count"):
         raise BrowserRuntimeError("profile_manifest_invalid", "snapshot totals do not match")
+    snapshot_inventory = inspect_password_inventory(data_dir)
+    _validate_manifest_password_inventory(manifest, snapshot_inventory)
     return manifest, snapshot_dir
 
 
@@ -791,6 +1067,10 @@ def restore_current_snapshot(
     expected_account_id: str | None = None,
     expected_profile_id: str | None = None,
     expected_node_id: str | None = None,
+    snapshot_version: int | None = None,
+    expected_runtime_version: str = _RUNTIME_VERSION,
+    expected_bundle: str | None = None,
+    expected_browser_version: str | None = None,
 ) -> dict[str, Any] | None:
     """Restore only a complete committed snapshot; preserve dirty evidence."""
 
@@ -806,6 +1086,10 @@ def restore_current_snapshot(
             expected_account_id=expected_account_id,
             expected_profile_id=expected_profile_id,
             expected_node_id=expected_node_id,
+            snapshot_version=snapshot_version,
+            expected_runtime_version=expected_runtime_version,
+            expected_bundle=expected_bundle,
+            expected_browser_version=expected_browser_version,
         )
     except BrowserRuntimeError as exc:
         if allow_empty and exc.code == "profile_missing" and not any(paths.profile_dir.iterdir()):
@@ -838,6 +1122,119 @@ def restore_current_snapshot(
 def _validate_id(value: str, field: str, *, max_length: int = 128) -> None:
     if not isinstance(value, str) or not value or len(value) > max_length or not _SAFE_COMPONENT.fullmatch(value):
         raise BrowserRuntimeError("identifier_invalid", f"{field} is invalid")
+
+
+def _windows_descendant_pids(root_pid: int) -> tuple[int, ...]:
+    """Return live descendants using the Windows process parent table."""
+
+    # This helper is intentionally stdlib-only; unlike a shell query it works
+    # after the registered parent has exited and keeps process names/commands
+    # out of runtime evidence.
+    if os.name != "nt":
+        return ()
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class ProcessEntry32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", wintypes.LONG),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry32W)]
+        kernel32.Process32FirstW.restype = wintypes.BOOL
+        kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry32W)]
+        kernel32.Process32NextW.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+        invalid_handle = ctypes.c_void_p(-1).value
+        if snapshot == invalid_handle:
+            return ()
+        try:
+            entry = ProcessEntry32W()
+            entry.dwSize = ctypes.sizeof(entry)
+            parent_by_pid: dict[int, int] = {}
+            first = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+            while first:
+                parent_by_pid[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
+                first = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+            descendants: list[int] = []
+            frontier = [root_pid]
+            visited: set[int] = set()
+            while frontier:
+                parent = frontier.pop()
+                if parent in visited:
+                    continue
+                visited.add(parent)
+                children = [pid for pid, parent_id in parent_by_pid.items() if parent_id == parent]
+                descendants.extend(children)
+                frontier.extend(children)
+            return tuple(sorted(set(descendants)))
+        finally:
+            kernel32.CloseHandle(snapshot)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return ()
+
+
+@contextmanager
+def _exclusive_file_lock(path: Path) -> Iterable[None]:
+    """Hold a small process-shared lock without changing global git/runtime config."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise BrowserRuntimeError("epoch_lock_unavailable", "epoch fencing lock path is a symlink")
+    try:
+        handle = path.open("a+b")
+    except OSError as exc:
+        raise BrowserRuntimeError("epoch_lock_unavailable", "epoch fencing lock cannot be opened") from exc
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            except OSError as exc:
+                raise BrowserRuntimeError("epoch_lock_unavailable", "epoch fencing lock cannot be acquired") from exc
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            except OSError as exc:
+                raise BrowserRuntimeError("epoch_lock_unavailable", "epoch fencing lock cannot be acquired") from exc
+        yield
+    finally:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        handle.close()
 
 
 def _validate_metadata_string(value: str, field: str) -> None:
@@ -966,6 +1363,94 @@ def _iter_profile_files(root: Path) -> Iterable[Path]:
         yield path
 
 
+def _enumerate_password_store_paths(root: Path) -> tuple[list[Path], int, int]:
+    """Enumerate password stores without unbounded globbing or symlink skips."""
+
+    stores: list[Path] = []
+    directories_examined = 0
+    files_examined = 0
+
+    def onerror(_: OSError) -> None:
+        raise BrowserRuntimeError("password_inventory_blocked", "password metadata cannot be enumerated")
+
+    try:
+        walker = os.walk(root, topdown=True, followlinks=False, onerror=onerror)
+        for current, dirnames, filenames in walker:
+            directories_examined += 1
+            if directories_examined + files_examined > _MAX_PASSWORD_SCAN_ENTRIES:
+                raise BrowserRuntimeError("password_inventory_unbounded", "password store enumeration exceeded its bound")
+            for dirname in sorted(dirnames):
+                directory = Path(current) / dirname
+                if directory.is_symlink():
+                    raise BrowserRuntimeError("profile_symlink", "profile contains a symlink")
+            for filename in sorted(filenames):
+                files_examined += 1
+                if directories_examined + files_examined > _MAX_PASSWORD_SCAN_ENTRIES:
+                    raise BrowserRuntimeError("password_inventory_unbounded", "password store enumeration exceeded its bound")
+                path = Path(current) / filename
+                if path.is_symlink():
+                    raise BrowserRuntimeError("profile_symlink", "profile contains a symlink")
+                if filename not in _PASSWORD_DATABASE_NAMES and filename not in _PASSWORD_DATABASE_SIDECARS:
+                    continue
+                if not path.is_file():
+                    raise BrowserRuntimeError("password_inventory_blocked", "password store is not a regular file")
+                stores.append(path)
+    except BrowserRuntimeError:
+        raise
+    except OSError as exc:
+        raise BrowserRuntimeError("password_inventory_blocked", "password metadata cannot be enumerated") from exc
+    stores.sort(key=lambda path: path.relative_to(root).as_posix())
+    return stores, directories_examined, files_examined
+
+
+def _assert_password_inventory_stable(before: PasswordInventory, after: PasswordInventory) -> None:
+    if (
+        before.status != after.status
+        or before.credential_count != after.credential_count
+        or before.database_count != after.database_count
+        or before.database_paths != after.database_paths
+        or before.database_entries != after.database_entries
+        or not after.enumeration_complete
+    ):
+        raise BrowserRuntimeError("password_inventory_changed", "password store changed during snapshot")
+
+
+def _validate_manifest_password_inventory(manifest: Mapping[str, Any], inventory: PasswordInventory) -> None:
+    """Require snapshot metadata to authorize the exact observed store set."""
+
+    listed = manifest.get("password_databases")
+    inventory_metadata = manifest.get("password_inventory")
+    if not isinstance(listed, list) or not isinstance(inventory_metadata, dict):
+        raise BrowserRuntimeError("password_manifest_unverified", "password store authorization is missing")
+    if inventory_metadata.get("enumeration_complete") is not True:
+        raise BrowserRuntimeError("password_inventory_blocked", "password store enumeration was incomplete")
+    if manifest.get("password_inventory_status") != inventory.status or manifest.get("password_credential_count") != inventory.credential_count:
+        raise BrowserRuntimeError("password_manifest_mismatch", "password metadata does not match the store")
+    expected_paths = list(inventory.database_paths)
+    listed_paths: list[str] = []
+    normalized_entries: list[dict[str, Any]] = []
+    for entry in listed:
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str) or not isinstance(entry.get("role"), str):
+            raise BrowserRuntimeError("password_manifest_unverified", "password store authorization is malformed")
+        relative = Path(entry["path"])
+        if relative.is_absolute() or ".." in relative.parts or relative.as_posix() != entry["path"]:
+            raise BrowserRuntimeError("password_manifest_unverified", "password store path is invalid")
+        name = relative.name
+        if name not in _PASSWORD_DATABASE_NAMES and name not in _PASSWORD_DATABASE_SIDECARS:
+            raise BrowserRuntimeError("password_manifest_unverified", "password store is not allowlisted")
+        role = "database" if name in _PASSWORD_DATABASE_NAMES else "sidecar"
+        if entry["role"] != role or not isinstance(entry.get("credential_count"), int) or entry["credential_count"] < 0:
+            raise BrowserRuntimeError("password_manifest_unverified", "password store metadata is invalid")
+        listed_paths.append(entry["path"])
+        normalized_entries.append({"path": entry["path"], "role": role, "credential_count": entry["credential_count"]})
+    if listed_paths != expected_paths or len(set(listed_paths)) != len(listed_paths):
+        raise BrowserRuntimeError("password_database_unlisted", "snapshot contains an unlisted password store")
+    if normalized_entries != [dict(entry) for entry in inventory.database_entries]:
+        raise BrowserRuntimeError("password_manifest_mismatch", "password store metadata does not match the store")
+    if inventory_metadata.get("database_count") != inventory.database_count or inventory_metadata.get("database_paths") != expected_paths:
+        raise BrowserRuntimeError("password_manifest_mismatch", "password inventory evidence does not match the store")
+
+
 def _copy_tree_streaming(source: Path, destination: Path) -> None:
     for path in sorted(source.rglob("*")):
         relative = path.relative_to(source)
@@ -991,7 +1476,56 @@ def _next_snapshot_version(root: Path) -> int:
     return max(versions, default=0) + 1
 
 
+def _select_snapshot_dir(root: Path, *, snapshot_version: int | None = None) -> Path:
+    """Select one version only after rejecting malformed/ambiguous candidates."""
+
+    candidates: dict[int, tuple[int, Path]] = {}
+    try:
+        children = sorted(root.iterdir(), key=lambda path: path.name)
+    except OSError as exc:
+        raise BrowserRuntimeError("profile_manifest_invalid", "snapshot versions cannot be enumerated") from exc
+    for child in children:
+        if child.is_symlink() and child.name.startswith("v"):
+            raise BrowserRuntimeError("profile_manifest_invalid", "snapshot version path is a symlink")
+        if not child.is_dir() or not child.name.startswith("v"):
+            continue
+        if not re.fullmatch(r"v[1-9][0-9]*", child.name):
+            raise BrowserRuntimeError("profile_manifest_invalid", "snapshot version path is invalid")
+        directory_version = int(child.name[1:])
+        try:
+            manifest = json.loads((child / "manifest.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeError) as exc:
+            raise BrowserRuntimeError("profile_manifest_invalid", "snapshot manifest cannot be read") from exc
+        manifest_version = manifest.get("version") if isinstance(manifest, dict) else None
+        if type(manifest_version) is not int or manifest_version < 1 or manifest_version != directory_version:
+            raise BrowserRuntimeError("profile_manifest_invalid", "snapshot version is inconsistent")
+        if manifest_version in candidates:
+            raise BrowserRuntimeError("profile_version_ambiguous", "multiple snapshots claim the same version")
+        candidates[manifest_version] = (directory_version, child)
+    if snapshot_version is not None:
+        if type(snapshot_version) is not int or snapshot_version < 1:
+            raise BrowserRuntimeError("profile_version_invalid", "requested snapshot version is invalid")
+        selected = candidates.get(snapshot_version)
+        if selected is None:
+            raise BrowserRuntimeError("profile_version_missing", "requested snapshot version does not exist")
+        return selected[1]
+    pointer = _read_pointer(root / "current")
+    if pointer is None:
+        if len(candidates) > 1:
+            raise BrowserRuntimeError("profile_version_ambiguous", "snapshot selection has no current version")
+        raise BrowserRuntimeError("profile_missing", "no committed profile snapshot exists")
+    if pointer in _POINTER_NAMES or not re.fullmatch(r"v[1-9][0-9]*", pointer):
+        raise BrowserRuntimeError("profile_manifest_invalid", "snapshot pointer is invalid")
+    directory_version = int(pointer[1:])
+    selected = candidates.get(directory_version)
+    if selected is None or selected[1].name != pointer:
+        raise BrowserRuntimeError("profile_manifest_invalid", "current snapshot pointer is invalid")
+    return selected[1]
+
+
 def _read_pointer(path: Path) -> str | None:
+    if path.is_symlink():
+        raise BrowserRuntimeError("profile_manifest_invalid", "snapshot pointer is a symlink")
     if not path.exists():
         return None
     try:
