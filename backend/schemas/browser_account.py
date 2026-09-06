@@ -79,6 +79,11 @@ LOGIN_SESSION_CLOSE_ROUTE = f"{LOGIN_SESSION_ROUTE}/close"
 PORTAL_TICKET_REDEEM_ROUTE = f"{LOGIN_SESSION_ROUTE}/portal-ticket"
 PORTAL_WS_ROUTE = f"{LOGIN_SESSION_ROUTE}/portal"
 IDEMPOTENCY_HEADER = "Idempotency-Key"
+
+
+QRAC2_CONTRACT_VERSION = 1
+MAX_PORTAL_FRAME_BYTES = 4_000_000
+MAX_PORTAL_INPUT_BYTES = 4_096
 REVISION_HEADER = "If-Match"
 
 
@@ -292,6 +297,8 @@ _COMMAND_PAYLOAD_TYPES: dict[BrowserCommandKind, type[_ContractModel]] = {
 
 
 class DurableCommandV1(_ContractModel):
+    # Version is frozen before persistence; unsupported contracts fail here.
+    contract_version: Literal[1] = QRAC2_CONTRACT_VERSION
     command_id: str = Field(min_length=1, max_length=36)
     workspace_id: str = Field(min_length=1, max_length=36)
     account_id: str = Field(min_length=1, max_length=36)
@@ -340,6 +347,10 @@ class DurableCommandV1(_ContractModel):
 
 
 class NodeClaimV1(_ContractModel):
+    # Claim identity is carried from the durable command, not inferred from URL.
+    contract_version: Literal[1] = QRAC2_CONTRACT_VERSION
+    workspace_id: str = Field(min_length=1, max_length=36)
+    account_id: str = Field(min_length=1, max_length=36)
     command_id: str = Field(min_length=1, max_length=36)
     session_id: str = Field(min_length=1, max_length=36)
     node_id: str = Field(min_length=1, max_length=36)
@@ -369,6 +380,64 @@ class ClaimedCommandV1(_ContractModel):
     session: SessionEnvelopeV1
 
 
+class CommandExecutionGuardV1(_ContractModel):
+    """Pre-side-effect admission gate for one frozen command/claim/session tuple."""
+
+    contract_version: Literal[1] = QRAC2_CONTRACT_VERSION
+    command: DurableCommandV1
+    claim: NodeClaimV1
+    session: SessionEnvelopeV1
+
+    @model_validator(mode="after")
+    def validate_association_before_side_effects(self) -> "CommandExecutionGuardV1":
+        if self.command.contract_version != self.contract_version:
+            raise ValueError("unsupported command contract version")
+        if self.claim.contract_version != self.contract_version:
+            raise ValueError("unsupported claim contract version")
+        if self.command.workspace_id != self.claim.workspace_id:
+            raise ValueError("command and claim workspace mismatch")
+        if self.command.account_id != self.claim.account_id:
+            raise ValueError("command and claim account mismatch")
+        if self.command.command_id != self.claim.command_id:
+            raise ValueError("command and claim id mismatch")
+        if self.command.session_id != self.claim.session_id:
+            raise ValueError("command and claim session mismatch")
+        if self.command.epoch != self.claim.epoch:
+            raise ValueError("command and claim epoch mismatch")
+        if self.command.expected_revision != self.claim.expected_revision:
+            raise ValueError("command and claim revision mismatch")
+        if self.session.workspace_id != self.claim.workspace_id:
+            raise ValueError("claim and session workspace mismatch")
+        if self.session.account_id != self.claim.account_id:
+            raise ValueError("claim and session account mismatch")
+        if self.session.session_id != self.claim.session_id:
+            raise ValueError("claim and session id mismatch")
+        if self.session.epoch != self.claim.epoch:
+            raise ValueError("claim and session epoch mismatch")
+        if self.session.node_id != self.claim.node_id:
+            raise ValueError("claim and session node mismatch")
+        if self.session.node_boot_id != self.claim.boot_id:
+            raise ValueError("claim and session boot mismatch")
+        if self.session.version != self.contract_version:
+            raise ValueError("unsupported session contract version")
+        if self.command.node_id is not None and self.command.node_id != self.claim.node_id:
+            raise ValueError("command and claim node mismatch")
+        if self.command.kind == BrowserCommandKind.APPLY_LOGIN_RULE:
+            payload = self.command.payload
+            assert isinstance(payload, LoginRuleCommandPayloadV1)
+            if (
+                self.session.login_rule_id != payload.login_rule_id
+                or self.session.login_rule_version != payload.login_rule_version
+            ):
+                raise ValueError("stale login rule version")
+        if self.command.kind == BrowserCommandKind.REFRESH_LOGIN:
+            payload = self.command.payload
+            assert isinstance(payload, RefreshLoginCommandPayloadV1)
+            if payload.expected_view_generation != self.session.view_generation:
+                raise ValueError("stale view generation")
+        return self
+
+
 class ExternalIdentityV1(_ContractModel):
     """Minimal non-secret identity proof; never includes cookies or tokens."""
 
@@ -390,6 +459,10 @@ class NodeEvidenceV1(_ContractModel):
 
 
 class NodeResultV1(_ContractModel):
+    # Results are admitted only as the frozen v1 envelope.
+    contract_version: Literal[1] = QRAC2_CONTRACT_VERSION
+    workspace_id: str = Field(min_length=1, max_length=36)
+    account_id: str = Field(min_length=1, max_length=36)
     command_id: str = Field(min_length=1, max_length=36)
     session_id: str = Field(min_length=1, max_length=36)
     node_id: str = Field(min_length=1, max_length=36)
@@ -478,6 +551,10 @@ class LoginRuleV1(_ContractModel):
 class LoginObservationV1(_ContractModel):
     """Rule observation handed to A for the same-session evidence CAS."""
 
+    # S claim and authenticated node identity are mandatory ownership evidence.
+    contract_version: Literal[1] = QRAC2_CONTRACT_VERSION
+    claim: NodeClaimV1
+    node_identity: NodeIdentityV1
     account_ref: AccountRef
     session_id: str = Field(min_length=1, max_length=36)
     epoch: int = Field(ge=0)
@@ -504,13 +581,120 @@ class LoginObservationV1(_ContractModel):
     @model_validator(mode="after")
     def validate_trusted_success(self) -> "LoginObservationV1":
         self.target.require_complete()
+        if self.contract_version != QRAC2_CONTRACT_VERSION:
+            raise ValueError("unsupported observation contract version")
+        if self.claim.workspace_id != self.account_ref.workspace_id:
+            raise ValueError("observation claim workspace mismatch")
+        if self.claim.account_id != self.account_ref.account_id:
+            raise ValueError("observation claim account mismatch")
+        if self.claim.session_id != self.session_id:
+            raise ValueError("observation claim session mismatch")
+        if self.claim.epoch != self.epoch:
+            raise ValueError("observation claim epoch mismatch")
+        if self.node_identity.node_id != self.claim.node_id:
+            raise ValueError("observation node mismatch")
+        if self.node_identity.boot_id != self.claim.boot_id:
+            raise ValueError("observation boot mismatch")
+        if not self.claim.claimed_at <= self.observed_at <= self.claim.expires_at:
+            raise ValueError("observation is outside claim lifetime")
+        if self.claim.expires_at <= self.claim.claimed_at:
+            raise ValueError("observation claim deadline is invalid")
         if self.evidence_kind is BrowserAuthEvidence.VALID and (
             self.external_identity is None or self.state not in {"verifying", "saved"}
         ):
             raise ValueError("valid login observation requires identity and verifying state")
         return self
+class AccountStateSnapshotV1(_ContractModel):
+    """Single trusted source for identity, auth, status, target, and revisions."""
+
+    contract_version: Literal[1] = QRAC2_CONTRACT_VERSION
+    account_ref: AccountRef
+    account_revision: int = Field(ge=0)
+    session_id: str = Field(min_length=1, max_length=36)
+    session_revision: int = Field(ge=0)
+    epoch: int = Field(ge=0)
+    trusted_identity: ExternalIdentityV1 | None = None
+    auth_evidence: BrowserAuthEvidence
+    status: BrowserAccountStatus
+    target: SessionTargetV1
+    rule_id: str = Field(min_length=1, max_length=128)
+    rule_version: str = Field(min_length=1, max_length=64)
+    view_generation: int = Field(ge=0)
+    validated_source: Literal["browser_account_session_snapshot"] = (
+        "browser_account_session_snapshot"
+    )
+    validated_at: datetime
+    freshness_deadline: datetime
+
+    @model_validator(mode="after")
+    def validate_source(self) -> "AccountStateSnapshotV1":
+        self.target.require_complete()
+        if self.contract_version != QRAC2_CONTRACT_VERSION:
+            raise ValueError("unsupported state snapshot contract version")
+        if self.freshness_deadline <= self.validated_at:
+            raise ValueError("state snapshot freshness deadline must be in the future")
+        if (self.freshness_deadline - self.validated_at).total_seconds() > 1:
+            raise ValueError("state snapshot freshness window exceeds one second")
+        if self.auth_evidence is BrowserAuthEvidence.VALID and self.trusted_identity is None:
+            raise ValueError("valid account snapshot requires trusted identity")
+        return self
+
+
 class AccountStateViewV1(_ContractModel):
     """Fresh revision state consumed by the account transition CAS."""
+    snapshot: AccountStateSnapshotV1
+    # These values must be projected from one validated DB snapshot.
+    contract_version: Literal[1] = QRAC2_CONTRACT_VERSION
+    trusted_identity: ExternalIdentityV1 | None = None
+    auth_evidence: BrowserAuthEvidence
+    status: BrowserAccountStatus
+    session_epoch: int = Field(ge=0)
+    target: SessionTargetV1
+    rule_id: str = Field(min_length=1, max_length=128)
+    rule_version: str = Field(min_length=1, max_length=64)
+    freshness_deadline: datetime
+    view_generation: int = Field(ge=0)
+    validated_source: Literal["browser_account_session_snapshot"] = (
+        "browser_account_session_snapshot"
+    )
+    validated_at: datetime
+
+    @model_validator(mode="after")
+    def validate_trusted_snapshot(self) -> "AccountStateViewV1":
+        self.target.require_complete()
+        if self.contract_version != QRAC2_CONTRACT_VERSION:
+            raise ValueError("unsupported state-view contract version")
+        if self.auth_evidence is BrowserAuthEvidence.VALID and self.trusted_identity is None:
+            raise ValueError("valid account state requires trusted identity")
+        if self.status in {
+            BrowserAccountStatus.VERIFYING,
+            BrowserAccountStatus.SAVED,
+            BrowserAccountStatus.DORMANT,
+        } and self.auth_evidence is BrowserAuthEvidence.VALID and self.trusted_identity is None:
+            raise ValueError("authenticated status requires trusted identity")
+        if self.freshness_deadline <= self.validated_at:
+            raise ValueError("state view freshness deadline must be in the future")
+        if (self.freshness_deadline - self.validated_at).total_seconds() > 1:
+            raise ValueError("state view freshness window exceeds one second")
+        if (
+            self.snapshot.account_ref != self.account_ref
+            or self.snapshot.account_revision != self.account_revision
+            or self.snapshot.session_id != self.session_id
+            or self.snapshot.session_revision != self.session_revision
+            or self.snapshot.epoch != self.session_epoch
+            or self.snapshot.trusted_identity != self.trusted_identity
+            or self.snapshot.auth_evidence != self.auth_evidence
+            or self.snapshot.status != self.status
+            or self.snapshot.target != self.target
+            or self.snapshot.rule_id != self.rule_id
+            or self.snapshot.rule_version != self.rule_version
+            or self.snapshot.view_generation != self.view_generation
+            or self.snapshot.validated_source != self.validated_source
+            or self.snapshot.validated_at != self.validated_at
+            or self.snapshot.freshness_deadline != self.freshness_deadline
+        ):
+            raise ValueError("state view does not match its trusted snapshot")
+        return self
 
     account_ref: AccountRef
     account_revision: int = Field(ge=0)
@@ -566,7 +750,7 @@ class PortalSensitivePayloadV1(_ContractModel):
     @field_validator("value")
     @classmethod
     def bound_value(cls, value: SecretStr | None) -> SecretStr | None:
-        if value is not None and len(value.get_secret_value()) > 4096:
+        if value is not None and len(value.get_secret_value()) > MAX_PORTAL_INPUT_BYTES:
             raise ValueError("sensitive input exceeds transient limit")
         return value
 
@@ -584,6 +768,24 @@ class PortalClipV1(_ContractModel):
     height: int = Field(gt=0, le=4096)
 
 
+class PortalRegionFocusV1(_ContractModel):
+    """L-produced allowlist carried unchanged into the R owner boundary."""
+
+    contract_version: Literal[1] = QRAC2_CONTRACT_VERSION
+    target: SessionTargetV1
+    view_generation: int = Field(ge=0)
+    region_kind: Literal["qr", "form", "approved"]
+    approved_regions: list[PortalClipV1] = Field(min_length=1, max_length=32)
+    focused_field_ref: str | None = Field(default=None, min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def validate_region_focus(self) -> "PortalRegionFocusV1":
+        self.target.require_complete()
+        if self.region_kind == "form" and self.focused_field_ref is None:
+            raise ValueError("form projection requires a focused field")
+        return self
+
+
 class PortalControlMessageV1(_ContractModel):
     """Transient message with a trusted outer workspace/account binding.
 
@@ -596,6 +798,7 @@ class PortalControlMessageV1(_ContractModel):
     session_id: str = Field(min_length=1, max_length=36)
     epoch: int = Field(ge=0)
     target: SessionTargetV1
+    contract_version: Literal[1] = QRAC2_CONTRACT_VERSION
     view_generation: int = Field(ge=0)
     sequence: int = Field(ge=1)
     kind: Literal["field_input", "pointer", "key", "request_view", "takeover"]
@@ -612,6 +815,7 @@ class PortalControlMessageV1(_ContractModel):
 
 class PortalPixelFrameV1(_ContractModel):
     """Transient clipped frame; only approved regions may be sent to the client."""
+    contract_version: Literal[1] = QRAC2_CONTRACT_VERSION
 
     workspace_id: str = Field(min_length=1, max_length=36)
     account_id: str = Field(min_length=1, max_length=36)
@@ -621,26 +825,41 @@ class PortalPixelFrameV1(_ContractModel):
     view_generation: int = Field(ge=0)
     sequence: int = Field(ge=1)
     region_kind: Literal["qr", "form", "approved"]
+    mime_type: Literal["image/png", "image/jpeg", "image/webp"]
     expires_at: datetime
     clip: PortalClipV1
+    byte_length: int = Field(gt=0, le=MAX_PORTAL_FRAME_BYTES)
     masked_regions: list[PortalClipV1] = Field(default_factory=list, max_length=32)
     frame_bytes: SecretBytes = Field(min_length=1)
 
     @field_validator("frame_bytes")
     @classmethod
     def bound_frame(cls, value: SecretBytes) -> SecretBytes:
-        if len(value.get_secret_value()) > 4_000_000:
+        if len(value.get_secret_value()) > MAX_PORTAL_FRAME_BYTES:
             raise ValueError("transient pixel frame exceeds size limit")
         return value
 
     @model_validator(mode="after")
     def validate_target_boundary(self) -> "PortalPixelFrameV1":
         self.target.require_complete()
+        raw = self.frame_bytes.get_secret_value()
+        if len(raw) != self.byte_length:
+            raise ValueError("pixel byte length does not match frame bytes")
+        if self.mime_type == "image/png" and not raw.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ValueError("pixel bytes do not match image/png")
+        if self.mime_type == "image/jpeg" and not raw.startswith(b"\xff\xd8\xff"):
+            raise ValueError("pixel bytes do not match image/jpeg")
+        if self.mime_type == "image/webp" and (
+            len(raw) < 12 or raw[:4] != b"RIFF" or raw[8:12] != b"WEBP"
+        ):
+            raise ValueError("pixel bytes do not match image/webp")
         return self
 
 
 class PortalOuterBindingV1(_ContractModel):
     """Trusted server-side binding supplied outside user-controlled payloads."""
+
+    contract_version: Literal[1] = QRAC2_CONTRACT_VERSION
 
     workspace_id: str = Field(min_length=1, max_length=36)
     account_id: str = Field(min_length=1, max_length=36)
@@ -652,6 +871,7 @@ class PortalOuterBindingV1(_ContractModel):
 
 class PortalTransientV1(_ContractModel):
     """In-memory transport envelope; runtime binds it to the authorized session."""
+    contract_version: Literal[1] = QRAC2_CONTRACT_VERSION
 
     binding: PortalOuterBindingV1
     control: PortalControlMessageV1 | None = None
@@ -692,6 +912,31 @@ class PortalWireFrameV1(_ContractModel):
             raise ValueError("control framing requires a control message")
         if self.encoding == "pixel-binary" and self.transient.pixel is None:
             raise ValueError("pixel framing requires a pixel frame")
+        return self
+
+
+class PortalOwnerRouteV1(_ContractModel):
+    """A-owned bounded route passed to R with session-page-record lineage."""
+
+    contract_version: Literal[1] = QRAC2_CONTRACT_VERSION
+    owner: Literal["browser_account_service"] = "browser_account_service"
+    binding: SensitiveSessionBindingV1
+    node_identity: NodeIdentityV1
+    region_focus: PortalRegionFocusV1
+    session_revision: int = Field(ge=0)
+    route_expires_at: datetime
+    max_frame_bytes: int = Field(gt=0, le=MAX_PORTAL_FRAME_BYTES)
+    max_input_bytes: int = Field(gt=0, le=MAX_PORTAL_INPUT_BYTES)
+
+    @model_validator(mode="after")
+    def validate_owner_boundary(self) -> "PortalOwnerRouteV1":
+        if self.binding.record_session_id is None:
+            raise ValueError("owner route requires a record session binding")
+        if self.binding.target != self.region_focus.target:
+            raise ValueError("owner route target does not match L region focus")
+        if self.binding.view_generation != self.region_focus.view_generation:
+            raise ValueError("owner route generation does not match L region focus")
+        self.binding.target.require_complete()
         return self
 
 
@@ -765,17 +1010,25 @@ class BrowserAccountListV1(_ContractModel):
 
 
 class PortalTicketRedeemRequestV1(_ContractModel):
-    """Body-only one-time ticket exchange; never place either secret in a URL."""
+    """Body-only first-entry exchange; no secret may appear in the URL."""
 
+    contract_version: Literal[1] = QRAC2_CONTRACT_VERSION
+    first_entry: Literal["initial", "reconnect"]
+    account_ref: AccountRef
+    session_id: str = Field(min_length=1, max_length=36)
+    expected_session_revision: int = Field(ge=0)
     ticket: SecretStr
     csrf_token: SecretStr
-
 
 class PortalTicketGrantV1(_ContractModel):
     """Non-secret routing facts returned after a successful ticket exchange."""
 
+    contract_version: Literal[1] = QRAC2_CONTRACT_VERSION
+    status: Literal["granted"] = "granted"
+
     workspace_id: str = Field(min_length=1, max_length=36)
     account_id: str = Field(min_length=1, max_length=36)
+    session_revision: int = Field(ge=0)
     session_id: str = Field(min_length=1, max_length=36)
     issued_at: datetime
     expires_at: datetime
@@ -790,6 +1043,37 @@ class PortalTicketGrantV1(_ContractModel):
         if (self.hard_expires_at - self.issued_at).total_seconds() > 1800:
             raise ValueError("portal ticket hard lifetime exceeds thirty minutes")
         return self
+
+
+class PortalEntryWaitingV1(_ContractModel):
+    """Typed non-success response while the fixed account waits for capacity."""
+
+    contract_version: Literal[1] = QRAC2_CONTRACT_VERSION
+    status: Literal["waiting"] = "waiting"
+    account_ref: AccountRef
+    session_id: str = Field(min_length=1, max_length=36)
+    session_revision: int = Field(ge=0)
+    reason: Literal[
+        "node_unavailable",
+        "capacity_missing",
+        "lease_waiting",
+        "profile_restore_waiting",
+    ]
+    retry_at: datetime | None = None
+
+
+class PortalEntryBlockedV1(_ContractModel):
+    """Typed non-success response; it cannot be decoded as a login grant."""
+
+    contract_version: Literal[1] = QRAC2_CONTRACT_VERSION
+    status: Literal["blocked"] = "blocked"
+    account_ref: AccountRef
+    session_id: str = Field(min_length=1, max_length=36)
+    session_revision: int = Field(ge=0)
+    error_code: BrowserAccountErrorCode
+
+
+PortalEntryResponseV1 = PortalTicketGrantV1 | PortalEntryWaitingV1 | PortalEntryBlockedV1
 
 
 
