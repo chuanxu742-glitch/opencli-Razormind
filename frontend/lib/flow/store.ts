@@ -1397,9 +1397,12 @@ export const useFlowStore = create<FlowState>((set, get) => ({
   },
 
   save: () => {
-    const { nodes, edges, drawings } = get()
+    const { nodes, edges, drawings, workflowProject } = get()
     if (typeof window === "undefined") return
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ nodes, edges, drawings }))
+    // Persist the canonical project alongside the projected canvas. Account and
+    // pinned source revision metadata lives in node params and must survive a
+    // save/reload before expand, publish, or execute.
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ nodes, edges, drawings, workflowProject }))
   },
 
   load: () => {
@@ -1407,9 +1410,16 @@ export const useFlowStore = create<FlowState>((set, get) => ({
     const raw = localStorage.getItem(STORAGE_KEY)
     if (!raw) return false
     try {
-      const parsed = JSON.parse(raw) as FlowSnapshot
+      const parsed = JSON.parse(raw) as FlowStoreSnapshot
       get().takeSnapshot()
-      set({ nodes: parsed.nodes, edges: parsed.edges, drawings: parsed.drawings ?? [] })
+      set({
+        nodes: parsed.nodes,
+        edges: parsed.edges,
+        drawings: parsed.drawings ?? [],
+        ...(parsed.workflowProject
+          ? { workflowProject: parseWorkflowProject(parsed.workflowProject) }
+          : {}),
+      })
       return true
     } catch {
       return false
