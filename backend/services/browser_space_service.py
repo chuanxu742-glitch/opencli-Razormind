@@ -13,7 +13,13 @@ from sqlalchemy import select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.models.browser import BrowserBinding, BrowserInstance
+from backend.models.browser import (
+    BrowserAccount,
+    BrowserAccountLease,
+    BrowserBinding,
+    BrowserInstance,
+    BrowserLoginSession,
+)
 from backend.models.browser_space import (
     BrowserSpace,
     BrowserSpaceEvent,
@@ -125,6 +131,9 @@ def _body_values(body: Any) -> dict[str, Any]:
             "binding_id",
             "owner_type",
             "owner_id",
+            "account_id",
+            "session_id",
+            "lease_id",
             "granted_capabilities",
             "request_id",
             "capability",
@@ -240,6 +249,9 @@ async def create_space(
     owner_id: str | None = None,
     granted_capabilities: list[str] | None = None,
     binding_id: str | None = None,
+    account_id: str | None = None,
+    session_id: str | None = None,
+    lease_id: str | None = None,
 ) -> BrowserSpace:
     values = (
         _body_values(body)
@@ -250,12 +262,18 @@ async def create_space(
             "owner_id": owner_id,
             "granted_capabilities": granted_capabilities,
             "binding_id": binding_id,
+            "account_id": account_id,
+            "session_id": session_id,
+            "lease_id": lease_id,
         }
     )
     owner_type = str(values.get("owner_type") or "")
     owner_id = str(values.get("owner_id") or "")
     instance_id = str(values.get("browser_instance_id") or "")
     binding_id = values.get("binding_id")
+    account_id = values.get("account_id")
+    session_id = values.get("session_id")
+    lease_id = values.get("lease_id")
     grants = values.get("granted_capabilities") or []
     if owner_type not in {"operator", "runtime_agent"} or not owner_id:
         raise BrowserSpaceError("invalid_owner", "owner_type and owner_id are required", 422)
@@ -275,6 +293,55 @@ async def create_space(
         binding = await db.get(BrowserBinding, binding_id)
         if binding is None or binding.browser_endpoint != instance.endpoint:
             raise BrowserSpaceError("not_found", "browser binding not found", 404)
+    account = None
+    session = None
+    lease = None
+    if account_id is not None or session_id is not None or lease_id is not None:
+        if not account_id or not session_id or not lease_id:
+            raise BrowserSpaceError(
+                "invalid_account_binding",
+                "account_id, session_id, and lease_id must be supplied together",
+                422,
+            )
+        account = await db.scalar(
+            select(BrowserAccount).where(
+                BrowserAccount.workspace_id == workspace_id,
+                BrowserAccount.id == account_id,
+            )
+        )
+        if account is None:
+            raise BrowserSpaceError("not_found", "browser account not found", 404)
+        if (
+            account.auth_required
+            or account.paused
+            or account.auth_evidence != "valid"
+            or account.status in {"closed", "expired", "error"}
+        ):
+            raise BrowserSpaceError(
+                "account_not_ready",
+                "browser account is not authorized for a Browser Space",
+                409,
+            )
+        session = await db.scalar(
+            select(BrowserLoginSession).where(
+                BrowserLoginSession.workspace_id == workspace_id,
+                BrowserLoginSession.id == session_id,
+                BrowserLoginSession.account_id == account_id,
+            )
+        )
+        if session is None or session.status in {"closed", "expired", "error"}:
+            raise BrowserSpaceError("not_found", "login session not found", 404)
+        lease = await db.scalar(
+            select(BrowserAccountLease).where(
+                BrowserAccountLease.workspace_id == workspace_id,
+                BrowserAccountLease.account_id == account_id,
+                BrowserAccountLease.lease_id == lease_id,
+                BrowserAccountLease.status == "active",
+                BrowserAccountLease.expires_at > datetime.now(UTC),
+            )
+        )
+        if lease is None or session.lease_id != lease_id or session.epoch != lease.epoch:
+            raise BrowserSpaceError("lease_lost", "account lease is not active", 409)
     active = await db.scalar(
         select(BrowserSpace.id)
         .where(BrowserSpace.browser_instance_id == instance_id)
@@ -288,6 +355,10 @@ async def create_space(
         workspace_id=workspace_id,
         browser_instance_id=instance_id,
         binding_id=binding_id,
+        account_id=account_id,
+        session_id=session_id,
+        lease_id=lease_id,
+        epoch=lease.epoch if lease is not None else 0,
         owner_type=owner_type,
         owner_id=owner_id,
         status=BrowserSpaceStatus.IDLE.value,
