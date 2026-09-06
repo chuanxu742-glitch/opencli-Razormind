@@ -242,6 +242,55 @@ async def test_h5_freeze_rejects_binding_or_identity_before_side_effect() -> Non
     assert record.calls == []
 
 
+def _binding_for_frame(ref: AccountRef, target: SessionTargetV1, record_id: str) -> SensitiveSessionBindingV1:
+    return SensitiveSessionBindingV1(
+        account_ref=ref,
+        session_id="session",
+        epoch=2,
+        target=target,
+        view_generation=4,
+        record_session_id=record_id,
+    )
+
+
+def test_h5_invalid_frame_selection_fails_before_registration_side_effect() -> None:
+    _, ref, target, _, _, _ = _context()
+    record = _RecordSessionProbe("record-session-missing")
+    binding = _binding_for_frame(
+        ref,
+        target.model_copy(update={"frame_id": "missing"}),
+        "record-session-missing",
+    )
+    with pytest.raises(ValueError):
+        register_portal_record_session(binding, record)
+    assert record.calls == []
+
+    duplicate = _RecordSessionProbe("record-session-duplicate")
+    duplicate.page.frames.append(_FrameProbe("main"))
+    duplicate_binding = _binding_for_frame(
+        ref,
+        target,
+        "record-session-duplicate",
+    )
+    with pytest.raises(ValueError):
+        register_portal_record_session(duplicate_binding, duplicate)
+    assert duplicate.calls == []
+
+
+def test_h5_frame_identity_type_error_fails_closed() -> None:
+    _, ref, target, _, _, _ = _context()
+    record = _RecordSessionProbe("record-session-type-error")
+
+    def broken_identity(_: object) -> tuple[object, object, int, object]:
+        raise TypeError("frame identity probe failed")
+
+    record.binding_identity = broken_identity
+    binding = _binding_for_frame(ref, target, "record-session-type-error")
+    with pytest.raises(ValueError):
+        register_portal_record_session(binding, record)
+    assert record.calls == []
+
+
 @pytest.mark.asyncio
 async def test_h5_target_iframe_navigation_advances_generation_binding() -> None:
     _, ref, target, _, _, _ = _context()
@@ -276,7 +325,7 @@ def _context() -> tuple[datetime, AccountRef, SessionTargetV1, SessionEnvelopeV1
     ref = AccountRef(workspace_id="workspace", account_id="account")
     target = SessionTargetV1(
         tab_id="tab",
-        frame_id="frame",
+        frame_id="main",
         document_id="document",
         origin="https://site.test",
     )

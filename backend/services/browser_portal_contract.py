@@ -84,28 +84,70 @@ class _RegisteredRecordSession:
 _RECORD_SESSIONS: dict[str, _RegisteredRecordSession] = {}
 
 
+def _frame_candidates(record_session: Any, frame_id: Any) -> list[Any]:
+    page = getattr(record_session, "page", None)
+    raw_page = getattr(page, "page", page)
+    frames = getattr(raw_page, "frames", None)
+    if callable(frames):
+        try:
+            frames = frames()
+        except TypeError as exc:
+            raise ValueError("record session frame selection failed") from exc
+    if frames is None:
+        raise ValueError("record session does not expose real Playwright frames")
+    try:
+        frames = list(frames)
+    except TypeError as exc:
+        raise ValueError("record session frame selection failed") from exc
+    candidates: list[Any] = []
+    for frame in frames:
+        for attr in ("frame_id", "id", "name"):
+            value = getattr(frame, attr, None)
+            if callable(value):
+                try:
+                    value = value()
+                except TypeError as exc:
+                    raise ValueError("record session frame selection failed") from exc
+            if value == frame_id:
+                candidates.append(frame)
+                break
+    return candidates
+
+
+def _requested_frame(record_session: Any, frame_id: Any) -> Any:
+    candidates = _frame_candidates(record_session, frame_id)
+    if len(candidates) != 1:
+        raise ValueError("record session frame selection is not unique")
+    return candidates[0]
+
+
 def _record_identity(
     record_session: Any,
     frame_id: Any | None = None,
 ) -> tuple[Any, Any, Any, Any]:
+    requested_frame = _requested_frame(record_session, frame_id)
     identity = getattr(record_session, "binding_identity", None)
     if callable(identity):
         try:
             value = identity(frame_id)
-        except TypeError:
-            value = identity()
-        if isinstance(value, tuple) and len(value) == 4:
-            return value
+        except TypeError as exc:
+            raise ValueError("record session frame identity failed") from exc
+        if not isinstance(value, tuple) or len(value) != 4:
+            raise ValueError("record session frame identity is invalid")
+        if value[1] is not requested_frame:
+            raise ValueError("record session frame identity changed")
+        return value
     page = getattr(record_session, "page", None)
     raw_page = getattr(page, "page", page)
-    frame = getattr(raw_page, "main_frame", None)
-    if callable(frame):
-        frame = frame()
-    document = getattr(raw_page, "document", None)
+    document = getattr(requested_frame, "document", None)
+    if document is None:
+        document = getattr(raw_page, "document", None)
+    if document is None:
+        document = getattr(requested_frame, "document_id", None)
     if document is None:
         document = getattr(raw_page, "document_id", None)
-    url = getattr(raw_page, "url", None)
-    return raw_page, frame, (document, url), None
+    url = getattr(requested_frame, "url", None)
+    return raw_page, requested_frame, (document, url), None
 
 
 def _require_same_record_identity(
