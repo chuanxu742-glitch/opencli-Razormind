@@ -201,7 +201,9 @@ export default function WorkbenchPage() {
             <label className="block space-y-1.5 text-sm">
               工作区
               <Select value={workspaceId ?? ''} onValueChange={(value) => changeWorkspace(value || null)}>
-                <SelectTrigger><SelectValue placeholder="选择工作区" /></SelectTrigger>
+                <SelectTrigger className="w-full min-w-0"><SelectValue placeholder="选择工作区">
+                  {(value: string | null) => workspaces.data?.find((workspace) => workspace.id === value)?.name ?? '选择工作区'}
+                </SelectValue></SelectTrigger>
                 <SelectContent>
                   {workspaces.data?.map((workspace) => (
                     <SelectItem key={workspace.id} value={workspace.id}>{workspace.name}</SelectItem>
@@ -258,14 +260,26 @@ export default function WorkbenchPage() {
                 <label className="block space-y-1.5 text-sm">
                   仓库
                   <Select value={repositoryId} onValueChange={(value) => setRepositoryId(value ?? '')} disabled={Boolean(thread) || repositories.isLoading || !repositories.data?.length}>
-                    <SelectTrigger><SelectValue placeholder="选择仓库" /></SelectTrigger>
+                    <SelectTrigger className="w-full min-w-0"><SelectValue placeholder="选择仓库">
+                      {(value: string | null) => {
+                        const repository = repositories.data?.find((candidate) => candidate.id === value)
+                        return repository ? `${repository.name} · ${repository.defaultRef}` : '选择仓库'
+                      }}
+                    </SelectValue></SelectTrigger>
                     <SelectContent>{repositories.data?.map((repository) => <SelectItem key={repository.id} value={repository.id}>{repository.name} · {repository.defaultRef}</SelectItem>)}</SelectContent>
                   </Select>
                 </label>
                 <label className="block space-y-1.5 text-sm">
                   运行时
                   <Select value={runtimeId} onValueChange={(value) => setRuntimeId(value ?? '')} disabled={runtimes.isLoading || !runtimes.data?.length}>
-                    <SelectTrigger><SelectValue placeholder="选择运行时" /></SelectTrigger>
+                    <SelectTrigger className="w-full min-w-0"><SelectValue placeholder="选择运行时">
+                      {(value: string | null) => {
+                        const runtime = runtimes.data?.find((candidate) => candidate.id === value)
+                        return runtime
+                          ? `${runtime.name} · v${runtime.publishedVersion}${runtime.readiness === 'blocked' ? ' · 不可用' : ''}`
+                          : '选择运行时'
+                      }}
+                    </SelectValue></SelectTrigger>
                     <SelectContent>{runtimes.data?.map((runtime) => <SelectItem key={runtime.id} value={runtime.id} disabled={runtime.readiness !== 'ready'}>{runtime.name} · v{runtime.publishedVersion}{runtime.readiness === 'blocked' ? ' · 不可用' : ''}</SelectItem>)}</SelectContent>
                   </Select>
                 </label>
