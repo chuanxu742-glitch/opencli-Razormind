@@ -203,7 +203,7 @@ async def test_collect_agent_mode_passes_positional_args_to_dispatch(
     captured: list[dict] = []
 
     async def fake_collect_via_agent(
-        agent_url, site, command, args, positional_args, fmt, mode, execution_id
+        agent_url, site, command, args, positional_args, fmt, mode, execution_id, account_session=None
     ):
         captured.append(
             {
@@ -257,25 +257,24 @@ async def test_collect_agent_mode_passes_positional_args_to_dispatch(
 
 
 @pytest.mark.asyncio
-async def test_collect_agent_mode_prefers_site_bound_agent(
+async def test_collect_anonymous_agent_ignores_legacy_site_binding(
     client,
     db_session,
     opencli_source_payload,
 ):
-    """Agent-mode routing should honor the same site binding used by fleet match."""
+    """Anonymous agent routing must not infer an account from a preserved site mapping."""
     from backend.browser_pool import LocalBrowserPool
     from backend.channels.base import ChannelResult
     from backend.channels.opencli_channel import OpenCLIChannel
-    from backend.services import browser_service
+    from backend.models.browser import BrowserBinding
 
     create_resp = await client.post("/api/v1/sources", json=opencli_source_payload)
     cfg = create_resp.json()["data"]["channel_config"]
-    await browser_service.create_binding(
-        db_session,
+    db_session.add(BrowserBinding(
         browser_endpoint="http://agent-b:19823",
         site="bilibili",
         notes="site-bound cluster route",
-    )
+    ))
     await db_session.commit()
 
     selected: list[str | None] = []
@@ -288,7 +287,7 @@ async def test_collect_agent_mode_prefers_site_bound_agent(
         async def __aexit__(self, exc_type, exc, tb):
             return False
 
-    async def fake_collect_via_ws_agent(
+    async def fake_collect_via_agent(
         agent_url,
         site,
         command,
@@ -296,7 +295,8 @@ async def test_collect_agent_mode_prefers_site_bound_agent(
         positional_args,
         fmt,
         mode,
-        execution_id,
+        execution_id=None,
+        account_session=None,
     ):
         dispatched.append(
             {
@@ -329,8 +329,8 @@ async def test_collect_agent_mode_prefers_site_bound_agent(
 
     with (
         patch(
-            "backend.channels.opencli_channel._collect_via_ws_agent",
-            side_effect=fake_collect_via_ws_agent,
+            "backend.channels.opencli_channel._collect_via_agent",
+            side_effect=fake_collect_via_agent,
         ),
         patch(
             "backend.channels.opencli_channel._command_requires_browser",
@@ -348,10 +348,10 @@ async def test_collect_agent_mode_prefers_site_bound_agent(
         result = await channel.collect(cfg, {})
 
     assert result.success, f"collect failed: {result.error}"
-    assert selected == ["http://agent-b:19823"]
+    assert selected == ["http://agent-a:19823"]
     assert dispatched == [
         {
-            "agent_url": "http://agent-b:19823",
+            "agent_url": "http://agent-a:19823",
             "site": "bilibili",
                 "command": "search",
                 "positional_args": ["AI agent"],
