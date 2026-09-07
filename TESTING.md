@@ -592,3 +592,58 @@ Edge 见下方"多浏览器"小节。
    `TaskRunEvent` 行对测试自己的查询可见（conftest 里那个 per-test 内存 `db_session` 是**另一个**库，
    环路不会写它）。需要事后翻库时，可改设 `DATABASE_URL` 指向一个一次性文件库。`playwright install
    chromium` 是每台机器一次性的准备步骤。
+
+## QR 账号集群验收（Q1/I）
+
+这组验收不替代现有 10 个 Bridge/CDP 部署场景。账号任务必须固定 `workspace_id`、`account_id`、SourceBinding revision 与真实会话租约；匿名采集仍使用匿名 Profile，未知 endpoint 或共享 Profile 不得回退。
+
+### 受控登录协议
+
+受控站点是真实 HTTP 服务，只用于协议边界，不代表任何真实平台：
+
+```bash
+uv run --extra dev pytest --no-cov tests/integration/test_browser_account_login.py
+```
+
+覆盖独立 Cookie 会话、二维码当前 origin、刷新后的旧 generation/确认链接失效、错误身份不可信、同会话挑战恢复、跨 origin 二维码候选及敏感表单不回显。测试输出中的二维码确认 URL、表单内容和 Cookie 均不得复制到日志或报告。
+
+### PostgreSQL 容量结构实验
+
+准备独立、可丢弃的 PostgreSQL 数据库后，只通过 `TEST_DATABASE_URL_PG` 注入连接串：
+
+```bash
+set TEST_DATABASE_URL_PG=postgresql+asyncpg://<dedicated-user>:<password>@<host>:<port>/<database>
+uv run python scripts/verify_browser_account_capacity.py \
+  --accounts 10000000 --page-size 100 --claim-size 100
+```
+
+脚本拒绝 SQLite、缺失连接串、超过 100 的 page/claim limit；只创建临时表并输出脱敏数据库身份、`EXPLAIN` 违规节点、p95、RSS 和进程计数。必须保存原始输出及执行硬件；`Seq Scan`、全量 `Materialize`、page/claim 超限、RSS 或活跃进程随库存增长均为失败。单表结构实验不证明两个中心、节点 fencing、Profile 停机、跨副本权限或真实平台吞吐。
+
+### Browser-account migration proof
+
+Run the migration regression against the dedicated PostgreSQL admin database. The
+fixture creates a unique disposable sibling database through
+`tests.postgres_conformance.temporary_postgres_database`; it never creates test
+tables in `opencli_test_db` itself:
+
+```powershell
+$env:TEST_DATABASE_URL_PG = "postgresql+asyncpg://opencli_test:<password>@127.0.0.1:55432/opencli_test_db"
+$env:REQUIRE_POSTGRES_CONFORMANCE = "1"
+uv run pytest --no-cov --confcutdir=tests/integration `
+  tests/integration/test_browser_account_migration.py
+```
+
+The proof upgrades through `add_browser_accounts` and then `head` (the recovered
+`refine_browser_account_contract` revision), verifies the source-only legacy
+binding remains readable with its workspace backfilled, and rejects a
+cross-workspace account reference through the composite foreign key. A passing
+test is migration/constraint evidence only; it does not claim scheduler,
+node-fencing, browser, Docker, Redis, or real-platform acceptance.
+
+### 分布式与浏览器前置
+
+- 集群测试必须使用独立 `TEST_DATABASE_URL_PG`、两个中心/调度者和受监督节点；不能用测试 SQLite 代替 PostgreSQL 锁语义。
+- Redis、中心副本、节点和受控浏览器必须记录实际版本、端口、归属、启动与停止控制；没有独立资源就记录 blocked，不把 skip 记为通过。
+- 真实 Profile 卷需提供加密配置、挂载映射和运维审查记录；DB 布尔字段、路径或节点自报不是证明。
+- Docker daemon 不可用时不要重复空转 Docker 命令，也不要宣称组合配置、容器重启、密码策略、设备绑定或 Profile 恢复已通过。
+- 真实平台扫码、手机确认和登录规则仅在合法账号及平台允许的环境中验证；fixture、空规则和 HTTP 200 都不能冒称平台认证成功。

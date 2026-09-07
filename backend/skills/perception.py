@@ -22,16 +22,79 @@ key-normalization + shape validation happen in **pure Python**
 
 from typing import Any
 
-# Token bound (ADR-0003 D2 + PRD §7 "Token blow-up on huge pages"): cap the
-# returned interactive-element list so a huge page cannot blow past the cheap
-# model's ~32k context. ~50 elements is a sane default — small enough to stay
-# well under budget; reaching more elements is the `scroll` verb's job (#02),
-# not a bigger snapshot. Override per-call via `snapshot(page, max_elements=...)`.
-DEFAULT_MAX_ELEMENTS = 50
 
-# Exact, ordered key set every projected row carries. Asserted by #03's prompt
-# builder and the acceptance test — no extra keys cross the boundary.
+# Token bound for the ordinary (non-sensitive) model projection.
+DEFAULT_MAX_ELEMENTS = 50
 SNAPSHOT_KEYS = ("ref", "role", "name", "value")
+
+# Login sessions opt into this process-local guard before any generic skill
+# perception runs.  The guard is deliberately fail-closed at the projection
+# boundary as well as in the injected script: a caller cannot accidentally
+# re-enable name/value extraction by passing a pre-populated raw row.
+_SENSITIVE_SESSION_IDS: set[str] = set()
+
+
+def set_session_sensitive(session_id: str, enabled: bool) -> None:
+    """Enable or disable generic DOM projection for one login session."""
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError("session_id is required")
+    if enabled:
+        _SENSITIVE_SESSION_IDS.add(session_id)
+    else:
+        _SENSITIVE_SESSION_IDS.discard(session_id)
+
+
+def clear_session_sensitive(session_id: str) -> None:
+    """Clear a guard after the owning session has completed teardown."""
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError("session_id is required")
+    _SENSITIVE_SESSION_IDS.discard(session_id)
+
+
+def is_session_sensitive(session_id: str | None) -> bool:
+    return bool(session_id and session_id in _SENSITIVE_SESSION_IDS)
+
+
+def _sensitive_snapshot_rows(raw: list[dict[str, Any]] | None, max_elements: int) -> list[dict[str, Any]]:
+    """Project only non-sensitive structural refs while a login is guarded."""
+    if not isinstance(raw, list) or max_elements <= 0:
+        return []
+    rows = raw[:max_elements]
+    projected: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        get = row.get if isinstance(row, dict) else (lambda _k, _d=None: _d)
+        try:
+            ref = int(get("ref", index))
+        except (TypeError, ValueError):
+            ref = index
+        projected.append({"ref": ref, "role": str(get("role", "") or ""), "name": "", "value": ""})
+    return projected
+
+
+# This variant intentionally never reads textContent, name, value, placeholder,
+# title, aria-label, or input.value.  It is used before the generic projection
+# boundary, so secrets do not enter the Python process in sensitive mode.
+SENSITIVE_SNAPSHOT_JS = r"""
+() => {
+  const nodes = Array.from(document.querySelectorAll('a, button, input, select, textarea, [role]'));
+  const out = [];
+  let ref = 0;
+  for (const el of nodes) {
+    const style = window.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden') continue;
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) continue;
+    el.setAttribute('data-skill-ref', String(ref));
+    const tag = (el.tagName || '').toLowerCase();
+    out.push({ ref, role: el.getAttribute('role') || tag, name: '', value: '' });
+    ref += 1;
+  }
+  return out;
+}
+"""
+
+
+
 
 # Injected JS: tag visible interactive elements with a sequential
 # data-skill-ref IN THE DOM and return a raw [{ref, role, name, value}] list.
@@ -86,7 +149,7 @@ SNAPSHOT_JS = r"""
 
 
 def project_snapshot(
-    raw: list[dict[str, Any]], max_elements: int = DEFAULT_MAX_ELEMENTS
+    raw: list[dict[str, Any]], max_elements: int = DEFAULT_MAX_ELEMENTS, *, sensitive: bool = False
 ) -> list[dict[str, Any]]:
     """Pure projection: cap + key-normalize + shape-validate the raw JS rows.
 
@@ -104,8 +167,12 @@ def project_snapshot(
 
     Never emits ``outerHTML`` / raw DOM / a screenshot — only the projection.
     """
+    if not isinstance(raw, list):
+        return []
     if max_elements < 0:
         max_elements = 0
+    if sensitive:
+        return _sensitive_snapshot_rows(raw, max_elements)
     rows = raw[:max_elements] if raw else []
 
     projected: list[dict[str, Any]] = []
@@ -129,15 +196,19 @@ def project_snapshot(
 
 
 async def snapshot(
-    page: Any, *, max_elements: int = DEFAULT_MAX_ELEMENTS
+    page: Any,
+    *,
+    max_elements: int = DEFAULT_MAX_ELEMENTS,
+    session_id: str | None = None,
+    sensitive: bool | None = None,
 ) -> list[dict[str, Any]]:
-    """Perceive ``page``: inject the ref-tagging JS and return the projected,
-    token-bounded ``[{ref, role, name, value}]`` interactive snapshot.
-
-    ``page`` is a Playwright ``Page`` (or any object exposing an awaitable
-    ``evaluate(js)`` — the I/O boundary is mockable, so this is testable with an
-    ``AsyncMock`` and no real browser). The default element cap is
-    :data:`DEFAULT_MAX_ELEMENTS` (50).
-    """
-    raw = await page.evaluate(SNAPSHOT_JS)
-    return project_snapshot(raw or [], max_elements=max_elements)
+    """Perceive a page, suppressing DOM names and values for guarded sessions."""
+    if sensitive is not None and not isinstance(sensitive, bool):
+        raise ValueError("sensitive must be a boolean when provided")
+    # A caller may explicitly request sensitive mode, but it may not override
+    # the authoritative session guard with ``False`` while a login session is
+    # still owned by the guard.
+    guarded = is_session_sensitive(session_id) or sensitive is True
+    script = SENSITIVE_SNAPSHOT_JS if guarded else SNAPSHOT_JS
+    raw = await page.evaluate(script)
+    return project_snapshot(raw or [], max_elements=max_elements, sensitive=guarded)

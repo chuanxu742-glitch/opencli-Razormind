@@ -73,6 +73,7 @@ export const DATA_EXPLORER_TABS: RouteTab[] = [
 ]
 
 export const COMPUTE_TABS: RouteTab[] = [
+  { href: '/browser-accounts', label: 'Browser accounts' },
   { href: '/nodes', label: '浏览器节点' },
   { href: '/workers', label: 'Worker' },
   { href: '/browsers', label: 'Chrome 池' },
