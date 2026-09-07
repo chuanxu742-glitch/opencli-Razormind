@@ -3,7 +3,6 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 import { Activity, Boxes, FileInput, Loader2, Play, RotateCcw } from "lucide-react"
 import { useSearchParams } from "next/navigation"
-import { getApiAuthToken } from "@/lib/api/auth-token"
 import { useFlowStore } from "@/lib/flow/store"
 import { fetchWorkflowCapabilities } from "@/lib/workflow/backend-capabilities"
 import { compileWorkflowProject, type WorkflowCompileResponse } from "@/lib/workflow/backend-compile"
@@ -183,7 +182,7 @@ export function RunTracePanel({ runRequestId = 0 }: { runRequestId?: number }) {
   const isRunning = runState.status === "running"
   const isBackendRunning = backendState.status === "running"
 
-  const monitorActiveRun = async (started: WorkflowRunProjection, authorization: string | null) => {
+  const monitorActiveRun = async (started: WorkflowRunProjection, authorization?: string | null) => {
     runMonitorAbortRef.current?.abort()
     const controller = new AbortController()
     runMonitorAbortRef.current = controller
@@ -241,10 +240,7 @@ export function RunTracePanel({ runRequestId = 0 }: { runRequestId?: number }) {
     const submittedQuestionBankFile = questionBankFile
     setRunState((current) => ({ status: "running", projection: current.projection, events: current.events, error: null }))
     try {
-      const token = getApiAuthToken()
-      const authorization = token ? `Bearer ${token}` : null
       const started = await startWorkflowRun(workflowProject, {
-        authorization,
         sourceOutputs,
         input,
         ...(runFileInput && workflowRunScope ? { scope: workflowRunScope } : {}),
@@ -256,7 +252,7 @@ export function RunTracePanel({ runRequestId = 0 }: { runRequestId?: number }) {
       }
       applyWorkflowRunProjection(started)
       setRunState({ status: "running", projection: started, events: [], error: null })
-      await monitorActiveRun(started, authorization)
+      await monitorActiveRun(started)
     } catch (error) {
       setRunState((current) => ({
         status: "error",
@@ -298,10 +294,7 @@ export function RunTracePanel({ runRequestId = 0 }: { runRequestId?: number }) {
     setIsResumingGaojixing(true)
     setRunState((current) => ({ ...current, status: "running", error: null }))
     try {
-      const token = getApiAuthToken()
-      const authorization = token ? `Bearer ${token}` : null
       const resumed = await resumeGaojixingWorkflowRun(projection.runId, {
-        authorization,
         scope: workflowRunScope,
       })
       applyWorkflowRunProjection(resumed)
@@ -311,7 +304,7 @@ export function RunTracePanel({ runRequestId = 0 }: { runRequestId?: number }) {
         events: current.events,
         error: null,
       }))
-      await monitorActiveRun(resumed, authorization)
+      await monitorActiveRun(resumed)
     } catch (error) {
       setRunState((current) => ({
         ...current,
@@ -367,10 +360,7 @@ export function RunTracePanel({ runRequestId = 0 }: { runRequestId?: number }) {
     if (!projection) return
     setEvidenceState((current) => ({ ...current, status: "loading", selectedBatchId: batchId, detail: null, error: null }))
     try {
-      const token = getApiAuthToken()
-      const detail = await fetchWorkflowEvidenceBatchDetail(projection.runId, batchId, {
-        authorization: token ? `Bearer ${token}` : null,
-      })
+      const detail = await fetchWorkflowEvidenceBatchDetail(projection.runId, batchId)
       setEvidenceState((current) => ({ ...current, status: "ready", detail, error: null }))
     } catch (error) {
       setEvidenceState((current) => ({
@@ -404,8 +394,7 @@ export function RunTracePanel({ runRequestId = 0 }: { runRequestId?: number }) {
         throw new Error("sourceOutputs 必须是非空的 { nodeId: object[] } JSON")
       }
       const sourceOutputs = parsed as Record<string, Array<Record<string, unknown>>>
-      const token = getApiAuthToken()
-      const authorization = token ? `Bearer ${token}` : null
+      const authorization = null
       const idempotencyKey = continuationKey || crypto.randomUUID()
       setContinuationKey(idempotencyKey)
       const continued = await continueWorkflowResearch(
@@ -416,7 +405,7 @@ export function RunTracePanel({ runRequestId = 0 }: { runRequestId?: number }) {
           idempotencyKey,
           sourceOutputs,
         },
-        { authorization },
+        {},
       )
       applyWorkflowRunProjection(continued.projection)
       setRunState((current) => ({
@@ -425,7 +414,7 @@ export function RunTracePanel({ runRequestId = 0 }: { runRequestId?: number }) {
         events: current.events,
         error: null,
       }))
-      const replay = await replayWorkflowRunEventStream(continued.childRunId, { authorization })
+      const replay = await replayWorkflowRunEventStream(continued.childRunId)
       for (const event of replay.events) applyWorkflowNodeRunEvent(event)
       const finalProjection = replay.projection ?? continued.projection
       applyWorkflowRunProjection(finalProjection)
@@ -451,8 +440,7 @@ export function RunTracePanel({ runRequestId = 0 }: { runRequestId?: number }) {
   const runBackendPreview = async () => {
     setBackendState((current) => ({ status: "running", compile: current.compile, trace: current.trace, native: current.native, error: null }))
     try {
-      const token = getApiAuthToken()
-      const authorization = token ? `Bearer ${token}` : null
+      const authorization = null
       const nativePackageNodeId = findNativeIntelligenceWorkflowPackageNodeId(workflowProject)
       const [compile, nativeDependencies] = await Promise.all([
         compileWorkflowProject(workflowProject, { authorization }),
