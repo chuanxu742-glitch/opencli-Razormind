@@ -13,6 +13,7 @@ contents, page HTML, cookies, tokens, or raw process errors.
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import json
 import os
@@ -622,12 +623,22 @@ class ProcessTreeSupervisor:
             self._processes.append(process)
 
     @staticmethod
-    def _returncode(process: Any) -> int | None:
+    def _reap_registered_parent(process: Any) -> int | None:
+        """Poll once so an exited registered child cannot remain a zombie."""
+
         value = getattr(process, "returncode", None)
         if value is not None:
             return value
         poll = getattr(process, "poll", None)
-        return poll() if callable(poll) else None
+        if not callable(poll):
+            return None
+        try:
+            return poll()
+        except (ChildProcessError, ProcessLookupError):
+            return getattr(process, "returncode", None)
+        except OSError:
+            # An unknown local wait failure cannot prove the parent stopped.
+            return None
 
     @property
     def stopped(self) -> bool:
@@ -647,21 +658,30 @@ class ProcessTreeSupervisor:
     @classmethod
     def _tree_alive(cls, process: Any) -> bool:
         pid = cls._pid(process)
+        parent_returncode = cls._reap_registered_parent(process)
         if pid is None:
-            return cls._returncode(process) is None
+            return parent_returncode is None
         if os.name == "nt":
             # ``poll`` only observes the registered parent.  A descendant can
             # outlive it, so inspect parent PID links before deciding the tree
             # is gone; this is the orphan case taskkill /PID /T cannot detect
             # after the root exits.
-            if cls._returncode(process) is None:
+            if parent_returncode is None:
                 return True
             return bool(_windows_descendant_pids(pid))
         try:
+            # Probe after polling: waitpid(WNOHANG) reaps a dead Popen group
+            # leader, while killpg still detects any surviving descendants.
             os.killpg(pid, 0)
             return True
-        except (OSError, ProcessLookupError):
-            return cls._returncode(process) is None
+        except ProcessLookupError:
+            return parent_returncode is None
+        except PermissionError:
+            return True
+        except OSError as exc:
+            if exc.errno == errno.ESRCH:
+                return parent_returncode is None
+            return True
 
     @classmethod
     def _send_signal(cls, process: Any, sig: int) -> None:
@@ -718,11 +738,11 @@ class ProcessTreeSupervisor:
             pid
             for process, pid in ((p, self._pid(p)) for p in processes)
             if pid is not None
-            and self._returncode(process) is not None
+            and self._reap_registered_parent(process) is not None
             and self._tree_alive(process)
         )
         for process in processes:
-            if self._pid(process) is not None or self._returncode(process) is None:
+            if self._pid(process) is not None or self._reap_registered_parent(process) is None:
                 self._send_signal(process, signal.SIGTERM)
         deadline = time.monotonic() + max(0.0, grace_seconds)
         while time.monotonic() < deadline and not all(not self._tree_alive(p) for p in processes):
@@ -765,11 +785,11 @@ class ProcessTreeSupervisor:
             pid
             for process, pid in ((p, self._pid(p)) for p in processes)
             if pid is not None
-            and self._returncode(process) is not None
+            and self._reap_registered_parent(process) is not None
             and self._tree_alive(process)
         )
         for process in processes:
-            if self._pid(process) is not None or self._returncode(process) is None:
+            if self._pid(process) is not None or self._reap_registered_parent(process) is None:
                 self._send_signal(process, signal.SIGTERM)
         deadline = asyncio.get_running_loop().time() + max(0.0, grace_seconds)
         while asyncio.get_running_loop().time() < deadline and not all(

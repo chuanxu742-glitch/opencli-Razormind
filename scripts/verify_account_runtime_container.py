@@ -21,6 +21,7 @@ from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.request import Request, urlopen
 
 from backend.browser_account_runtime import (
     BrowserAccountRuntimeAllocator,
@@ -38,6 +39,7 @@ from backend.schemas.browser_account import (
 _OPENCLI_VERSION = "1.8.7"
 _LOGIN_HOST = "127.0.0.1"
 _LOGIN_PORT = 49906
+_BARRIER_TIMEOUT_SECONDS = 120.0
 
 
 class VerificationError(RuntimeError):
@@ -49,7 +51,10 @@ class _LoginHandler(BaseHTTPRequestHandler):
         if self.path != "/login":
             self.send_error(404)
             return
-        body = b"<!doctype html><title>Controlled runtime fixture</title><form><input name=identity></form>"
+        body = (
+            b"<!doctype html><title>Controlled runtime fixture</title>"
+            b"<form><input name=identity></form>"
+        )
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -132,6 +137,73 @@ def _accepts(port: int) -> bool:
         return False
 
 
+def _resolve_opencli_daemon_script() -> Path:
+    completed = subprocess.run(
+        ["npm", "root", "-g"],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=20,
+    )
+    npm_root = Path(completed.stdout.strip())
+    if completed.returncode or not npm_root.is_absolute():
+        raise VerificationError(
+            f"npm root -g did not return an absolute global root (exit {completed.returncode})"
+        )
+    daemon_script = npm_root / "@jackwener" / "opencli" / "dist" / "src" / "daemon.js"
+    if not daemon_script.is_file():
+        raise VerificationError(f"OpenCLI daemon is absent under npm root {npm_root}")
+    return daemon_script
+
+
+def _daemon_status(port: int) -> tuple[bool, bool]:
+    request = Request(
+        f"http://{_LOGIN_HOST}:{port}/status",
+        headers={"X-OpenCLI": "1"},
+    )
+    with urlopen(request, timeout=1.0) as response:
+        body = response.read(4097)
+    if len(body) > 4096:
+        raise VerificationError("OpenCLI status response exceeded 4096 bytes")
+    payload = json.loads(body)
+    if not isinstance(payload, dict):
+        raise VerificationError("OpenCLI status response was not an object")
+    return payload.get("ok") is True, payload.get("extensionConnected") is True
+
+
+def _require_connected_opencli_extension(port: int, *, timeout: float = 30.0) -> None:
+    deadline = time.monotonic() + timeout
+    last_status = (False, False)
+    while time.monotonic() < deadline:
+        try:
+            last_status = _daemon_status(port)
+        except (OSError, ValueError, VerificationError):
+            last_status = (False, False)
+        if last_status == (True, True):
+            return
+        time.sleep(0.1)
+    raise VerificationError(
+        "OpenCLI status did not verify an attached extension "
+        f"(ok={last_status[0]}, extensionConnected={last_status[1]})"
+    )
+
+
+def _prove_simultaneous_namespaces(barrier_dir: Path, participant: str) -> None:
+    if participant not in {"first", "second"}:
+        raise VerificationError("barrier participant must be first or second")
+    if not barrier_dir.is_dir():
+        raise VerificationError("shared live-state barrier directory is unavailable")
+    marker = barrier_dir / f"{participant}.live"
+    marker.write_text("runtime-live\n", encoding="utf-8")
+    expected = (barrier_dir / "first.live", barrier_dir / "second.live")
+    deadline = time.monotonic() + _BARRIER_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if all(path.is_file() for path in expected):
+            return
+        time.sleep(0.1)
+    raise VerificationError("both container namespaces were not live concurrently")
+
+
 def _require_pinned_opencli() -> str:
     completed = subprocess.run(
         ["opencli", "--version"], capture_output=True, check=False, text=True, timeout=20
@@ -151,8 +223,9 @@ def _pid_gone(pid: int) -> bool:
     return not Path(f"/proc/{pid}").exists()
 
 
-async def verify() -> dict[str, Any]:
+async def verify(*, barrier_dir: Path, participant: str) -> dict[str, Any]:
     opencli_version = _require_pinned_opencli()
+    daemon_script = _resolve_opencli_daemon_script()
     with tempfile.TemporaryDirectory(prefix="account-runtime-smoke-") as state_root:
         root = Path(state_root)
         os.environ.update(
@@ -163,10 +236,14 @@ async def verify() -> dict[str, Any]:
                 "ACCOUNT_RUNTIME_STATE_ROOT": str(root / "state"),
                 "BROWSER_RUNTIME_BUNDLE_ID": "opencli-default",
                 "BROWSER_RUNTIME_BUNDLE_ROOT": "/opt/browser-runtime-bundles",
-                "BROWSER_RUNTIME_BUNDLE_MANIFEST": "/opt/browser-runtime-bundles/opencli-default/2/manifest.json",
-                "CHROMIUM_POLICY_FILE": "/etc/chromium/policies/managed/opencli-account-runtime.json",
+                "BROWSER_RUNTIME_BUNDLE_MANIFEST": (
+                    "/opt/browser-runtime-bundles/opencli-default/2/manifest.json"
+                ),
+                "CHROMIUM_POLICY_FILE": (
+                    "/etc/chromium/policies/managed/opencli-account-runtime.json"
+                ),
                 "ACCOUNT_RUNTIME_BROWSER_BIN": "/usr/bin/chromium",
-                "ACCOUNT_RUNTIME_OPENCLI_DAEMON_JS": "/usr/lib/node_modules/@jackwener/opencli/dist/src/daemon.js",
+                "ACCOUNT_RUNTIME_OPENCLI_DAEMON_JS": str(daemon_script),
                 "ACCOUNT_RUNTIME_DISPLAY_MIN": "310",
                 "ACCOUNT_RUNTIME_DISPLAY_MAX": "319",
                 "ACCOUNT_RUNTIME_PORT_MIN": "41000",
@@ -196,16 +273,26 @@ async def verify() -> dict[str, Any]:
                         first.binding.daemon_port,
                     )
                 ):
-                    raise VerificationError("CDP, Browser Bridge, or OpenCLI daemon is not reachable")
+                    raise VerificationError(
+                        "CDP, Browser Bridge, or OpenCLI daemon is not reachable"
+                    )
+                _require_connected_opencli_extension(first.binding.daemon_port)
+                _prove_simultaneous_namespaces(barrier_dir, participant)
                 second_command, second_claim, second_session, _ = _contracts()
                 second_command = second_command.model_copy(
                     update={"command_id": "smoke-command-2", "session_id": "smoke-session-2"}
                 )
                 second_claim = second_claim.model_copy(
-                    update={"command_id": second_command.command_id, "session_id": second_command.session_id}
+                    update={
+                        "command_id": second_command.command_id,
+                        "session_id": second_command.session_id,
+                    }
                 )
                 second_session = second_session.model_copy(
-                    update={"command_id": second_command.command_id, "session_id": second_command.session_id}
+                    update={
+                        "command_id": second_command.command_id,
+                        "session_id": second_command.session_id,
+                    }
                 )
                 try:
                     await allocator.start(
@@ -247,10 +334,16 @@ async def verify() -> dict[str, Any]:
                 await allocator.close_all()
     return {
         "ready": True,
-        "evidence_scope": "synthetic contracts; loopback controlled login rule; no authorization or real platform login",
+        "evidence_scope": (
+            "synthetic contracts; loopback controlled login rule; "
+            "no authorization or real platform login"
+        ),
+        "namespace_participant": participant,
+        "simultaneous_namespace_isolation": True,
         "opencli_version": opencli_version,
         "chromium_cdp": True,
         "bbx_tcp_connection": True,
+        "opencli_extension_connected": True,
         "fixed_daemon_port": 19825,
         "second_same_container_rejected": True,
         "stop_freed_processes_and_ports": True,
@@ -259,9 +352,13 @@ async def verify() -> dict[str, Any]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.parse_args()
+    parser.add_argument("--barrier-dir", type=Path, required=True)
+    parser.add_argument("--participant", choices=("first", "second"), required=True)
+    arguments = parser.parse_args()
     try:
-        report = asyncio.run(verify())
+        report = asyncio.run(
+            verify(barrier_dir=arguments.barrier_dir, participant=arguments.participant)
+        )
     except (BrowserRuntimeError, OSError, subprocess.SubprocessError, VerificationError) as error:
         print(json.dumps({"ready": False, "error": str(error)}, sort_keys=True))
         return 1
