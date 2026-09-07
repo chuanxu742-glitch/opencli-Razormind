@@ -800,13 +800,13 @@ def _clip_contains(container: Any, candidate: Any) -> bool:
     )
 
 
-async def route_portal_frame(
+def validate_portal_frame_binding(
     owner_route: PortalOwnerRouteV1,
     frame: PortalWireFrameV1,
     *,
     now: datetime | None = None,
 ) -> PortalWireFrameV1:
-    """Validate complete wire binding before resolving the live page."""
+    """Validate the transient wire at the center without an edge-local record."""
 
     checked_at = now or datetime.now(timezone.utc)
     if owner_route.route_expires_at <= checked_at:
@@ -822,7 +822,6 @@ async def route_portal_frame(
         or binding.view_generation != route_binding.view_generation
     ):
         raise ValueError("portal frame is outside the owner route binding")
-    await _resolve_frozen_portal_record_session(owner_route.binding)
     if frame.contract_version != owner_route.contract_version:
         raise ValueError("portal frame and owner route contract versions differ")
     if frame.encoding == "pixel-binary":
@@ -854,6 +853,19 @@ async def route_portal_frame(
             if control.field_ref != owner_route.region_focus.focused_field_ref:
                 raise ValueError("portal input is outside approved focus")
     return frame
+
+
+async def route_portal_frame(
+    owner_route: PortalOwnerRouteV1,
+    frame: PortalWireFrameV1,
+    *,
+    now: datetime | None = None,
+) -> PortalWireFrameV1:
+    """Validate the wire and the actual record on the node holding the page."""
+
+    validated = validate_portal_frame_binding(owner_route, frame, now=now)
+    await _resolve_frozen_portal_record_session(owner_route.binding)
+    return validated
 
 
 async def invoke_portal_owner_transport(
