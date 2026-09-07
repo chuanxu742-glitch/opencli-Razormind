@@ -1,7 +1,7 @@
 """Persist digest-only portal tickets and short-lived owner credentials."""
 
-from alembic import op
 import sqlalchemy as sa
+from alembic import op
 
 revision = "add_browser_portal_security"
 down_revision = "refine_browser_account_contract"
@@ -27,7 +27,9 @@ def upgrade() -> None:
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("hard_expires_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("consumed_at", sa.DateTime(timezone=True), nullable=True),
-        sa.CheckConstraint("session_revision >= 0", name="ck_browser_portal_tickets_session_revision"),
+        sa.CheckConstraint(
+            "session_revision >= 0", name="ck_browser_portal_tickets_session_revision"
+        ),
         sa.ForeignKeyConstraint(["workspace_id"], ["workspaces.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(["account_id"], ["browser_accounts.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(["session_id"], ["browser_login_sessions.id"], ondelete="CASCADE"),
@@ -66,7 +68,9 @@ def upgrade() -> None:
         sa.Column("hard_expires_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("revoked_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("active", sa.Boolean(), nullable=False, server_default=sa.true()),
-        sa.CheckConstraint("session_revision >= 0", name="ck_browser_portal_owners_session_revision"),
+        sa.CheckConstraint(
+            "session_revision >= 0", name="ck_browser_portal_owners_session_revision"
+        ),
         sa.ForeignKeyConstraint(["workspace_id"], ["workspaces.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(["account_id"], ["browser_accounts.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(["session_id"], ["browser_login_sessions.id"], ondelete="CASCADE"),
@@ -76,15 +80,9 @@ def upgrade() -> None:
     op.create_index(
         "ix_browser_portal_owners_workspace_id", "browser_portal_owners", ["workspace_id"]
     )
-    op.create_index(
-        "ix_browser_portal_owners_account_id", "browser_portal_owners", ["account_id"]
-    )
-    op.create_index(
-        "ix_browser_portal_owners_session_id", "browser_portal_owners", ["session_id"]
-    )
-    op.create_index(
-        "ix_browser_portal_owners_ticket_id", "browser_portal_owners", ["ticket_id"]
-    )
+    op.create_index("ix_browser_portal_owners_account_id", "browser_portal_owners", ["account_id"])
+    op.create_index("ix_browser_portal_owners_session_id", "browser_portal_owners", ["session_id"])
+    op.create_index("ix_browser_portal_owners_ticket_id", "browser_portal_owners", ["ticket_id"])
     op.create_index(
         "ix_browser_portal_owners_scope",
         "browser_portal_owners",
