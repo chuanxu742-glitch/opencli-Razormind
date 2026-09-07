@@ -309,7 +309,9 @@ async def list_browser_accounts(
         .scalars()
         .all()
     )
-    next_cursor = rows.pop().id if len(rows) > limit else None
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    next_cursor = rows[-1].id if has_more else None
     return rows, next_cursor
 
 
