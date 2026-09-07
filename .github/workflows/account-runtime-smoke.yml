@@ -19,6 +19,24 @@ on:
       - chrome/script-host/**
       - scripts/verify_account_runtime_container.py
       - .github/workflows/account-runtime-smoke.yml
+  pull_request:
+    paths:
+      - agent/Dockerfile
+      - agent/entrypoint.sh
+      - backend/browser_account_runtime.py
+      - backend/browser_account_process.py
+      - backend/browser_account_errors.py
+      - tests/unit/test_browser_account_process.py
+      - tests/unit/test_process_tree_supervisor.py
+      - tests/unit/test_agent_entrypoint_lifecycle.py
+      - chrome/runtime-bundles/**
+      - chrome/script-host/**
+      - scripts/verify_account_runtime_container.py
+      - .github/workflows/account-runtime-smoke.yml
+
+concurrency:
+  group: account-runtime-smoke-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read

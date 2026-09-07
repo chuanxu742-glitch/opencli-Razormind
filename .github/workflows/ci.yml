@@ -8,6 +8,10 @@ on:
       - codex/**
   pull_request:
   workflow_dispatch:
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
 
 permissions:
   contents: read
@@ -15,6 +19,7 @@ permissions:
 jobs:
   extension:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     name: Browser Extension
     defaults:
       run:
@@ -48,6 +53,7 @@ jobs:
 
   frontend:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     name: Next Frontend
     defaults:
       run:
@@ -98,6 +104,7 @@ jobs:
 
   release-contract:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     name: Source Recovery Smoke
     env:
       API_AUTH_TOKEN: ci-release-token
@@ -144,6 +151,7 @@ jobs:
 
   backend:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     name: Backend Quality
     steps:
       - name: Checkout
@@ -197,6 +205,7 @@ jobs:
 
   frontend-workflow-checks:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     name: Frontend Workflow Checks
     defaults:
       run:
@@ -232,6 +241,7 @@ jobs:
 
   migrations:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     name: Alembic Migrations
     services:
       postgres:
@@ -305,6 +315,7 @@ jobs:
 
   cargo:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     name: ODP Rust (odp-rs)
     defaults:
       run:
@@ -339,3 +350,47 @@ jobs:
 
       - name: cargo clippy --workspace -- -D warnings
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+  ci-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    name: CI Gate
+    if: ${{ always() }}
+    needs:
+      - extension
+      - frontend
+      - release-contract
+      - backend
+      - frontend-workflow-checks
+      - migrations
+      - cargo
+    steps:
+      - name: Reject incomplete CI
+        if: >-
+          ${{
+            !(
+              needs.extension.result == 'success' &&
+              needs.frontend.result == 'success' &&
+              needs['release-contract'].result == 'success' &&
+              needs.backend.result == 'success' &&
+              needs['frontend-workflow-checks'].result == 'success' &&
+              needs.migrations.result == 'success' &&
+              needs.cargo.result == 'success'
+            )
+          }}
+        run: |
+          echo "CI Gate requires every required CI job to succeed."
+          exit 1
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Run release gate offline tests
+        run: node --test .github/scripts/require-release-ci.test.cjs
