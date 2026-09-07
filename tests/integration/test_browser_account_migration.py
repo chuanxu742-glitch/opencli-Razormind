@@ -164,6 +164,40 @@ async def test_refine_head_preserves_legacy_binding_and_enforces_workspace_pairs
                 "fk_browser_commands_session_workspace",
                 "fk_browser_profile_manifest_command_workspace",
             } <= constraints
+            portal_tables = {
+                row[0]
+                for row in (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT table_name
+                            FROM information_schema.tables
+                            WHERE table_schema = 'public'
+                              AND table_name IN ('browser_portal_tickets', 'browser_portal_owners')
+                            """
+                        )
+                    )
+                ).all()
+            }
+            assert {"browser_portal_tickets", "browser_portal_owners"} <= portal_tables
+
+            session_columns = {
+                row[0]
+                for row in (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT column_name
+                            FROM information_schema.columns
+                            WHERE table_schema = 'public'
+                              AND table_name = 'browser_login_sessions'
+                            """
+                        )
+                    )
+                ).all()
+            }
+            assert {"revision", "view_generation", "document_id"} <= session_columns
+
 
             await connection.execute(
                 text(

@@ -233,6 +233,12 @@ class Settings(BaseSettings):
     # Multi-agent pool: overrides opencli_cdp_endpoint when set.
     # e.g. http://agent-1:19222,http://agent-2:19222,http://192.168.1.100:19222
     agent_pool_endpoints: str = ""
+    # Account-capable nodes authenticate with the center using these
+    # deployment-provided identity values.  Empty values keep this process
+    # anonymous-only; the server never accepts them from task payloads.
+    agent_node_id: str = ""
+    agent_node_credential_id: str = ""
+    agent_node_credential: str = ""
     # noVNC base port for the first agent instance (agent-1). Additional
     # instances use base+1, base+2, …  Matches docker-compose NOVNC_PORT.
     novnc_base_port: int = 6080

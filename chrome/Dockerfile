@@ -9,13 +9,17 @@ COPY scripts/patch-opencli.js /tmp/patch-opencli.js
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium x11vnc xvfb novnc websockify procps nginx \
     fonts-noto-cjk gettext-base \
-    curl ca-certificates unzip \
+    curl ca-certificates unzip util-linux \
     && curl -fsSL https://deb.nodesource.com/setup_26.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && npm install -g @jackwener/opencli@${OPENCLI_VERSION} \
     && node /tmp/patch-opencli.js \
     && rm /tmp/patch-opencli.js \
     && rm -rf /root/.npm /var/lib/apt/lists/*
+RUN mkdir -p /etc/chromium/policies/managed \
+    && printf '%s\n' '{"PasswordManagerEnabled":false,"AutofillAddressEnabled":false,"AutofillCreditCardEnabled":false}' \
+       > /etc/chromium/policies/managed/opencli-account-runtime.json \
+    && chmod 0644 /etc/chromium/policies/managed/opencli-account-runtime.json
 RUN if [ "$BROWSER_ENGINE" = "cloakbrowser" ]; then \
       mkdir -p /opt/cloakbrowser \
       && npm install --prefix /opt/cloakbrowser --omit=dev \
@@ -35,7 +39,8 @@ RUN useradd -m -u 1000 chrome \
     && sed -i 's/user www-data;//' /etc/nginx/nginx.conf \
     && sed -i 's|pid /run/nginx.pid|pid /tmp/nginx.pid|' /etc/nginx/nginx.conf \
     && mkdir -p /tmp/.X11-unix /opt/cloakbrowser/cache \
-    && chown -R chrome:chrome /opt/cloakbrowser \
+       /home/chrome/.local/state/opencli-account-runtime /var/lib/opencli/account-runtime \
+    && chown -R chrome:chrome /opt/cloakbrowser /var/lib/opencli \
     && chmod 1777 /tmp/.X11-unix \
     && ln -sf /usr/share/novnc/vnc_lite.html /usr/share/novnc/index.html
 
@@ -71,6 +76,9 @@ COPY scripts/resolve-browser-executable.mjs /usr/local/bin/resolve-browser-execu
 RUN chmod +x /usr/local/bin/resolve-browser-executable.mjs
 
 ENV BROWSER_ENGINE=${BROWSER_ENGINE} \
+    PROFILE_DIR=/home/chrome/.config/chromium \
+    RUNTIME_STATE_DIR=/home/chrome/.local/state/opencli-account-runtime \
+    CHROMIUM_POLICY_FILE=/etc/chromium/policies/managed/opencli-account-runtime.json \
     CLOAKBROWSER_CACHE_DIR=/opt/cloakbrowser/cache
 EXPOSE 6080 19222 19825
 

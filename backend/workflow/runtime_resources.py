@@ -32,6 +32,15 @@ def resolve_runtime_resources(
     adapter_node = resolve_opencli_adapter_node(adapter_node_id) if adapter_node_id else None
     mutation_mode = "write" if adapter_node and adapter_node.access == "write" else "read"
     requested_capability = f"opencli.{dispatch.site}.{dispatch.command or 'unresolved'}"
+    account_id = _read_string(
+        node.params.get("accountId", node.params.get("account_id"))
+    )
+    binding_revision_id = _read_string(
+        node.params.get(
+            "sourceBindingRevisionId",
+            node.params.get("source_binding_revision_id"),
+        )
+    )
     requirement = WorkflowRuntimeResourceRequirement(
         nodeId=dispatch.nodeId,
         sourceGroup=dispatch.sourceGroup,
@@ -39,6 +48,8 @@ def resolve_runtime_resources(
         mutationMode=mutation_mode,
         requestedCapability=requested_capability,
         adapterNodeId=adapter_node_id,
+        accountId=account_id,
+        sourceBindingRevisionId=binding_revision_id,
     )
 
     if not dispatch.command:
@@ -46,6 +57,22 @@ def resolve_runtime_resources(
             MISSING_OPENCLI_COMMAND,
             "OpenCLI command could not be resolved from runtime metadata.",
             requirement,
+        )
+
+    if account_id is not None:
+        if binding_revision_id is None:
+            return requirement, _blocked(
+                "account_binding_revision_required",
+                "Account execution requires a fixed SourceBindingRevision.",
+                requirement,
+            )
+        # The account service owns lease/node selection. Do not derive a
+        # profile lock, snapshot, or worker slot from site/fleet metadata.
+        return requirement, WorkflowRuntimeResourceResolution(
+            status="resolved",
+            adapterNodeId=adapter_node_id or (node.adapter.id if node.adapter else None),
+            command=dispatch.command,
+            concurrencyLimit=1,
         )
 
     if adapter_node_id and adapter_node is None:

@@ -1,19 +1,47 @@
 """Browser helpers and structured runtime dispatch for the edge agent."""
 
 import asyncio
+import base64
 import csv
 import io
 import json
 import logging
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 import yaml
 from fastapi import HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from backend.agent_runtimes.base import AgentTask, RuntimeInvocationError
 from backend.agent_runtimes.registry import get_runtime
+from backend.browser_account_runtime import (
+    BrowserRuntimeError,
+    SessionRuntimeBinding,
+    runtime_lease_book,
+    session_portal_registry,
+    session_runtime_registry,
+)
+from backend.schemas.browser_account import (
+    CommandExecutionGuardV1,
+    DurableCommandV1,
+    NodeClaimV1,
+    NodeIdentityV1,
+    PortalControlMessageV1,
+    PortalOuterBindingV1,
+    PortalOwnerRouteV1,
+    PortalPixelFrameV1,
+    PortalRegionFocusV1,
+    PortalTransientV1,
+    PortalWireFrameV1,
+    PortalWireLayoutV1,
+    SensitiveSessionBindingV1,
+    SessionEnvelopeV1,
+)
+from backend.services.browser_portal_contract import portal_wire_metadata_length
 
 logger = logging.getLogger(__name__)
 
@@ -21,12 +49,209 @@ logger = logging.getLogger(__name__)
 class RuntimeInvokeRequest(BaseModel):
     """Structured runtime action forwarded only from an allowlisted bundle."""
 
+    model_config = ConfigDict(extra="forbid")
+
     runtime: str
     workflow: str
-    instructions: str
+    instructions: str = ""
     input: dict[str, Any] = {}
     config: dict[str, Any] = {}
+    # Account dispatch is admitted only with the existing typed claim/session
+    # envelope.  The edge never accepts a client endpoint as a substitute.
+    command: DurableCommandV1 | None = None
+    claim: NodeClaimV1 | None = None
+    session: SessionEnvelopeV1 | None = None
+    node_identity: NodeIdentityV1 | None = None
 
+
+@dataclass(frozen=True)
+class AccountRuntimeContext:
+    guard: CommandExecutionGuardV1
+    binding: SessionRuntimeBinding
+
+    @property
+    def cdp_endpoint(self) -> str:
+        return self.binding.cdp_endpoint
+
+    @property
+    def server_config(self) -> dict[str, Any]:
+        # Only non-secret process routing facts are projected into the adapter.
+        # The caller's config is never allowed to override these values.
+        return {
+            "remote": self.binding.bbx_remote,
+            "daemon_endpoint": self.binding.daemon_endpoint,
+            "profile_dir": str(self.binding.profile_dir),
+            "home_dir": str(self.binding.home_dir),
+            "cache_dir": str(self.binding.cache_dir),
+            "display": self.binding.display,
+            "cdp_endpoint": self.binding.cdp_endpoint,
+        }
+
+
+def resolve_account_runtime_context(req: RuntimeInvokeRequest) -> AccountRuntimeContext:
+    """Validate a server-resolved command/claim/session tuple before side effects."""
+
+    if req.command is None or req.claim is None or req.session is None or req.node_identity is None:
+        raise HTTPException(
+            status_code=409,
+            detail="account runtime dispatch requires command, claim, session, and node identity",
+        )
+    try:
+        guard = CommandExecutionGuardV1(
+            command=req.command,
+            claim=req.claim,
+            session=req.session,
+        )
+        binding = session_runtime_registry().resolve(
+            session_id=guard.session.session_id,
+            node_id=guard.claim.node_id,
+            boot_id=guard.claim.boot_id,
+            epoch=guard.claim.epoch,
+        )
+        runtime_lease_book().renew(
+            claim=guard.claim,
+            node_identity=req.node_identity,
+            now=datetime.now(UTC),
+        )
+    except (ValueError, BrowserRuntimeError) as exc:
+        code = exc.code if isinstance(exc, BrowserRuntimeError) else "runtime_context_invalid"
+        raise HTTPException(status_code=409, detail=code) from exc
+    if (
+        req.node_identity.node_id != guard.claim.node_id
+        or req.node_identity.boot_id != guard.claim.boot_id
+    ):
+        raise HTTPException(status_code=401, detail="authenticated node identity does not own claim")
+    forbidden = {
+        "remote",
+        "binary",
+        "cdp_endpoint",
+        "endpoint",
+        "daemon_endpoint",
+        "profile_dir",
+        "home_dir",
+        "cache_dir",
+        "display",
+    }
+    if forbidden.intersection(req.config):
+        raise HTTPException(status_code=400, detail="client runtime routing override is forbidden")
+
+
+async def prepare_portal_route(
+    agent_url: str,
+    session_envelope: SessionEnvelopeV1,
+    *,
+    session_revision: int,
+    timeout: float = 15,
+) -> PortalOwnerRouteV1:
+    """Resolve one live edge page, RecordSession and L-approved focus into a route."""
+
+    if isinstance(session_revision, bool) or not isinstance(session_revision, int) or session_revision < 0:
+        raise ValueError("portal route requires an authorized session revision")
+    if not 0 < timeout <= 30:
+        raise ValueError("portal route timeout must be between zero and thirty seconds")
+    if session_envelope.purpose != "login":
+        raise ValueError("portal routes require a login session")
+    target = session_envelope.target
+    target.require_complete()
+    if session_envelope.login_rule_id is None or session_envelope.login_rule_version is None:
+        raise ValueError("portal routes require a fixed login rule")
+    try:
+        runtime = session_runtime_registry().resolve(
+            session_id=session_envelope.session_id,
+            node_id=session_envelope.node_id,
+            boot_id=session_envelope.node_boot_id,
+            epoch=session_envelope.epoch,
+        )
+        registration = session_portal_registry().resolve(
+            session_id=session_envelope.session_id,
+            node_id=session_envelope.node_id,
+            boot_id=session_envelope.node_boot_id,
+            epoch=session_envelope.epoch,
+            agent_url=agent_url,
+        )
+    except BrowserRuntimeError as exc:
+        raise RuntimeError(exc.code) from exc
+
+    request = RuntimeInvokeRequest(
+        runtime="script-host",
+        workflow="login.observe",
+        input={
+            "session_id": session_envelope.session_id,
+            "epoch": session_envelope.epoch,
+            "target": target.model_dump(mode="json") | {
+                "view_generation": session_envelope.view_generation
+            },
+        },
+        config={
+            "pack": "account-login",
+            "action": "login.observe",
+            "tab_id": target.tab_id,
+        },
+    )
+    try:
+        observation_response = await asyncio.wait_for(
+            invoke_script_host(request, cdp_endpoint=runtime.cdp_endpoint),
+            timeout=timeout,
+        )
+    except TimeoutError as exc:
+        raise RuntimeError("login observe timed out") from exc
+    if observation_response.get("ok") is not True:
+        raise RuntimeError("login observe rejected the live target")
+    observation = observation_response.get("result")
+    if not isinstance(observation, dict):
+        raise RuntimeError("login observe returned no observation")
+    if (
+        observation.get("session_id") != session_envelope.session_id
+        or observation.get("epoch") != session_envelope.epoch
+        or observation.get("rule_id") != session_envelope.login_rule_id
+        or observation.get("rule_version") != session_envelope.login_rule_version
+        or observation.get("target") != target.model_dump(mode="json")
+        or observation.get("view_generation") != session_envelope.view_generation
+    ):
+        raise RuntimeError("login observe lineage does not match the authorized session")
+    try:
+        focus = PortalRegionFocusV1.model_validate(observation.get("region_focus"))
+    except ValueError as exc:
+        raise RuntimeError("login observe returned no approved portal focus") from exc
+    if (
+        focus.target != target
+        or focus.view_generation != session_envelope.view_generation
+    ):
+        raise RuntimeError("login observe focus lineage changed")
+
+    binding = SensitiveSessionBindingV1(
+        account_ref={
+            "workspace_id": session_envelope.workspace_id,
+            "account_id": session_envelope.account_id,
+        },
+        session_id=session_envelope.session_id,
+        epoch=session_envelope.epoch,
+        target=target,
+        view_generation=session_envelope.view_generation,
+        record_session_id=getattr(registration.record_session, "session_id", None),
+    )
+    from backend.services.browser_portal_contract import (
+        freeze_portal_record_session,
+        register_portal_record_session,
+    )
+
+    register_portal_record_session(binding, registration.record_session)
+    await freeze_portal_record_session(binding, registration.record_session)
+    return PortalOwnerRouteV1(
+        binding=binding,
+        node_identity=NodeIdentityV1(
+            node_id=session_envelope.node_id,
+            boot_id=session_envelope.node_boot_id,
+        ),
+        owner_endpoint=registration.owner_endpoint,
+        tunnel_handle=registration.tunnel_handle,
+        tunnel_auth_digest=registration.tunnel_auth_digest,
+        region_focus=focus,
+        session_revision=session_revision,
+        route_expires_at=datetime.now(UTC) + timedelta(seconds=timeout),
+        max_frame_bytes=4_000_000,
+        max_input_bytes=4_096,
+    )
 
 async def snapshot_tab_ids(cdp_endpoint: str) -> set[str]:
     """Return the set of tab IDs currently open in Chrome."""
@@ -84,36 +309,44 @@ def parse_output(raw: str, fmt: str) -> list[dict]:
     if fmt == "csv":
         return list(csv.DictReader(io.StringIO(raw.strip())))
     return [{"content": raw}]
-
-
-async def _evaluate_cdp_target(websocket_url: str, expression: str) -> Any:
-    """Evaluate one expression in an existing CDP target and return its value."""
+async def _cdp_command(
+    websocket_url: str,
+    method: str,
+    params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run one CDP command against the already-resolved real page target."""
     import websockets
 
     async with websockets.connect(websocket_url, open_timeout=5) as websocket:
         await websocket.send(
-            json.dumps(
-                {
-                    "id": 1,
-                    "method": "Runtime.evaluate",
-                    "params": {
-                        "expression": expression,
-                        "awaitPromise": True,
-                        "returnByValue": True,
-                    },
-                }
-            )
+            json.dumps({"id": 1, "method": method, "params": params or {}})
         )
         while True:
             message = json.loads(await asyncio.wait_for(websocket.recv(), timeout=30))
             if message.get("id") != 1:
                 continue
-            if "error" in message or message.get("result", {}).get("exceptionDetails"):
-                raise RuntimeError(
-                    message.get("error")
-                    or message["result"]["exceptionDetails"].get("text", "CDP evaluation failed")
-                )
-            return message.get("result", {}).get("result", {}).get("value")
+            if "error" in message:
+                raise RuntimeError(message["error"])
+            result = message.get("result")
+            if not isinstance(result, dict):
+                raise RuntimeError(f"CDP {method} returned no result")
+            return result
+
+
+async def _evaluate_cdp_target(websocket_url: str, expression: str) -> Any:
+    """Evaluate one expression in an existing CDP target and return its value."""
+    result = await _cdp_command(
+        websocket_url,
+        "Runtime.evaluate",
+        {
+            "expression": expression,
+            "awaitPromise": True,
+            "returnByValue": True,
+        },
+    )
+    if result.get("exceptionDetails"):
+        raise RuntimeError(result["exceptionDetails"].get("text", "CDP evaluation failed"))
+    return result.get("result", {}).get("value")
 
 
 def _script_host_action(req: RuntimeInvokeRequest) -> tuple[str, str]:
@@ -180,17 +413,312 @@ async def invoke_script_host(req: RuntimeInvokeRequest, *, cdp_endpoint: str) ->
     raise HTTPException(status_code=503, detail="OpenCLI Script Host target is unavailable")
 
 
+async def resolve_portal_target(cdp_endpoint: str, route: PortalOwnerRouteV1) -> str:
+    """Resolve the exact live page target; never accept a caller endpoint."""
+    target = route.binding.target
+    target.require_complete()
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            response = await client.get(f"{cdp_endpoint.rstrip('/')}/json/list")
+            response.raise_for_status()
+            targets = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise RuntimeError("Chrome CDP target listing is unavailable") from exc
+    matches = [
+        item
+        for item in targets
+        if item.get("type") == "page"
+        and str(item.get("id")) == str(target.tab_id)
+        and isinstance(item.get("webSocketDebuggerUrl"), str)
+    ]
+    if len(matches) != 1:
+        raise RuntimeError("portal page target is missing or ambiguous")
+    page_url = matches[0].get("url", "")
+    actual = urlparse(page_url)
+    expected = urlparse(target.origin or "")
+    if (
+        not actual.scheme
+        or not actual.netloc
+        or (actual.scheme, actual.netloc) != (expected.scheme, expected.netloc)
+    ):
+        raise RuntimeError("portal page origin does not match server target")
+    return matches[0]["webSocketDebuggerUrl"]
+
+
+def _portal_binding(route: PortalOwnerRouteV1) -> PortalOuterBindingV1:
+    binding = route.binding
+    return PortalOuterBindingV1(
+        workspace_id=binding.account_ref.workspace_id,
+        account_id=binding.account_ref.account_id,
+        session_id=binding.session_id,
+        epoch=binding.epoch,
+        target=binding.target,
+        view_generation=binding.view_generation,
+    )
+
+
+async def _portal_masked_regions(
+    websocket_url: str,
+    route: PortalOwnerRouteV1,
+) -> list[dict[str, int]]:
+    """Measure sensitive fields in the approved clip without reading their values."""
+
+    regions = await _evaluate_cdp_target(
+        websocket_url,
+        """(() => [...document.querySelectorAll('[data-sensitive-field]')].map((node) => {
+          const rect = node.getBoundingClientRect();
+          return {x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height)};
+        }))()""",
+    )
+    if not isinstance(regions, list):
+        return []
+    allowed = route.region_focus.approved_regions
+    masked: list[dict[str, int]] = []
+    for region in regions[:32]:
+        if not isinstance(region, dict):
+            continue
+        values = {name: region.get(name) for name in ("x", "y", "width", "height")}
+        if not all(isinstance(value, int) for value in values.values()):
+            continue
+        if values["width"] <= 0 or values["height"] <= 0:
+            continue
+        if any(
+            candidate.x <= values["x"]
+            and candidate.y <= values["y"]
+            and values["x"] + values["width"] <= candidate.x + candidate.width
+            and values["y"] + values["height"] <= candidate.y + candidate.height
+            for candidate in allowed
+        ):
+            masked.append(values)
+    return masked
+
+
+async def _apply_guarded_field_input(
+    websocket_url: str,
+    route: PortalOwnerRouteV1,
+    control: PortalControlMessageV1,
+) -> None:
+    """Set transient input only on the current L-approved focused DOM field."""
+
+    payload = control.sensitive_payload
+    if (
+        payload is None
+        or payload.value is None
+        or control.field_ref != route.region_focus.focused_field_ref
+        or not control.field_ref
+    ):
+        raise ValueError("portal field input is outside approved focus")
+    field = control.field_ref.removeprefix("controlled-login-fixture:")
+    if not field or field == control.field_ref:
+        raise ValueError("portal field reference is invalid")
+    expected = {
+        "origin": route.binding.target.origin,
+        "documentId": route.binding.target.document_id,
+        "viewGeneration": route.binding.view_generation,
+        "field": field,
+        "value": payload.value.get_secret_value(),
+    }
+    expression = f"""(async (expected) => {{
+      if (window.location.origin !== expected.origin) return false;
+      const [identityResponse, statusResponse] = await Promise.all([
+        fetch('/identity', {{credentials: 'same-origin', cache: 'no-store'}}),
+        fetch('/auth-status', {{credentials: 'same-origin', cache: 'no-store'}}),
+      ]);
+      if (!identityResponse.ok || !statusResponse.ok) return false;
+      const [identity, status] = await Promise.all([identityResponse.json(), statusResponse.json()]);
+      const evidence = status && status.evidence;
+      if (!evidence ||
+          String(identity.document_generation) !== String(expected.documentId) ||
+          identity.view_generation !== expected.viewGeneration ||
+          String(evidence.document_generation) !== String(expected.documentId) ||
+          evidence.view_generation !== expected.viewGeneration) return false;
+      const matches = [...document.querySelectorAll('[data-sensitive-field]')].filter(
+        (node) => node.getAttribute('data-sensitive-field') === expected.field,
+      );
+      if (matches.length !== 1 || document.activeElement !== matches[0]) return false;
+      const rect = matches[0].getBoundingClientRect();
+      const allowed = {json.dumps([region.model_dump() for region in route.region_focus.approved_regions], separators=(",", ":"))};
+      if (!allowed.some((region) => rect.x >= region.x && rect.y >= region.y &&
+          rect.x + rect.width <= region.x + region.width &&
+          rect.y + rect.height <= region.y + region.height)) return false;
+      matches[0].value = expected.value;
+      matches[0].dispatchEvent(new Event('input', {{bubbles: true}}));
+      matches[0].dispatchEvent(new Event('change', {{bubbles: true}}));
+      return true;
+    }})({json.dumps(expected, separators=(",", ":"))})"""
+    try:
+        accepted = await _evaluate_cdp_target(websocket_url, expression)
+    finally:
+        expected["value"] = ""
+    if accepted is not True:
+        raise ValueError("portal field input target is stale or unfocused")
+
+
+async def capture_portal_frame(
+    *,
+    websocket_url: str,
+    route: PortalOwnerRouteV1,
+    sequence: int,
+) -> PortalWireFrameV1:
+    """Capture only the first L-approved region from the real page target."""
+    region = route.region_focus.approved_regions[0]
+    result = await _cdp_command(
+        websocket_url,
+        "Page.captureScreenshot",
+        {
+            "format": "png",
+            "fromSurface": True,
+            "captureBeyondViewport": False,
+            "clip": {
+                "x": region.x,
+                "y": region.y,
+                "width": region.width,
+                "height": region.height,
+                "scale": 1,
+            },
+        },
+    )
+    raw = base64.b64decode(result.get("data", ""), validate=True)
+    masked_regions = await _portal_masked_regions(websocket_url, route)
+    try:
+        from PIL import Image, ImageDraw
+
+        image = Image.open(io.BytesIO(raw))
+        draw = ImageDraw.Draw(image)
+        for masked in masked_regions:
+            draw.rectangle(
+                (
+                    masked["x"] - region.x,
+                    masked["y"] - region.y,
+                    masked["x"] - region.x + masked["width"],
+                    masked["y"] - region.y + masked["height"],
+                ),
+                fill=(0, 0, 0),
+            )
+        projected = io.BytesIO()
+        image.save(projected, format="PNG")
+        raw = projected.getvalue()
+    except ImportError:
+        if masked_regions:
+            raise RuntimeError("portal screenshot masking requires Pillow")
+
+    pixel = PortalPixelFrameV1(
+        workspace_id=route.binding.account_ref.workspace_id,
+        account_id=route.binding.account_ref.account_id,
+        session_id=route.binding.session_id,
+        epoch=route.binding.epoch,
+        target=route.binding.target,
+        view_generation=route.binding.view_generation,
+        sequence=sequence,
+        region_kind=route.region_focus.region_kind,
+        mime_type="image/png",
+        expires_at=datetime.now(UTC) + timedelta(seconds=5),
+        clip=region,
+        masked_regions=masked_regions,
+        byte_length=len(raw),
+        frame_bytes=raw,
+    )
+    binding = _portal_binding(route)
+    frame = PortalWireFrameV1(
+        sequence=sequence,
+        encoding="pixel-binary",
+        content_type="application/octet-stream",
+        mime_type="image/png",
+        byte_length=len(raw),
+        layout=PortalWireLayoutV1(metadata_bytes=1, payload_bytes=len(raw)),
+        transient=PortalTransientV1(binding=binding, pixel=pixel),
+    )
+    metadata_bytes = portal_wire_metadata_length(frame)
+    return frame.model_copy(
+        update={
+            "layout": PortalWireLayoutV1(
+                metadata_bytes=metadata_bytes,
+                payload_bytes=len(raw),
+            )
+        }
+    )
+
+
+def _point_in_regions(route: PortalOwnerRouteV1, x: int, y: int) -> bool:
+    return any(
+        region.x <= x < region.x + region.width
+        and region.y <= y < region.y + region.height
+        for region in route.region_focus.approved_regions
+    )
+
+
+async def apply_portal_control(
+    *,
+    websocket_url: str,
+    cdp_endpoint: str,
+    route: PortalOwnerRouteV1,
+    control: PortalControlMessageV1,
+) -> bool:
+    """Apply one approved control through CDP or the packaged Script Host."""
+
+    payload = control.sensitive_payload
+    if control.kind == "request_view":
+        return True
+    if control.kind == "field_input":
+        await _apply_guarded_field_input(websocket_url, route, control)
+        return True
+    if payload is None:
+        raise ValueError("portal control requires transient payload")
+    if control.kind == "pointer":
+        if payload.x is None or payload.y is None or not _point_in_regions(route, payload.x, payload.y):
+            raise ValueError("portal pointer is outside approved regions")
+        for event_type in ("mousePressed", "mouseReleased"):
+            await _cdp_command(
+                websocket_url,
+                "Input.dispatchMouseEvent",
+                {"type": event_type, "x": payload.x, "y": payload.y, "button": "left", "clickCount": 1},
+            )
+        return True
+    if control.kind == "key":
+        if payload.key is None:
+            raise ValueError("portal key control has no key")
+        key = payload.key
+        await _cdp_command(websocket_url, "Input.dispatchKeyEvent", {"type": "keyDown", "key": key})
+        await _cdp_command(websocket_url, "Input.dispatchKeyEvent", {"type": "keyUp", "key": key})
+        return True
+    if control.kind == "takeover":
+        return True
+    raise ValueError("unsupported portal control")
+
+
 async def invoke_runtime(
     request_id: str,
     req: RuntimeInvokeRequest,
     *,
-    cdp_endpoint: str,
+    cdp_endpoint: str | None = None,
+    account_context: AccountRuntimeContext | None = None,
 ) -> dict:
     if req.runtime == "codex":
         raise HTTPException(
             status_code=403,
             detail="Codex runtime is only available through controller WS dispatch",
         )
+    if account_context is not None:
+        cdp_endpoint = account_context.cdp_endpoint
+        server_config = account_context.server_config
+        # The account binding is the only authority for process routing.  The
+        # client request can carry action arguments but never endpoint/binary
+        # selection or BBX remote targets.
+        merged_config = dict(server_config)
+        merged_config.update({key: value for key, value in req.config.items() if key not in {
+            "remote",
+            "binary",
+            "cdp_endpoint",
+            "endpoint",
+            "daemon_endpoint",
+            "profile_dir",
+            "home_dir",
+            "cache_dir",
+            "display",
+        }})
+        req = req.model_copy(update={"config": merged_config})
+    if not cdp_endpoint:
+        raise HTTPException(status_code=503, detail="runtime session has no server-resolved CDP binding")
     if req.runtime == "script-host":
         return await invoke_script_host(req, cdp_endpoint=cdp_endpoint)
     try:

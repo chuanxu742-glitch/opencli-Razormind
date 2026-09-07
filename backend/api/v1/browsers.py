@@ -5,7 +5,7 @@ import secrets
 import socket
 from datetime import UTC
 
-from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -99,6 +99,18 @@ logger = logging.getLogger(__name__)
 async def list_bindings(db: AsyncSession = Depends(get_db)) -> ApiResponse:
     bindings = await browser_service.list_bindings(db)
     return ApiResponse.ok([BrowserBindingRead.model_validate(b) for b in bindings])
+
+
+@router.get("/bindings/migration", response_model=ApiResponse[dict])
+async def inspect_binding_migration(
+    limit: int = Query(default=50, ge=1, le=200),
+    after_id: str | None = Query(default=None, max_length=36),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse:
+    """Expose preserved legacy mappings and explicit ownership blocks."""
+    return ApiResponse.ok(
+        await browser_service.inspect_legacy_binding_migration(db, limit=limit, after_id=after_id)
+    )
 
 
 @router.post("/bindings", response_model=ApiResponse[BrowserBindingRead])

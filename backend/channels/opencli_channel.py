@@ -41,6 +41,29 @@ _help_cache: dict[tuple[str, str, str], tuple[float, frozenset[str]]] = {}
 _browser_requirement_cache: dict[tuple[str, str, str], tuple[float, bool]] = {}
 
 
+_INTERNAL_ROUTING_KEYS = frozenset(
+    {
+        "chrome_endpoint",
+        "required_profile_kind",
+        "execution_id",
+        "account_ref",
+        "accountRef",
+        "account_id",
+        "accountId",
+        "workspace_id",
+        "workspaceId",
+        "source_binding_revision_id",
+        "sourceBindingRevisionId",
+        "caller_id",
+        "callerId",
+        "account_session",
+        "_account_ref",
+        "_account_session",
+        "_execution_context",
+    }
+)
+
+
 def _cache_get(
     cache: dict[tuple[str, str, str], tuple[float, Any]],
     key: tuple[str, str, str],
@@ -67,16 +90,41 @@ def _cache_set(
 def _split_routing_parameters(
     parameters: dict[str, Any],
 ) -> tuple[tuple[str | None, str | None], dict[str, Any]]:
-    """Separate Admin-only browser routing controls from capability arguments."""
+    """Separate internal browser routing controls from CLI capability args."""
     chrome_endpoint = parameters.get("chrome_endpoint") or None
     required_profile_kind = parameters.get("required_profile_kind") or None
     cli_parameters = {
         key: value
         for key, value in parameters.items()
-        if key not in {"chrome_endpoint", "required_profile_kind", "execution_id"}
+        if key not in _INTERNAL_ROUTING_KEYS
     }
     return (chrome_endpoint, required_profile_kind), cli_parameters
 
+
+def _account_session_from_parameters(parameters: dict[str, Any]) -> Any | None:
+    value = parameters.get("_account_session") or parameters.get("account_session")
+    if value is None:
+        return None
+    from backend.schemas.browser_account import SessionEnvelopeV1
+
+    return value if isinstance(value, SessionEnvelopeV1) else SessionEnvelopeV1.from_wire(value)
+
+
+
+async def _account_node_endpoint(pool: Any, node_id: str) -> str | None:
+    """Resolve a fenced account node to its registered pool endpoint."""
+    if not node_id:
+        return None
+    from backend.database import AsyncSessionLocal
+    from backend.models.edge_node import EdgeNode
+
+    async with AsyncSessionLocal() as session:
+        node = await session.get(EdgeNode, node_id)
+    endpoint = node.url.rstrip("/") if node is not None and node.url else None
+    if endpoint is None:
+        return None
+    endpoints = getattr(pool, "endpoints", ())
+    return endpoint if endpoint in endpoints else None
 
 async def _site_bound_agent_endpoint(pool: Any, site: str, session: AsyncSession) -> str | None:
     if not site:
@@ -107,23 +155,10 @@ async def _site_bound_agent_endpoint(pool: Any, site: str, session: AsyncSession
 
 
 async def _select_agent_endpoint(pool: Any, site: str, session: AsyncSession) -> str | None:
-    bound_endpoint = await _site_bound_agent_endpoint(pool, site, session)
-    if bound_endpoint:
-        logger.debug(
-            "agent mode: selected site-bound endpoint %s for site=%s",
-            bound_endpoint,
-            site,
-        )
-        return bound_endpoint
-
+    """Select an explicitly registered agent; site is not an identity key."""
+    del site, session
     agent_eps = [ep for ep in pool.endpoints if pool.get_agent_protocol(ep)]
-    if agent_eps:
-        logger.debug(
-            "agent mode: selected endpoint %s (has agent_protocol)",
-            agent_eps[0],
-        )
-        return agent_eps[0]
-    return None
+    return agent_eps[0] if agent_eps else None
 
 
 async def _kill_subprocess(proc, *, platform: str | None = None) -> None:
@@ -291,8 +326,6 @@ def _parse_table(raw: str) -> list[dict]:
         if len(cells) == len(headers):
             rows.append(dict(zip(headers, cells)))
     return rows if rows else [{"content": raw}]
-
-
 def _parse_markdown(raw: str) -> list[dict]:
     """Parse markdown table into list of dicts."""
     lines = [line.strip() for line in raw.splitlines() if line.strip().startswith("|")]
@@ -312,11 +345,11 @@ def _parse_markdown(raw: str) -> list[dict]:
 
 
 _PARSERS = {
-    "json":  _parse_json,
-    "yaml":  _parse_yaml,
-    "csv":   _parse_csv,
+    "json": _parse_json,
+    "yaml": _parse_yaml,
+    "csv": _parse_csv,
     "table": _parse_table,
-    "md":    _parse_markdown,
+    "md": _parse_markdown,
 }
 
 
@@ -329,13 +362,9 @@ async def _collect_via_agent(
     output_format: str,
     mode: str,
     execution_id: str | None = None,
+    account_session: Any | None = None,
 ) -> ChannelResult:
-    """Dispatch a collection request to a LAN agent server via HTTP POST.
-
-    The cdp_endpoint is intentionally omitted: the agent server uses its own
-    locally-configured Chrome (OPENCLI_CDP_ENDPOINT env var on the edge node).
-    The pool endpoint is only a logical identifier used by the center for routing.
-    """
+    """Dispatch to one authenticated node, optionally with a fenced session."""
     import httpx
 
     url = agent_url.rstrip("/") + "/collect"
@@ -348,6 +377,8 @@ async def _collect_via_agent(
         "mode": mode,
         "execution_id": execution_id or "",
     }
+    if account_session is not None:
+        payload["account_session"] = account_session.to_wire()
     from backend.config import get_settings
     logger.info("agent dispatch | url=%s site=%s cmd=%s", url, site, command)
     try:
@@ -397,15 +428,25 @@ async def _collect_via_ws_agent(
     output_format: str,
     mode: str,
     execution_id: str | None = None,
+    account_session: Any | None = None,
 ) -> ChannelResult:
-    """Dispatch a collect request to a NAT agent via the persistent reverse WS channel."""
+    """Dispatch through the same node session envelope over the reverse WS."""
     from backend import ws_agent_manager
 
     logger.info("WS agent dispatch | agent=%s site=%s cmd=%s", agent_url, site, command)
     try:
         result = await ws_agent_manager.dispatch_collect(
-            agent_url, site, command, args, positional_args, output_format, mode,
+            agent_url,
+            site,
+            command,
+            args,
+            positional_args,
+            output_format,
+            mode,
             request_id=execution_id,
+            account_session=(
+                account_session.to_wire() if account_session is not None else None
+            ),
         )
     except TimeoutError:
         logger.error("WS agent timeout | agent=%s", agent_url)
@@ -433,8 +474,6 @@ async def _collect_via_ws_agent(
         items, site=site, command=command, node_url=agent_url, chrome_mode=mode,
         **agent_metadata,
     )
-
-
 async def _check_bridge_ready(daemon_host: str, daemon_port: int) -> str | None:
     """Return an error string if the bridge extension is not ready, else None.
 
@@ -627,12 +666,11 @@ class OpenCLIChannel(AbstractChannel):
     """
 
     channel_type = "opencli"
-    # Drives a real Chrome from the shared pool → must run on the node holding the
-    # live session; the pipeline resolves a site-keyed browser binding for it.
+    # Drives a real Chrome from a resolved account lease or an explicitly
+    # selected anonymous agent; account routing never uses site bindings.
     # incremental/paginated stay False: opencli's site/command catalog is an
     # external binary discovered at runtime via `--help` (see _get_named_options /
     # _command_requires_browser) — there is no cursor or page-token contract for
-    # it anywhere in this codebase to drive a runner-owned pagination loop against.
     # default_rate is spelled out (rather than left to the dataclass default) to
     # document it's a deliberate choice, not an oversight: same 60/min every other
     # browser-driving channel (BrowserActChannel, SkillChannel) accepts, since
@@ -645,74 +683,77 @@ class OpenCLIChannel(AbstractChannel):
         site = config.get("site", "")
         command = config.get("command", "")
         output_format = config.get("format", "json")
-
         execution_id = parameters.get("execution_id") or None
+        account_session = _account_session_from_parameters(parameters)
+        if account_session is not None and parameters.get("chrome_endpoint"):
+            return ChannelResult.fail(
+                "account sessions reject caller-supplied browser endpoints",
+                error_type="AccountRoutingError",
+            )
         (chrome_endpoint, required_profile_kind), cli_params = (
             _split_routing_parameters(parameters)
         )
-        raw_args: dict = {**config.get("args", {}), **cli_params}
+        configured_args = config.get("args", {})
+        if not isinstance(configured_args, dict):
+            configured_args = {}
+        raw_args: dict = {
+            key: value
+            for key, value in configured_args.items()
+            if key not in _INTERNAL_ROUTING_KEYS
+        }
+        raw_args.update(cli_params)
         positional_args: list[str] = [str(v) for v in config.get("positional_args", [])]
-
-        # Resolve which keys in raw_args are valid named --options for this command.
-        # Any key not recognised by the binary is passed as a positional arg instead,
-        # so configs written for older opencli versions continue to work after upgrades
-        # where args like `query` became positional.
-        opencli_bin_early = _resolve_bin("cdp")  # mode doesn't affect option names
+        opencli_bin_early = _resolve_bin("cdp")
         named_options = await _get_named_options(opencli_bin_early, site, command)
         args: dict = {}
         extra_positional: list[str] = []
-        for k, v in raw_args.items():
-            if named_options and k not in named_options:
-                logger.debug(
-                    "arg %r not a named option for %s/%s — passing as positional",
-                    k,
-                    site,
-                    command,
-                )
-                extra_positional.append(str(v))
+        for key, value in raw_args.items():
+            if named_options and key not in named_options:
+                extra_positional.append(str(value))
             else:
-                args[k] = v
-        # extra_positional goes first (before explicitly configured positional_args)
+                args[key] = value
         positional_args = extra_positional + positional_args
-
         env = os.environ.copy()
-
         from backend.browser_pool import LocalBrowserPool, get_pool
         from backend.config import get_settings
+
         settings = get_settings()
         requires_browser = await _command_requires_browser(
             opencli_bin_early, site, command
         )
-
         if not requires_browser:
-            cmd = [opencli_bin_early, site, command]
-            cmd.extend(positional_args)
+            if account_session is not None:
+                return ChannelResult.fail(
+                    "account sessions require a browser-backed OpenCLI command",
+                    error_type="AccountRoutingError",
+                )
+            cmd = [opencli_bin_early, site, command, *positional_args]
             for key, value in args.items():
                 cmd.extend([f"--{key}", str(value)])
             cmd.extend(["-f", output_format])
             return await _collect_with_opencli_subprocess(
-                cmd,
-                env,
-                site=site,
-                command=command,
-                output_format=output_format,
-                mode="direct",
+                cmd, env, site=site, command=command, output_format=output_format, mode="direct"
             )
 
         pool = get_pool()
-
-        # In agent mode, prefer endpoints that have a registered agent_url/protocol.
-        # The pool may also contain local chrome endpoints without agent metadata.
         _acquire_endpoint = chrome_endpoint
-        if (
+        if account_session is not None:
+            if settings.collection_mode != "agent":
+                return ChannelResult.fail(
+                    "account sessions require an authenticated agent runtime",
+                    error_type="AccountRoutingError",
+                )
+            _acquire_endpoint = await _account_node_endpoint(pool, account_session.node_id)
+            if not _acquire_endpoint:
+                return ChannelResult.fail(
+                    "account session node is not registered in the browser fleet",
+                    error_type="NodeUnavailable",
+                )
+        elif (
             settings.collection_mode == "agent"
             and not chrome_endpoint
             and isinstance(pool, LocalBrowserPool)
         ):
-            # No request-scoped AsyncSession is available at this entry point (collect()'s
-            # interface is config/parameters only), so — same as health_check() below —
-            # we open one directly here and thread it explicitly into the helpers instead
-            # of letting them each reach for their own AsyncSessionLocal() independently.
             from backend.database import AsyncSessionLocal
 
             async with AsyncSessionLocal() as session:
@@ -723,11 +764,10 @@ class OpenCLIChannel(AbstractChannel):
                 )
 
         acquire_kwargs: dict[str, Any] = {"endpoint": _acquire_endpoint}
-        if required_profile_kind:
+        if required_profile_kind and account_session is None:
             acquire_kwargs["required_profile_kind"] = required_profile_kind
         async with pool.acquire(**acquire_kwargs) as cdp_endpoint:
             mode = pool.get_mode(cdp_endpoint)
-            # Agent mode: dispatch to remote edge node
             if settings.collection_mode == "agent":
                 protocol = (
                     pool.get_agent_protocol(cdp_endpoint)
@@ -743,77 +783,41 @@ class OpenCLIChannel(AbstractChannel):
                 if protocol == "http":
                     return await _collect_via_agent(
                         agent_url, site, command, args, positional_args, output_format, mode,
-                        execution_id,
+                        execution_id, account_session,
                     )
-                elif protocol == "ws":
+                if protocol == "ws":
                     return await _collect_via_ws_agent(
                         agent_url, site, command, args, positional_args, output_format, mode,
-                        execution_id,
+                        execution_id, account_session,
                     )
-                else:
-                    logger.error(
-                        "Unknown agent_protocol %r for endpoint %s",
-                        protocol,
-                        cdp_endpoint,
-                    )
-                    return ChannelResult.fail(f"Unknown agent_protocol: {protocol!r}")
+                return ChannelResult.fail(f"Unknown agent_protocol: {protocol!r}")
 
             opencli_bin = _resolve_bin(mode)
-
-            cmd = [opencli_bin, site, command]
-            cmd.extend(positional_args)
+            cmd = [opencli_bin, site, command, *positional_args]
             for key, value in args.items():
                 cmd.extend([f"--{key}", str(value)])
             cmd.extend(["-f", output_format])
-
             if mode == "bridge":
                 daemon_host = urlparse(cdp_endpoint).hostname or "agent-1"
                 env.pop("OPENCLI_CDP_ENDPOINT", None)
                 env["OPENCLI_DAEMON_HOST"] = daemon_host
                 env["OPENCLI_DAEMON_PORT"] = str(_DAEMON_PORT)
-                logger.info(
-                    "opencli bridge | cmd=%s daemon=%s:%s",
-                    " ".join(cmd),
-                    daemon_host,
-                    _DAEMON_PORT,
-                )
                 bridge_err = await _check_bridge_ready(daemon_host, _DAEMON_PORT)
                 if bridge_err:
                     logger.warning(
-                        "bridge readiness probe failed; trying opencli anyway: %s",
-                        bridge_err,
+                        "bridge readiness probe failed; trying opencli anyway: %s", bridge_err
                     )
             else:
                 env["OPENCLI_CDP_ENDPOINT"] = cdp_endpoint
-                logger.info("opencli cdp | cmd=%s cdp=%s", " ".join(cmd), cdp_endpoint)
-
             pre_tab_ids: set[str] | None = set()
             if mode == "cdp":
                 pre_tab_ids = await _snapshot_tab_ids(cdp_endpoint)
-
             result = await _collect_with_opencli_subprocess(
-                cmd,
-                env,
-                site=site,
-                command=command,
-                output_format=output_format,
-                mode=mode,
-                chrome_mode=mode,
+                cmd, env, site=site, command=command, output_format=output_format,
+                mode=mode, chrome_mode=mode,
             )
-
-            if mode == "cdp":
-                if pre_tab_ids is None:
-                    # C20: no trustworthy baseline, so we can't tell newly-opened
-                    # tabs from ones the user already had open — skip cleanup
-                    # this run rather than risk closing the user's own tabs.
-                    logger.warning(
-                        "cdp cleanup skipped for %s: pre-collection tab snapshot "
-                        "failed, can't distinguish new tabs from pre-existing ones",
-                        cdp_endpoint,
-                    )
-                else:
-                    await _cleanup_cdp_tabs(cdp_endpoint, pre_tab_ids)
-
+            if mode == "cdp" and pre_tab_ids is not None:
+                await _cleanup_cdp_tabs(cdp_endpoint, pre_tab_ids)
             return result
 
     async def fetch(self, ctx: FetchContext) -> FetchResult:

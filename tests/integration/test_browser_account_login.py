@@ -10,7 +10,6 @@ import pytest
 from tests.fixtures.browser_account_login_app import running_login_site
 
 
-
 class _FixtureClient:
     """Small real-HTTP client preserving one fixture browser cookie context."""
 
@@ -177,3 +176,63 @@ def test_multi_origin_page_exposes_foreign_qr_as_distinct_unapproved_origin():
         assert f'data-qr-origin="{site.base_url}"' in page
         assert f'data-qr-origin="{site.alternate_origin}"' in page
         assert 'id="foreign-login-qr"' in page
+
+
+@pytest.mark.live
+@pytest.mark.asyncio
+async def test_controlled_login_fixture_runs_real_browser_qr_business_flow():
+    """Drive the fixture through Chromium, not a mocked page or transport."""
+
+    from playwright.async_api import async_playwright
+
+    with running_login_site() as site:
+        playwright = await async_playwright().start()
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            context = await browser.new_context()
+            page = await context.new_page()
+            await page.goto(f"{site.base_url}/login", wait_until="domcontentloaded")
+            assert await page.locator("#login-qr").is_visible()
+
+            initial = await page.evaluate(
+                """async () => (await fetch('/__control__/state')).json()"""
+            )
+            qr = await page.evaluate(
+                """async () => (await fetch('/qr/current')).json()"""
+            )
+            old_image = qr["image_url"]
+            old_generation = qr["generation"]
+            assert initial["flow_state"] == "presenting"
+            assert qr["status"] == "presenting"
+            assert old_image.startswith(site.base_url)
+
+            refreshed = await page.evaluate(
+                """async (sessionId) => (await fetch('/__control__/advance', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({session_id: sessionId, event: 'refresh_qr'})
+                })).json()""",
+                initial["session_id"],
+            )
+            assert refreshed["qr_generation"] == old_generation + 1
+            await page.reload(wait_until="domcontentloaded")
+            assert await page.evaluate(
+                """async (url) => (await fetch(url)).status""", old_image
+            ) == 410
+
+            current = await page.evaluate(
+                """async () => (await fetch('/qr/current')).json()"""
+            )
+            confirmed = await page.evaluate(
+                """async (url) => (await fetch(url)).json()""",
+                current["confirmation_url"],
+            )
+            assert confirmed["confirmed"] is True
+            await page.reload(wait_until="domcontentloaded")
+            assert (
+                await page.locator("#authenticated").get_attribute("data-authenticated")
+                == "true"
+            )
+        finally:
+            await browser.close()
+            await playwright.stop()

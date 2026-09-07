@@ -83,14 +83,25 @@ def run_collect(
     output_format: str = "json",
     mode: str | None = None,
     chrome_endpoint: str | None = None,
+    account_session: dict[str, Any] | None = None,
     timeout: float | None = None,
 ) -> dict[str, Any]:
     """Run `opencli <site> <command>` and return parsed items."""
+    if account_session is not None and chrome_endpoint:
+        raise ValueError("account session rejects caller-supplied browser endpoint")
     if not shutil.which(OPENCLI_BIN) and not os.path.isfile(OPENCLI_BIN):
         raise FileNotFoundError(f"opencli binary not found: {OPENCLI_BIN}")
 
     resolved_mode = (mode or os.environ.get("OPENCLI_MODE", "bridge")).lower()
-    raw_args = dict(args or {})
+    raw_args = {
+        key: value
+        for key, value in (args or {}).items()
+        if key not in {
+            "account_id", "accountId", "workspace_id", "workspaceId",
+            "source_binding_revision_id", "sourceBindingRevisionId",
+            "account_ref", "accountRef", "session_envelope",
+        }
+    }
     pos = list(positional_args or [])
     named = _named_options(site, command)
     cli_args: dict[str, Any] = {}
@@ -125,7 +136,7 @@ def run_collect(
     raw = proc.stdout or ""
     parser = _parse_json if output_format == "json" else _parse_yaml
     items = parser(raw)
-    return {
+    result = {
         "ok": True,
         "site": site,
         "command": command,
@@ -134,3 +145,11 @@ def run_collect(
         "count": len(items),
         "stderr": stderr[:300] if stderr else None,
     }
+    if account_session is not None:
+        result["account_session"] = {
+            "account_id": account_session.get("account_id"),
+            "session_id": account_session.get("session_id"),
+            "node_id": account_session.get("node_id"),
+            "epoch": account_session.get("epoch"),
+        }
+    return result
