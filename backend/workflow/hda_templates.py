@@ -746,7 +746,16 @@ def _optional_source_runtime_params(source: dict[str, Any]) -> dict[str, Any]:
         "callerId",
         "caller_id",
     ):
-            optional[key] = source[key]
+        if key not in source:
+            continue
+        value = source[key]
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        if isinstance(value, (list, tuple, dict, set)) and not value:
+            continue
+        optional[key] = value
     return optional
 
 
