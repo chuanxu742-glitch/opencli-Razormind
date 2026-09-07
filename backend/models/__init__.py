@@ -29,6 +29,7 @@ from backend.models.browser import (
     BrowserRuntimeDeployment,
     ProfileInventoryStatus,
 )
+from backend.models.browser_portal import BrowserPortalOwner, BrowserPortalTicket
 from backend.models.browser_space import (
     BrowserSpace,
     BrowserSpaceEvent,
@@ -180,6 +181,8 @@ __all__ = [
     "BrowserRuntimeBundle",
     "BrowserRuntimeDeployment",
     "ProfileInventoryStatus",
+    "BrowserPortalOwner",
+    "BrowserPortalTicket",
     "BrowserSpace",
     "BrowserSpaceEvent",
     "EdgeNode",

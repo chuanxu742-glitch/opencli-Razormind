@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Literal
-
+import hashlib
+import secrets
 from fastapi import (
     APIRouter,
     Depends,
@@ -13,13 +15,16 @@ from fastapi import (
     Request,
     Response,
     WebSocket,
+    WebSocketDisconnect,
     status,
 )
+from sqlalchemy import select
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
-
-from backend.database import get_db
-from backend.models.browser import BrowserAccountStatus
+from backend.database import AsyncSessionLocal, get_db
+from backend.models.browser import BrowserAccount, BrowserAccountStatus, BrowserLoginSession
+from backend.models.browser_portal import BrowserPortalOwner
 from backend.schemas.browser_account import (
     AccountRef,
     BrowserAccountCreate,
@@ -547,12 +552,16 @@ async def get_login_authorization_facts(
         raise _http_error(exc) from exc
     return ApiResponse.ok(facts)
 
+def _http_origin(scheme: str, netloc: str) -> str:
+    scheme = {"ws": "http", "wss": "https"}.get(scheme, scheme)
+    return f"{scheme}://{netloc}"
+
 
 def _require_same_origin(request: Request) -> None:
     origin = request.headers.get("origin")
     if not origin:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Origin header required")
-    expected = f"{request.url.scheme}://{request.url.netloc}"
+    expected = _http_origin(request.url.scheme, request.url.netloc)
     if origin.rstrip("/") != expected.rstrip("/"):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Origin is not allowed")
 
@@ -567,9 +576,10 @@ async def issue_account_portal_ticket(
     session_id: str,
     body: PortalTicketIssueRequestV1,
     request: Request,
+    response: Response,
     identity: RequestIdentity = Depends(get_request_identity),
     db: AsyncSession = Depends(get_db),
-) -> ApiResponse:
+) -> Response:
     _require_same_origin(request)
     access = await get_workspace_access(db, workspace_id, identity)
     _require_operator_or_manager(access)
@@ -581,7 +591,16 @@ async def issue_account_portal_ticket(
         )
     except browser_account_service.BrowserAccountError as exc:
         raise _http_error(exc) from exc
-    return ApiResponse.ok(issued)
+    payload = issued.model_dump(mode="json")
+    payload["ticket"] = issued.ticket.get_secret_value()
+    payload["csrf_token"] = issued.csrf_token.get_secret_value()
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={"success": True, "data": payload, "error": None, "meta": None},
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
 
 
 @router.post(
@@ -594,6 +613,7 @@ async def redeem_account_portal_ticket(
     session_id: str,
     body: PortalTicketRedeemRequestV1,
     request: Request,
+    response: Response,
     identity: RequestIdentity = Depends(get_request_identity),
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse:
@@ -602,12 +622,23 @@ async def redeem_account_portal_ticket(
     _require_operator_or_manager(access)
     if body.account_ref != _account_ref(workspace_id, account_id) or body.session_id != session_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Portal session not found")
+    owner_token = secrets.token_urlsafe(32)
     try:
         outcome = await browser_account_service.redeem_portal_ticket(
-            db, body, subject=identity.subject
+            db, body, subject=identity.subject, owner_token=owner_token
         )
     except browser_account_service.BrowserAccountError as exc:
         raise _http_error(exc) from exc
+    if getattr(outcome, "status", None) == "granted":
+        response.set_cookie(
+            key=outcome.cookie_name,
+            value=owner_token,
+            max_age=max(1, int((outcome.expires_at - datetime.now(UTC)).total_seconds())),
+            httponly=True,
+            secure=True,
+            samesite=outcome.same_site,
+            path="/",
+        )
     return ApiResponse.ok(outcome)
 
 
@@ -618,18 +649,66 @@ async def account_portal_websocket(
     account_id: str,
     session_id: str,
 ) -> None:
-    """A-owned WS auth gate; R owns the actual transient frame transport."""
-
     origin = websocket.headers.get("origin")
-    expected = f"{websocket.url.scheme}://{websocket.url.netloc}"
+    expected = _http_origin(websocket.url.scheme, websocket.url.netloc)
     cookie = websocket.cookies.get("qrac2_portal")
     if not cookie or not origin or origin.rstrip("/") != expected.rstrip("/"):
         await websocket.close(code=4403, reason="Portal origin or cookie authentication failed")
         return
-    # A persistence-backed cookie verifier must be installed by C/R before
-    # accepting this socket; accepting here would create an unauthenticated
-    # multi-replica transport.
-    await websocket.close(code=4503, reason="Portal persistence verifier unavailable")
+    digest = hashlib.sha256(cookie.encode("utf-8")).hexdigest()
+    now = datetime.now(UTC)
+    async with AsyncSessionLocal() as db:
+        owner = await db.scalar(
+            select(BrowserPortalOwner).where(
+                BrowserPortalOwner.owner_digest == digest,
+                BrowserPortalOwner.workspace_id == workspace_id,
+                BrowserPortalOwner.account_id == account_id,
+                BrowserPortalOwner.session_id == session_id,
+                BrowserPortalOwner.active.is_(True),
+                BrowserPortalOwner.revoked_at.is_(None),
+            )
+        )
+        session = await db.scalar(
+            select(BrowserLoginSession).where(
+                BrowserLoginSession.workspace_id == workspace_id,
+                BrowserLoginSession.account_id == account_id,
+                BrowserLoginSession.id == session_id,
+            )
+        )
+        account = await db.scalar(
+            select(BrowserAccount).where(
+                BrowserAccount.workspace_id == workspace_id,
+                BrowserAccount.id == account_id,
+            )
+        )
+    if (
+        owner is None
+        or session is None
+        or account is None
+        or owner.expires_at <= now
+        or owner.hard_expires_at <= now
+        or owner.session_revision != session.revision
+        or account.paused
+        or account.auth_required
+        or session.status in {"closed", "expired", "error"}
+    ):
+        await websocket.close(code=4403, reason="Portal owner credential is invalid")
+        return
+    await websocket.accept()
+    await websocket.send_json(
+        {
+            "status": "authorized",
+            "workspace_id": workspace_id,
+            "account_id": account_id,
+            "session_id": session_id,
+            "session_revision": session.revision,
+        }
+    )
+    try:
+        while True:
+            await websocket.receive()
+    except WebSocketDisconnect:
+        return
 
 
 __all__ = ["router"]

@@ -9,6 +9,7 @@ cookie as proof of authentication.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -33,6 +34,8 @@ from backend.models.browser import (
     BrowserProfileManifest,
     BrowserRuntimeBundle,
 )
+
+from backend.models.browser_portal import BrowserPortalOwner, BrowserPortalTicket
 
 from backend.models.edge_node import EdgeNode
 from backend.models.identity import User, Workspace, WorkspaceMembership
@@ -1208,9 +1211,6 @@ async def apply_node_result(
             else BrowserAccountErrorCode.SAVE_FAILED.value
         )
         session.status = BrowserAccountStatus.ERROR.value
-    _set_revision(account)
-    await db.flush()
-    return command_row
 PortalTicketStore = Callable[[AsyncSession, PortalTicketRecordV1], Awaitable[None]]
 PortalTicketLoader = Callable[
     [AsyncSession, str], Awaitable[PortalTicketRecordV1 | None]
@@ -1218,6 +1218,101 @@ PortalTicketLoader = Callable[
 PortalTicketCAS = Callable[
     [AsyncSession, PortalTicketConsumeCASV1, datetime], Awaitable[bool]
 ]
+
+
+def _portal_digest(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _portal_record(row: BrowserPortalTicket) -> PortalTicketRecordV1:
+    return PortalTicketRecordV1(
+        ticket_id=row.ticket_id,
+        ticket_digest=row.ticket_digest,
+        csrf_digest=row.csrf_digest,
+        subject=row.subject,
+        account_ref=AccountRef(workspace_id=row.workspace_id, account_id=row.account_id),
+        session_id=row.session_id,
+        session_revision=row.session_revision,
+        issued_at=_as_utc(row.issued_at),
+        expires_at=_as_utc(row.expires_at),
+        hard_expires_at=_as_utc(row.hard_expires_at),
+        consumed_at=_as_utc(row.consumed_at) if row.consumed_at else None,
+    )
+
+
+async def _store_portal_ticket(
+    db: AsyncSession,
+    record: PortalTicketRecordV1,
+) -> None:
+    db.add(
+        BrowserPortalTicket(
+            id=record.ticket_id,
+            ticket_id=record.ticket_id,
+            ticket_digest=record.ticket_digest,
+            csrf_digest=record.csrf_digest,
+            subject=record.subject,
+            workspace_id=record.account_ref.workspace_id,
+            account_id=record.account_ref.account_id,
+            session_id=record.session_id,
+            session_revision=record.session_revision,
+            issued_at=record.issued_at,
+            expires_at=record.expires_at,
+            hard_expires_at=record.hard_expires_at,
+        )
+    )
+    await db.flush()
+
+
+async def _load_portal_ticket(
+    db: AsyncSession,
+    ticket_id: str,
+) -> PortalTicketRecordV1 | None:
+    row = await db.scalar(
+        select(BrowserPortalTicket).where(BrowserPortalTicket.ticket_id == ticket_id)
+    )
+    return _portal_record(row) if row is not None else None
+
+
+async def _consume_portal_ticket(
+    db: AsyncSession,
+    cas: PortalTicketConsumeCASV1,
+    now: datetime,
+    *,
+    owner_token: str,
+    subject: str,
+) -> bool:
+    row = await db.scalar(
+        select(BrowserPortalTicket)
+        .where(
+            BrowserPortalTicket.ticket_id == cas.ticket_id,
+            BrowserPortalTicket.workspace_id == cas.account_ref.workspace_id,
+            BrowserPortalTicket.account_id == cas.account_ref.account_id,
+            BrowserPortalTicket.session_id == cas.session_id,
+            BrowserPortalTicket.session_revision == cas.expected_session_revision,
+            BrowserPortalTicket.consumed_at.is_(None),
+        )
+        .with_for_update()
+    )
+    if row is None:
+        return False
+    row.consumed_at = now
+    db.add(
+        BrowserPortalOwner(
+            owner_digest=_portal_digest(owner_token),
+            subject=subject,
+            workspace_id=row.workspace_id,
+            account_id=row.account_id,
+            session_id=row.session_id,
+            ticket_id=row.ticket_id,
+            session_revision=row.session_revision,
+            issued_at=now,
+            expires_at=min(_as_utc(row.expires_at), now + timedelta(minutes=10)),
+            hard_expires_at=_as_utc(row.hard_expires_at),
+            active=True,
+        )
+    )
+    await db.flush()
+    return True
 
 
 async def issue_portal_ticket(
@@ -1228,14 +1323,6 @@ async def issue_portal_ticket(
     store: PortalTicketStore | None = None,
     cookie_lifetime_seconds: int = 600,
 ) -> PortalTicketIssuedV1:
-    """Issue a ticket only when a persistent digest store is supplied."""
-
-    if store is None:
-        raise BrowserAccountError(
-            "portal_ticket_persistence_missing",
-            "portal ticket persistence is not configured",
-            503,
-        )
     account = await _account_or_error(
         db, request.account_ref.workspace_id, request.account_ref.account_id, for_update=True
     )
@@ -1254,16 +1341,15 @@ async def issue_portal_ticket(
         raise BrowserAccountError(BrowserAccountErrorCode.PERMISSION_DENIED, "account portal is not authorized", 403)
     now = _now()
     expires_at = now + timedelta(seconds=min(max(cookie_lifetime_seconds, 60), 600))
-    hard_expires_at = now + timedelta(minutes=30)
     issued = issue_first_portal_ticket(
         request,
         ticket=SecretStr(secrets.token_urlsafe(32)),
         now=now,
         expires_at=expires_at,
-        hard_expires_at=hard_expires_at,
+        hard_expires_at=now + timedelta(minutes=30),
         session_revision=session.revision,
     )
-    await store(db, ticket_record_from_issue(issued, subject=subject))
+    await (store or _store_portal_ticket)(db, ticket_record_from_issue(issued, subject=subject))
     return issued
 
 
@@ -1276,18 +1362,17 @@ async def redeem_portal_ticket(
     consume: PortalTicketCAS | None = None,
     cookie_name: str = "qrac2_portal",
     websocket_path: str = "/api/v1/portal/ws",
+    owner_token: str | None = None,
 ) -> PortalEntryResponseV1:
-    """Redeem through the persistence owner's atomic consume CAS."""
-
-    if load is None or consume is None:
-        raise BrowserAccountError(
-            "portal_ticket_persistence_missing",
-            "portal ticket persistence is not configured",
-            503,
-        )
-    record = await load(db, request.ticket_id)
+    owner_token = owner_token or secrets.token_urlsafe(32)
+    record = await (load or _load_portal_ticket)(db, request.ticket_id)
     if record is None:
         raise BrowserAccountError(BrowserAccountErrorCode.SESSION_EXPIRED, "portal ticket is expired", 410)
+    consume_fn = consume or (
+        lambda session, cas, now: _consume_portal_ticket(
+            session, cas, now, owner_token=owner_token, subject=subject
+        )
+    )
     return await consume_portal_ticket_cas(
         request,
         record=record,
@@ -1295,7 +1380,7 @@ async def redeem_portal_ticket(
         now=_now(),
         cookie_name=cookie_name,
         websocket_path=websocket_path,
-        cas_update=lambda cas, now: consume(db, cas, now),
+        cas_update=lambda cas, now: consume_fn(db, cas, now),
     )
 
 
