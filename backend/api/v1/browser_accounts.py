@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from typing import Literal
 import hashlib
@@ -84,6 +85,7 @@ class LoginSessionClose(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     expected_revision: int | None = Field(default=None, ge=0)
+    reason: Literal["completed", "cancelled", "expired", "error"] = "cancelled"
 
 
 class AccountControlRequest(BaseModel):
@@ -566,6 +568,89 @@ def _require_same_origin(request: Request) -> None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Origin is not allowed")
 
 
+def _as_utc(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+_ACTIVE_PORTAL_SOCKETS: dict[
+    tuple[str, str, str, str],
+    dict[str, object],
+] = {}
+_PORTAL_AUTHORIZATION_TASK: asyncio.Task[None] | None = None
+
+
+async def _close_portal_socket(
+    key: tuple[str, str, str, str],
+    state: dict[str, object],
+    *,
+    reason: str,
+) -> None:
+    _ACTIVE_PORTAL_SOCKETS.pop(key, None)
+    websocket = state["websocket"]
+    try:
+        await websocket.close(code=4403, reason=reason)  # type: ignore[union-attr]
+    except Exception:
+        # The peer may already have disconnected; revocation remains fail-closed.
+        pass
+
+
+async def _portal_authorization_monitor() -> None:
+    """Batch fresh permission reads and close revoked portals before one second."""
+
+    global _PORTAL_AUTHORIZATION_TASK
+    try:
+        while _ACTIVE_PORTAL_SOCKETS:
+            await asyncio.sleep(0.25)
+            entries = list(_ACTIVE_PORTAL_SOCKETS.items())
+            requests = [key for key, _ in entries]
+            try:
+                async with AsyncSessionLocal() as db:
+                    snapshots = await browser_account_service.get_portal_authorization_batch(
+                        db, requests
+                    )
+            except Exception:
+                # A timed-out or unavailable authorization read is not permission.
+                for key, state in entries:
+                    await _close_portal_socket(
+                        key, state, reason="Portal authorization refresh failed"
+                    )
+                continue
+            checked_at = datetime.now(UTC)
+            for key, state in entries:
+                if _ACTIVE_PORTAL_SOCKETS.get(key) is not state:
+                    continue
+                snapshot = snapshots.get(key)
+                owner_expires_at = state["owner_expires_at"]
+                owner_hard_expires_at = state["owner_hard_expires_at"]
+                if (
+                    snapshot is None
+                    or checked_at >= snapshot.facts.freshness_deadline
+                    or not snapshot.facts.membership_exists
+                    or snapshot.facts.role not in {"admin", "maintainer", "operator"}
+                    or snapshot.facts.user_disabled
+                    or not snapshot.facts.workspace_active
+                    or snapshot.facts.session_revoked
+                    or snapshot.account_paused
+                    or (
+                        snapshot.account_auth_required
+                        and snapshot.session_purpose != "login"
+                    )
+                    or snapshot.facts.session_revision != state["session_revision"]
+                    or checked_at >= owner_expires_at
+                    or checked_at >= owner_hard_expires_at
+                ):
+                    await _close_portal_socket(
+                        key, state, reason="Portal authorization has been revoked"
+                    )
+    finally:
+        _PORTAL_AUTHORIZATION_TASK = None
+
+
+def _ensure_portal_authorization_monitor() -> None:
+    global _PORTAL_AUTHORIZATION_TASK
+    if _PORTAL_AUTHORIZATION_TASK is None or _PORTAL_AUTHORIZATION_TASK.done():
+        _PORTAL_AUTHORIZATION_TASK = asyncio.create_task(_portal_authorization_monitor())
+
 @router.post(
     "/{account_id}/login-sessions/{session_id}/portal-ticket/issue",
     response_model=ApiResponse[PortalTicketIssuedV1],
@@ -685,30 +770,40 @@ async def account_portal_websocket(
         owner is None
         or session is None
         or account is None
-        or owner.expires_at <= now
-        or owner.hard_expires_at <= now
+        or _as_utc(owner.expires_at) <= now
+        or _as_utc(owner.hard_expires_at) <= now
         or owner.session_revision != session.revision
         or account.paused
-        or account.auth_required
+        or (account.auth_required and session.purpose != "login")
         or session.status in {"closed", "expired", "error"}
     ):
         await websocket.close(code=4403, reason="Portal owner credential is invalid")
         return
     await websocket.accept()
-    await websocket.send_json(
-        {
-            "status": "authorized",
-            "workspace_id": workspace_id,
-            "account_id": account_id,
-            "session_id": session_id,
-            "session_revision": session.revision,
-        }
-    )
+    key = (workspace_id, account_id, session_id, owner.subject)
+    state: dict[str, object] = {
+        "websocket": websocket,
+        "owner_expires_at": _as_utc(owner.expires_at),
+        "owner_hard_expires_at": _as_utc(owner.hard_expires_at),
+        "session_revision": session.revision,
+    }
+    _ACTIVE_PORTAL_SOCKETS[key] = state
+    _ensure_portal_authorization_monitor()
     try:
         while True:
-            await websocket.receive()
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                return
+            # A-to-R transient frame relay is intentionally not implicit: until
+            # R registers its dedicated PortalOwnerRoute transport, accepting and
+            # discarding input would be a credential/pixel sink.
+            await websocket.close(code=1011, reason="Portal transport is unavailable")
+            return
     except WebSocketDisconnect:
         return
+    finally:
+        if _ACTIVE_PORTAL_SOCKETS.get(key) is state:
+            _ACTIVE_PORTAL_SOCKETS.pop(key, None)
 
 
 __all__ = ["router"]

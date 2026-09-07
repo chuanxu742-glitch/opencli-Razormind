@@ -17,7 +17,7 @@ from typing import Any, Literal, Mapping
 import uuid
 
 from pydantic import SecretStr
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from collections.abc import Awaitable, Callable
@@ -89,7 +89,26 @@ _TERMINAL_SESSION_STATUSES = (
     BrowserAccountStatus.EXPIRED.value,
     BrowserAccountStatus.CLOSED.value,
 )
+
+_PORTAL_TERMINAL_SESSION_STATUSES = frozenset(
+    (*_TERMINAL_SESSION_STATUSES, BrowserAccountStatus.ERROR.value)
+)
 _COMMAND_TTL = timedelta(minutes=30)
+
+PORTAL_WEBSOCKET_PATH_TEMPLATE = (
+    "/api/v1/workspaces/{workspace_id}/browser-accounts/"
+    "{account_id}/login-sessions/{session_id}/portal"
+)
+
+
+def portal_websocket_path(workspace_id: str, account_id: str, session_id: str) -> str:
+    """Return the only WebSocket route that can serve an account portal grant."""
+
+    return PORTAL_WEBSOCKET_PATH_TEMPLATE.format(
+        workspace_id=workspace_id,
+        account_id=account_id,
+        session_id=session_id,
+    )
 
 
 class BrowserAccountError(RuntimeError):
@@ -953,6 +972,115 @@ async def resolve_account_session(
     return envelope.model_copy(update={"lease_expires_at": lease.expires_at})
 
 
+@dataclass(frozen=True)
+class PortalAuthorizationSnapshot:
+    """One fresh DB-backed authorization row used by an active portal."""
+
+    facts: PortalAuthorizationFactsV1
+    account_paused: bool
+    account_auth_required: bool
+    session_purpose: str
+
+
+async def get_portal_authorization_batch(
+    db: AsyncSession,
+    requests: list[tuple[str, str, str, str]],
+) -> dict[tuple[str, str, str, str], PortalAuthorizationSnapshot]:
+    """Read all active portal permissions from one bounded fresh DB snapshot.
+
+    ``requests`` contains ``(workspace_id, account_id, session_id, subject)``.
+    An empty request does no I/O.  Callers must discard the snapshot at its
+    freshness deadline; it is not a cache or a long-lived transaction.
+    """
+
+    if not requests:
+        return {}
+    now = _now()
+    unique_requests = list(dict.fromkeys(requests))
+    conditions = [
+        and_(
+            WorkspaceMembership.workspace_id == workspace_id,
+            User.subject == subject,
+            BrowserLoginSession.workspace_id == workspace_id,
+            BrowserLoginSession.account_id == account_id,
+            BrowserLoginSession.id == session_id,
+            BrowserAccount.workspace_id == workspace_id,
+            BrowserAccount.id == account_id,
+        )
+        for workspace_id, account_id, session_id, subject in unique_requests
+    ]
+    try:
+        async with asyncio.timeout(0.5):
+            result = await db.execute(
+                select(
+                    WorkspaceMembership,
+                    User,
+                    Workspace,
+                    BrowserLoginSession,
+                    BrowserAccount,
+                )
+                .join(User, User.id == WorkspaceMembership.user_id)
+                .join(Workspace, Workspace.id == WorkspaceMembership.workspace_id)
+                .join(
+                    BrowserAccount,
+                    and_(
+                        BrowserAccount.workspace_id == Workspace.id,
+                        BrowserAccount.id.in_(
+                            [account_id for _, account_id, _, _ in unique_requests]
+                        ),
+                    ),
+                )
+                .join(
+                    BrowserLoginSession,
+                    and_(
+                        BrowserLoginSession.workspace_id == Workspace.id,
+                        BrowserLoginSession.account_id == BrowserAccount.id,
+                    ),
+                )
+                .where(or_(*conditions))
+            )
+            rows = result.all()
+    except TimeoutError as exc:
+        raise BrowserAccountError(
+            BrowserAccountErrorCode.PERMISSION_DENIED,
+            "portal authorization could not be refreshed",
+            503,
+        ) from exc
+
+    snapshots: dict[tuple[str, str, str, str], PortalAuthorizationSnapshot] = {}
+    for membership, user, workspace, session, account in rows:
+        key = (workspace.id, account.id, session.id, user.subject)
+        if key not in unique_requests:
+            continue
+        session_revoked = session.status in _PORTAL_TERMINAL_SESSION_STATUSES or (
+            session.expires_at is not None and _as_utc(session.expires_at) <= now
+        )
+        facts = PortalAuthorizationFactsV1(
+            workspace_id=workspace.id,
+            account_id=account.id,
+            session_id=session.id,
+            membership_exists=True,
+            role=membership.role.value,
+            user_disabled=bool(user.disabled),
+            workspace_active=bool(workspace.active),
+            account_revision=account.revision,
+            session_revoked=session_revoked,
+            session_revision=session.revision,
+            session_expires_at=(
+                _as_utc(session.expires_at) if session.expires_at is not None else now
+            ),
+            checked_at=now,
+            freshness_deadline=now + timedelta(milliseconds=500),
+        )
+        snapshots[key] = PortalAuthorizationSnapshot(
+            facts=facts,
+            account_paused=bool(account.paused),
+            account_auth_required=bool(account.auth_required),
+            session_purpose=session.purpose,
+        )
+    return snapshots
+
+
 async def get_portal_authorization_facts(
     db: AsyncSession,
     workspace_id: str,
@@ -961,50 +1089,18 @@ async def get_portal_authorization_facts(
     *,
     subject: str,
 ) -> PortalAuthorizationFactsV1:
-    """Read fresh authorization facts with a conservative local deadline."""
+    """Read one portal authorization fact through the same batch path."""
 
-    now = _now()
-    try:
-        async with asyncio.timeout(0.5):
-            row = await db.execute(
-                select(WorkspaceMembership, User, Workspace)
-                .join(User, User.id == WorkspaceMembership.user_id)
-                .join(Workspace, Workspace.id == WorkspaceMembership.workspace_id)
-                .where(WorkspaceMembership.workspace_id == workspace_id)
-                .where(User.subject == subject)
-            )
-            membership = row.one_or_none()
-            session = await _session_or_error(db, workspace_id, account_id, session_id)
-            account = await _account_or_error(db, workspace_id, account_id)
-    except TimeoutError as exc:
+    key = (workspace_id, account_id, session_id, subject)
+    snapshot = (await get_portal_authorization_batch(db, [key])).get(key)
+    if snapshot is None:
+        # Preserve the historical 404/403-neutral behavior for missing scope.
         raise BrowserAccountError(
             BrowserAccountErrorCode.PERMISSION_DENIED,
-            "portal authorization could not be refreshed",
-            503,
-        ) from exc
-    role = membership.WorkspaceMembership.role.value if membership is not None else None
-    user_disabled = True if membership is None else bool(membership.User.disabled)
-    workspace_active = False if membership is None else bool(membership.Workspace.active)
-    session_revoked = session.status in _TERMINAL_SESSION_STATUSES or (
-        session.expires_at is not None and _as_utc(session.expires_at) <= now
-    )
-    return PortalAuthorizationFactsV1(
-        workspace_id=workspace_id,
-        account_id=account_id,
-        session_id=session_id,
-        membership_exists=membership is not None,
-        role=role,
-        user_disabled=user_disabled,
-        workspace_active=workspace_active,
-        account_revision=account.revision,
-        session_revoked=session_revoked,
-        session_revision=session.revision,
-        session_expires_at=(
-            _as_utc(session.expires_at) if session.expires_at is not None else now
-        ),
-        checked_at=now,
-        freshness_deadline=now + timedelta(milliseconds=500),
-    )
+            "portal authorization could not be confirmed",
+            403,
+        )
+    return snapshot.facts
 
 
 async def apply_login_observation(
@@ -1290,10 +1386,35 @@ async def _consume_portal_ticket(
             BrowserPortalTicket.session_id == cas.session_id,
             BrowserPortalTicket.session_revision == cas.expected_session_revision,
             BrowserPortalTicket.consumed_at.is_(None),
+            BrowserPortalTicket.expires_at > now,
+            BrowserPortalTicket.hard_expires_at > now,
         )
         .with_for_update()
     )
     if row is None:
+        return False
+    session = await db.scalar(
+        select(BrowserLoginSession).where(
+            BrowserLoginSession.workspace_id == row.workspace_id,
+            BrowserLoginSession.account_id == row.account_id,
+            BrowserLoginSession.id == row.session_id,
+        )
+    )
+    account = await db.scalar(
+        select(BrowserAccount).where(
+            BrowserAccount.workspace_id == row.workspace_id,
+            BrowserAccount.id == row.account_id,
+        )
+    )
+    if (
+        session is None
+        or account is None
+        or session.revision != row.session_revision
+        or session.status in _PORTAL_TERMINAL_SESSION_STATUSES
+        or (session.expires_at is not None and _as_utc(session.expires_at) <= now)
+        or account.paused
+        or (account.auth_required and session.purpose != "login")
+    ):
         return False
     row.consumed_at = now
     db.add(
@@ -1335,9 +1456,11 @@ async def issue_portal_ticket(
     )
     if session.revision != request.expected_session_revision:
         raise BrowserAccountError(BrowserAccountErrorCode.STALE_GENERATION, "session revision is stale")
-    if session.status in _TERMINAL_SESSION_STATUSES:
+    if session.status in _PORTAL_TERMINAL_SESSION_STATUSES or (
+        session.expires_at is not None and _as_utc(session.expires_at) <= _now()
+    ):
         raise BrowserAccountError(BrowserAccountErrorCode.SESSION_EXPIRED, "login session is closed", 410)
-    if account.paused or account.auth_required:
+    if account.paused or (account.auth_required and session.purpose != "login"):
         raise BrowserAccountError(BrowserAccountErrorCode.PERMISSION_DENIED, "account portal is not authorized", 403)
     now = _now()
     expires_at = now + timedelta(seconds=min(max(cookie_lifetime_seconds, 60), 600))
@@ -1361,32 +1484,63 @@ async def redeem_portal_ticket(
     load: PortalTicketLoader | None = None,
     consume: PortalTicketCAS | None = None,
     cookie_name: str = "qrac2_portal",
-    websocket_path: str = "/api/v1/portal/ws",
+    websocket_path: str | None = None,
     owner_token: str | None = None,
 ) -> PortalEntryResponseV1:
     owner_token = owner_token or secrets.token_urlsafe(32)
     record = await (load or _load_portal_ticket)(db, request.ticket_id)
     if record is None:
         raise BrowserAccountError(BrowserAccountErrorCode.SESSION_EXPIRED, "portal ticket is expired", 410)
+    now = _now()
+    if now >= record.expires_at or now >= record.hard_expires_at:
+        raise BrowserAccountError(BrowserAccountErrorCode.SESSION_EXPIRED, "portal ticket is expired", 410)
+    if consume is None:
+        account = await _account_or_error(
+            db, request.account_ref.workspace_id, request.account_ref.account_id
+        )
+        session = await _session_or_error(
+            db,
+            request.account_ref.workspace_id,
+            request.account_ref.account_id,
+            request.session_id,
+        )
+        if (
+            account.paused
+            or (account.auth_required and session.purpose != "login")
+            or session.status in _PORTAL_TERMINAL_SESSION_STATUSES
+            or (session.expires_at is not None and _as_utc(session.expires_at) <= now)
+            or session.revision != request.expected_session_revision
+        ):
+            raise BrowserAccountError(
+                BrowserAccountErrorCode.SESSION_EXPIRED,
+                "login session is no longer authorized",
+                410,
+            )
     consume_fn = consume or (
-        lambda session, cas, now: _consume_portal_ticket(
-            session, cas, now, owner_token=owner_token, subject=subject
+        lambda session, cas, consumed_at: _consume_portal_ticket(
+            session, cas, consumed_at, owner_token=owner_token, subject=subject
         )
     )
     return await consume_portal_ticket_cas(
         request,
         record=record,
         authenticated_subject=subject,
-        now=_now(),
+        now=now,
         cookie_name=cookie_name,
-        websocket_path=websocket_path,
-        cas_update=lambda cas, now: consume_fn(db, cas, now),
+        websocket_path=websocket_path
+        or portal_websocket_path(
+            request.account_ref.workspace_id,
+            request.account_ref.account_id,
+            request.session_id,
+        ),
+        cas_update=lambda cas, consumed_at: consume_fn(db, cas, consumed_at),
     )
 
 
 __all__ = [
     "AccountSessionResolution",
     "BrowserAccountError",
+    "PortalAuthorizationSnapshot",
     "apply_login_observation",
     "apply_node_result",
     "close_login_session",
@@ -1395,8 +1549,10 @@ __all__ = [
     "create_login_session",
     "get_browser_account",
     "get_login_session",
+    "get_portal_authorization_batch",
     "get_portal_authorization_facts",
     "issue_portal_ticket",
+    "portal_websocket_path",
     "redeem_portal_ticket",
     "list_browser_accounts",
     "list_login_sessions",
