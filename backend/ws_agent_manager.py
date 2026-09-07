@@ -91,6 +91,11 @@ _pending_agent_tasks: dict[str, asyncio.Future] = {}
 # request_id → (on_event callback, owning agent_url) for streaming agent_event dispatch
 _agent_task_callbacks: dict[str, tuple[Callable[[dict[str, Any]], Any], str]] = {}
 
+# request_id → Future awaiting a typed portal descriptor from its edge owner.
+_pending_portal_prepares: dict[str, asyncio.Future[PortalOwnerRouteV1]] = {}
+# request_id → owning edge connection for disconnect cleanup.
+_portal_prepare_owners: dict[str, str] = {}
+
 
 _PORTAL_QUEUE_MAX = 4
 _PORTAL_MAX_WIRE_BYTES = 4_200_000
@@ -231,6 +236,58 @@ def unregister_connection(agent_url: str) -> None:
                 "error_type": "AgentDisconnected",
             })
         _agent_task_callbacks.pop(request_id, None)
+    for request_id, owner in tuple(_portal_prepare_owners.items()):
+        if owner != agent_url:
+            continue
+        future = _pending_portal_prepares.get(request_id)
+        if future is not None and not future.done():
+            future.set_exception(RuntimeError("portal owner disconnected before preparation"))
+        _portal_prepare_owners.pop(request_id, None)
+
+
+async def prepare_portal_route(
+    agent_url: str,
+    session_envelope: SessionEnvelopeV1,
+    *,
+    session_revision: int,
+    timeout: float = 15,
+) -> PortalOwnerRouteV1:
+    """Ask the authenticated edge owner to resolve its real portal session."""
+
+    if isinstance(session_revision, bool) or not isinstance(session_revision, int) or session_revision < 0:
+        raise ValueError("portal route requires an authorized session revision")
+    if not 0 < timeout <= 30:
+        raise ValueError("portal route timeout must be between zero and thirty seconds")
+    session = SessionEnvelopeV1.model_validate(session_envelope)
+    identity = _connection_identities.get(agent_url)
+    websocket = _connections.get(agent_url)
+    if websocket is None:
+        raise RuntimeError("portal node is not connected")
+    if identity is None or (
+        identity.node_id != session.node_id or identity.boot_id != session.node_boot_id
+    ):
+        raise RuntimeError("portal node identity is not authorized for this session")
+    request_id = str(uuid.uuid4())
+    future: asyncio.Future[PortalOwnerRouteV1] = asyncio.get_running_loop().create_future()
+    _pending_portal_prepares[request_id] = future
+    _portal_prepare_owners[request_id] = agent_url
+    try:
+        await websocket.send_json(
+            {
+                "type": "portal_prepare",
+                "request_id": request_id,
+                "session": session.model_dump(mode="json"),
+                "agent_url": agent_url,
+                "session_revision": session_revision,
+                "timeout": timeout,
+            }
+        )
+        return await asyncio.wait_for(future, timeout=timeout)
+    except TimeoutError as exc:
+        raise RuntimeError("portal owner did not prepare a route before timeout") from exc
+    finally:
+        _pending_portal_prepares.pop(request_id, None)
+        _portal_prepare_owners.pop(request_id, None)
 async def open_portal_route(
     agent_url: str,
     owner_route: PortalOwnerRouteV1,
@@ -528,3 +585,25 @@ def resolve_agent_result(request_id: str, msg: dict[str, Any]) -> None:
         )
         return
     fut.set_result(msg.get("result", {}))
+
+
+def resolve_portal_prepared(agent_url: str, msg: dict[str, Any]) -> None:
+    """Resolve an edge-produced route only for its originating authenticated node."""
+
+    request_id = msg.get("request_id")
+    if not isinstance(request_id, str) or _portal_prepare_owners.get(request_id) != agent_url:
+        logger.warning("WS: unexpected portal_prepared response")
+        return
+    future = _pending_portal_prepares.get(request_id)
+    if future is None or future.done():
+        return
+    try:
+        if msg.get("type") == "portal_prepare_error":
+            raise RuntimeError("portal owner rejected route preparation")
+        route = PortalOwnerRouteV1.model_validate(msg.get("route"))
+        identity = _connection_identities.get(agent_url)
+        if identity is None or route.node_identity != identity:
+            raise ValueError("portal route identity does not match authenticated node")
+        future.set_result(route)
+    except (ValueError, RuntimeError) as exc:
+        future.set_exception(exc)

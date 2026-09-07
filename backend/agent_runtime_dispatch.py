@@ -22,6 +22,7 @@ from backend.browser_account_runtime import (
     BrowserRuntimeError,
     SessionRuntimeBinding,
     runtime_lease_book,
+    session_portal_registry,
     session_runtime_registry,
 )
 from backend.schemas.browser_account import (
@@ -33,9 +34,11 @@ from backend.schemas.browser_account import (
     PortalOuterBindingV1,
     PortalOwnerRouteV1,
     PortalPixelFrameV1,
+    PortalRegionFocusV1,
     PortalTransientV1,
     PortalWireFrameV1,
     PortalWireLayoutV1,
+    SensitiveSessionBindingV1,
     SessionEnvelopeV1,
 )
 from backend.services.browser_portal_contract import portal_wire_metadata_length
@@ -131,7 +134,124 @@ def resolve_account_runtime_context(req: RuntimeInvokeRequest) -> AccountRuntime
     }
     if forbidden.intersection(req.config):
         raise HTTPException(status_code=400, detail="client runtime routing override is forbidden")
-    return AccountRuntimeContext(guard=guard, binding=binding)
+
+
+async def prepare_portal_route(
+    agent_url: str,
+    session_envelope: SessionEnvelopeV1,
+    *,
+    session_revision: int,
+    timeout: float = 15,
+) -> PortalOwnerRouteV1:
+    """Resolve one live edge page, RecordSession and L-approved focus into a route."""
+
+    if isinstance(session_revision, bool) or not isinstance(session_revision, int) or session_revision < 0:
+        raise ValueError("portal route requires an authorized session revision")
+    if not 0 < timeout <= 30:
+        raise ValueError("portal route timeout must be between zero and thirty seconds")
+    if session_envelope.purpose != "login":
+        raise ValueError("portal routes require a login session")
+    target = session_envelope.target
+    target.require_complete()
+    if session_envelope.login_rule_id is None or session_envelope.login_rule_version is None:
+        raise ValueError("portal routes require a fixed login rule")
+    try:
+        runtime = session_runtime_registry().resolve(
+            session_id=session_envelope.session_id,
+            node_id=session_envelope.node_id,
+            boot_id=session_envelope.node_boot_id,
+            epoch=session_envelope.epoch,
+        )
+        registration = session_portal_registry().resolve(
+            session_id=session_envelope.session_id,
+            node_id=session_envelope.node_id,
+            boot_id=session_envelope.node_boot_id,
+            epoch=session_envelope.epoch,
+            agent_url=agent_url,
+        )
+    except BrowserRuntimeError as exc:
+        raise RuntimeError(exc.code) from exc
+
+    request = RuntimeInvokeRequest(
+        runtime="script-host",
+        workflow="login.observe",
+        input={
+            "session_id": session_envelope.session_id,
+            "epoch": session_envelope.epoch,
+            "target": target.model_dump(mode="json") | {
+                "view_generation": session_envelope.view_generation
+            },
+        },
+        config={
+            "pack": "account-login",
+            "action": "login.observe",
+            "tab_id": target.tab_id,
+        },
+    )
+    try:
+        observation_response = await asyncio.wait_for(
+            invoke_script_host(request, cdp_endpoint=runtime.cdp_endpoint),
+            timeout=timeout,
+        )
+    except TimeoutError as exc:
+        raise RuntimeError("login observe timed out") from exc
+    if observation_response.get("ok") is not True:
+        raise RuntimeError("login observe rejected the live target")
+    observation = observation_response.get("result")
+    if not isinstance(observation, dict):
+        raise RuntimeError("login observe returned no observation")
+    if (
+        observation.get("session_id") != session_envelope.session_id
+        or observation.get("epoch") != session_envelope.epoch
+        or observation.get("rule_id") != session_envelope.login_rule_id
+        or observation.get("rule_version") != session_envelope.login_rule_version
+        or observation.get("target") != target.model_dump(mode="json")
+        or observation.get("view_generation") != session_envelope.view_generation
+    ):
+        raise RuntimeError("login observe lineage does not match the authorized session")
+    try:
+        focus = PortalRegionFocusV1.model_validate(observation.get("region_focus"))
+    except ValueError as exc:
+        raise RuntimeError("login observe returned no approved portal focus") from exc
+    if (
+        focus.target != target
+        or focus.view_generation != session_envelope.view_generation
+    ):
+        raise RuntimeError("login observe focus lineage changed")
+
+    binding = SensitiveSessionBindingV1(
+        account_ref={
+            "workspace_id": session_envelope.workspace_id,
+            "account_id": session_envelope.account_id,
+        },
+        session_id=session_envelope.session_id,
+        epoch=session_envelope.epoch,
+        target=target,
+        view_generation=session_envelope.view_generation,
+        record_session_id=getattr(registration.record_session, "session_id", None),
+    )
+    from backend.services.browser_portal_contract import (
+        freeze_portal_record_session,
+        register_portal_record_session,
+    )
+
+    register_portal_record_session(binding, registration.record_session)
+    await freeze_portal_record_session(binding, registration.record_session)
+    return PortalOwnerRouteV1(
+        binding=binding,
+        node_identity=NodeIdentityV1(
+            node_id=session_envelope.node_id,
+            boot_id=session_envelope.node_boot_id,
+        ),
+        owner_endpoint=registration.owner_endpoint,
+        tunnel_handle=registration.tunnel_handle,
+        tunnel_auth_digest=registration.tunnel_auth_digest,
+        region_focus=focus,
+        session_revision=session_revision,
+        route_expires_at=datetime.now(UTC) + timedelta(seconds=timeout),
+        max_frame_bytes=4_000_000,
+        max_input_bytes=4_096,
+    )
 
 async def snapshot_tab_ids(cdp_endpoint: str) -> set[str]:
     """Return the set of tab IDs currently open in Chrome."""

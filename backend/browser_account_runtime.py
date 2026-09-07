@@ -1669,6 +1669,105 @@ class SessionRuntimeRegistry:
 
 
 @dataclass(frozen=True)
+class PortalRuntimeRegistration:
+    """Edge-owned live portal facts; never serialized into a durable command."""
+
+    session_id: str
+    node_id: str
+    boot_id: str
+    epoch: int
+    agent_url: str
+    owner_endpoint: str
+    tunnel_handle: str
+    tunnel_auth_digest: str
+    record_session: Any
+
+    def validate(self) -> None:
+        for field_name, value in (
+            ("session_id", self.session_id),
+            ("node_id", self.node_id),
+            ("boot_id", self.boot_id),
+            ("tunnel_handle", self.tunnel_handle),
+        ):
+            _validate_id(value, field_name, max_length=255)
+        if self.epoch < 0:
+            raise BrowserRuntimeError("portal_registration_invalid", "portal generation is invalid")
+        if not self.agent_url.startswith(("https://", "wss://")):
+            raise BrowserRuntimeError("portal_registration_invalid", "portal agent URL must use TLS")
+        if not self.owner_endpoint.startswith("https://"):
+            raise BrowserRuntimeError("portal_registration_invalid", "portal owner endpoint must use TLS")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.tunnel_auth_digest):
+            raise BrowserRuntimeError("portal_registration_invalid", "portal tunnel digest is invalid")
+        if getattr(self.record_session, "session_id", None) is None or getattr(
+            self.record_session, "page", None
+        ) is None:
+            raise BrowserRuntimeError(
+                "portal_record_missing", "portal record session is not a live page record"
+            )
+
+
+class SessionPortalRegistry:
+    """Registers actual edge RecordSessions for one fenced runtime generation."""
+
+    def __init__(self) -> None:
+        self._registrations: dict[str, PortalRuntimeRegistration] = {}
+        self._lock = threading.RLock()
+
+    def register(self, registration: PortalRuntimeRegistration) -> None:
+        registration.validate()
+        with self._lock:
+            existing = self._registrations.get(registration.session_id)
+            if existing is not None and existing != registration:
+                raise BrowserRuntimeError(
+                    "stale_portal_registration",
+                    "portal session already has a different live registration",
+                )
+            self._registrations[registration.session_id] = registration
+
+    def resolve(
+        self,
+        *,
+        session_id: str,
+        node_id: str,
+        boot_id: str,
+        epoch: int,
+        agent_url: str,
+    ) -> PortalRuntimeRegistration:
+        with self._lock:
+            registration = self._registrations.get(session_id)
+        if registration is None:
+            raise BrowserRuntimeError("portal_record_missing", "portal record session is unavailable")
+        if (
+            registration.node_id != node_id
+            or registration.boot_id != boot_id
+            or registration.epoch != epoch
+            or registration.agent_url != agent_url
+        ):
+            raise BrowserRuntimeError(
+                "stale_portal_registration",
+                "portal registration does not match the current runtime generation",
+            )
+        registration.validate()
+        return registration
+
+    def revoke(self, *, session_id: str, node_id: str, boot_id: str, epoch: int) -> None:
+        with self._lock:
+            registration = self._registrations.get(session_id)
+            if registration is None:
+                return
+            if (
+                registration.node_id != node_id
+                or registration.boot_id != boot_id
+                or registration.epoch != epoch
+            ):
+                raise BrowserRuntimeError(
+                    "stale_portal_registration",
+                    "cannot revoke a newer portal registration",
+                )
+            self._registrations.pop(session_id, None)
+
+
+@dataclass(frozen=True)
 class RuntimeLeaseAdmission:
     """Local authenticated claim/renew/result admission, never a scheduler."""
 
@@ -1741,11 +1840,16 @@ class AuthenticatedRuntimeLeaseBook:
 
 
 _SESSION_RUNTIME_REGISTRY = SessionRuntimeRegistry()
+_SESSION_PORTAL_REGISTRY = SessionPortalRegistry()
 _RUNTIME_LEASE_BOOK = AuthenticatedRuntimeLeaseBook()
 
 
 def session_runtime_registry() -> SessionRuntimeRegistry:
     return _SESSION_RUNTIME_REGISTRY
+
+
+def session_portal_registry() -> SessionPortalRegistry:
+    return _SESSION_PORTAL_REGISTRY
 
 
 def runtime_lease_book() -> AuthenticatedRuntimeLeaseBook:

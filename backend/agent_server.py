@@ -75,6 +75,7 @@ from backend.agent_runtime_dispatch import (
     cleanup_cdp_tabs,
     invoke_runtime,
     parse_output,
+    prepare_portal_route,
     resolve_portal_target,
     resolve_account_runtime_context,
     snapshot_tab_ids,
@@ -634,6 +635,67 @@ async def _handle_ws_portal_binary(ws, data: bytes) -> None:
             await ws.send(json.dumps({"type": "portal_error", "portal_id": portal_id, "error": "control rejected"}))
         except Exception:
             logger.debug("WS: failed to report portal control error", exc_info=True)
+
+
+async def _handle_ws_portal_prepare(
+    ws,
+    msg: dict,
+    authenticated_identity: NodeIdentityV1 | None,
+) -> None:
+    """Build one short-lived route from this node's registered live runtime."""
+
+    request_id = msg.get("request_id", "")
+    try:
+        if authenticated_identity is None:
+            raise ValueError("portal node identity is unavailable")
+        session = SessionEnvelopeV1.model_validate(msg.get("session"))
+        if (
+            session.node_id != authenticated_identity.node_id
+            or session.node_boot_id != authenticated_identity.boot_id
+        ):
+            raise ValueError("portal session does not belong to this node")
+        agent_url = msg.get("agent_url")
+        session_revision = msg.get("session_revision")
+        timeout = msg.get("timeout", 15)
+        if (
+            not isinstance(agent_url, str)
+            or isinstance(session_revision, bool)
+            or not isinstance(session_revision, int)
+            or session_revision < 0
+            or not isinstance(timeout, (int, float))
+        ):
+            raise ValueError("portal preparation request is invalid")
+        route = await prepare_portal_route(
+            agent_url,
+            session,
+            session_revision=session_revision,
+            timeout=float(timeout),
+        )
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "portal_prepared",
+                    "request_id": request_id,
+                    "route": route.model_dump(mode="json"),
+                }
+            )
+        )
+    except Exception:
+        logger.warning("WS portal preparation rejected", exc_info=True)
+        try:
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "portal_prepare_error",
+                        "request_id": request_id,
+                        "error": "portal preparation rejected",
+                    }
+                )
+            )
+        except Exception:
+            logger.debug("WS: failed to report portal preparation error", exc_info=True)
+
+
 async def _handle_ws_agent_task(
     ws,
     msg: dict,
@@ -938,6 +1000,10 @@ async def _register_via_ws(advertise_url: str) -> None:
                     elif msg_type == "portal_open":
                         asyncio.create_task(
                             _handle_ws_portal(ws, msg, _node_identity(required=False))
+                        )
+                    elif msg_type == "portal_prepare":
+                        asyncio.create_task(
+                            _handle_ws_portal_prepare(ws, msg, _node_identity(required=False))
                         )
                     elif msg_type == "portal_close":
                         _ACTIVE_PORTALS.pop(msg.get("portal_id", ""), None)
