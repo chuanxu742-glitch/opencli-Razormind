@@ -186,6 +186,9 @@ jobs:
       - name: Backend syntax check
         run: uv run python -m compileall backend
 
+      - name: Managed runtime lifecycle regressions
+        run: uv run pytest tests/unit/test_browser_account_runtime_allocator.py --no-cov -q
+
       # Coverage visibility, not a gate: pyproject.toml bakes in
       # `--cov-fail-under=80` via [tool.pytest.ini_options].addopts, but the
       # current suite sits at ~70% total. Enforcing 80% here would turn CI red
