@@ -320,7 +320,7 @@ test('Studio Run presents the fresh question bank as a file contract instead of 
   )
   assert.match(
     runFlow,
-    /const started = await startWorkflowRun[\s\S]*?setQuestionBankFile\(\(current\) => current === submittedQuestionBankFile \? null : current\)[\s\S]*?monitorActiveRun\(started, authorization\)/,
+    /const started = await startWorkflowRun[\s\S]*?setQuestionBankFile\(\(current\) => current === submittedQuestionBankFile \? null : current\)[\s\S]*?monitorActiveRun\(started\)/,
   )
   assert.match(runFlow, /const submittedQuestionBankFile = questionBankFile/)
   assert.match(
