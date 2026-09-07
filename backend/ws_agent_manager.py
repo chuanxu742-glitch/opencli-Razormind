@@ -88,17 +88,19 @@ _connection_tunnels: dict[str, tuple[str, str]] = {}
 
 # request_id → Future awaiting agent result (collect/result path)
 _pending: dict[str, asyncio.Future] = {}
+_collect_owners: dict[str, WebSocket] = {}
 
 # request_id → Future awaiting the terminal agent_result (agent_task path)
 _pending_agent_tasks: dict[str, asyncio.Future] = {}
+_task_owners: dict[str, WebSocket] = {}
 
 # request_id → (on_event callback, owning agent_url) for streaming agent_event dispatch
 _agent_task_callbacks: dict[str, tuple[Callable[[dict[str, Any]], Any], str]] = {}
 
 # request_id → Future awaiting a typed portal descriptor from its edge owner.
 _pending_portal_prepares: dict[str, asyncio.Future[PortalOwnerRouteV1]] = {}
-# request_id → owning edge connection for disconnect cleanup.
-_portal_prepare_owners: dict[str, str] = {}
+# request_id → owning edge WebSocket for response fencing and disconnect cleanup.
+_portal_prepare_owners: dict[str, WebSocket] = {}
 
 
 _PORTAL_QUEUE_MAX = 4
@@ -208,6 +210,10 @@ def register_connection(
     """Record a newly-established WS connection and its node identity."""
     if bool(tunnel_handle) != bool(tunnel_auth_digest):
         raise ValueError("portal tunnel binding must include handle and digest")
+    previous = _connections.get(agent_url)
+    if previous is not None and previous is not ws:
+        unregister_connection(agent_url, previous)
+        asyncio.get_running_loop().create_task(previous.close(code=1012))
     _connections[agent_url] = ws
     if node_identity is not None:
         _connection_identities[agent_url] = node_identity
@@ -221,25 +227,40 @@ def register_connection(
     logger.info("WS agent connected: %s (total=%d)", agent_url, len(_connections))
 
 
-def unregister_connection(agent_url: str) -> None:
-    """Remove a WS connection and fail all its pending futures."""
+def unregister_connection(agent_url: str, source_ws: WebSocket | None = None) -> bool:
+    """Fail this transport's pending work without unregistering a replacement."""
+    current = _connections.get(agent_url)
+    if current is None or (source_ws is not None and current is not source_ws):
+        return False
+
+    for request_id, owner in tuple(_collect_owners.items()):
+        if owner is not current:
+            continue
+        future = _pending.get(request_id)
+        if future is not None and not future.done():
+            future.set_exception(RuntimeError("Agent disconnected before collection completed"))
+        _collect_owners.pop(request_id, None)
+
     _connections.pop(agent_url, None)
     _connection_identities.pop(agent_url, None)
     _connection_tunnels.pop(agent_url, None)
     for portal_id, transport in tuple(_portal_transports.items()):
-        if transport.agent_url == agent_url:
-            transport._finish()
-            _portal_transports.pop(portal_id, None)
-            _portal_ready.pop(portal_id, None)
+        if transport.websocket is not current:
+            continue
+        transport._finish()
+        _portal_transports.pop(portal_id, None)
+        ready = _portal_ready.pop(portal_id, None)
+        if ready is not None and not ready.done():
+            ready.set_exception(RuntimeError("portal owner disconnected before opening"))
     logger.info("WS agent disconnected: %s (remaining=%d)", agent_url, len(_connections))
 
     dead_request_ids = [
-        request_id for request_id, (_, owner) in _agent_task_callbacks.items() if owner == agent_url
+        request_id for request_id, owner in _task_owners.items() if owner is current
     ]
     for request_id in dead_request_ids:
-        fut = _pending_agent_tasks.get(request_id)
-        if fut is not None and not fut.done():
-            fut.set_result(
+        future = _pending_agent_tasks.get(request_id)
+        if future is not None and not future.done():
+            future.set_result(
                 {
                     "type": "error",
                     "task_id": request_id,
@@ -247,14 +268,16 @@ def unregister_connection(agent_url: str) -> None:
                     "error_type": "AgentDisconnected",
                 }
             )
+        _task_owners.pop(request_id, None)
         _agent_task_callbacks.pop(request_id, None)
     for request_id, owner in tuple(_portal_prepare_owners.items()):
-        if owner != agent_url:
+        if owner is not current:
             continue
         future = _pending_portal_prepares.get(request_id)
         if future is not None and not future.done():
             future.set_exception(RuntimeError("portal owner disconnected before preparation"))
         _portal_prepare_owners.pop(request_id, None)
+    return True
 
 
 async def prepare_portal_route(
@@ -288,7 +311,7 @@ async def prepare_portal_route(
     request_id = str(uuid.uuid4())
     future: asyncio.Future[PortalOwnerRouteV1] = asyncio.get_running_loop().create_future()
     _pending_portal_prepares[request_id] = future
-    _portal_prepare_owners[request_id] = agent_url
+    _portal_prepare_owners[request_id] = websocket
     try:
         await websocket.send_json(
             {
@@ -356,11 +379,19 @@ async def open_portal_route(
         raise
 
 
-async def resolve_portal_ready(agent_url: str, msg: dict[str, Any]) -> None:
-    """Resolve an edge portal_open acknowledgement."""
+async def resolve_portal_ready(
+    agent_url: str,
+    msg: dict[str, Any],
+    source_ws: WebSocket | None = None,
+) -> None:
+    """Resolve an edge portal_open acknowledgement from its owning transport."""
     portal_id = msg.get("portal_id", "")
     transport = _portal_transports.get(portal_id)
-    if transport is None or transport.agent_url != agent_url:
+    if (
+        transport is None
+        or transport.agent_url != agent_url
+        or (source_ws is not None and transport.websocket is not source_ws)
+    ):
         logger.warning("WS: unexpected portal_ready for portal_id=%s", portal_id)
         return
     ready = _portal_ready.get(portal_id)
@@ -380,29 +411,47 @@ async def resolve_portal_ready(agent_url: str, msg: dict[str, Any]) -> None:
         ready.set_result(None)
 
 
-def _abort_portals_for_agent(agent_url: str) -> None:
+def _abort_portals_for_agent(
+    agent_url: str,
+    source_ws: WebSocket | None = None,
+) -> None:
     for portal_id, transport in tuple(_portal_transports.items()):
         if transport.agent_url != agent_url:
             continue
+        if source_ws is not None and transport.websocket is not source_ws:
+            continue
         transport._finish()
         _portal_transports.pop(portal_id, None)
-        _portal_ready.pop(portal_id, None)
+        ready = _portal_ready.pop(portal_id, None)
+        if ready is not None and not ready.done():
+            ready.set_exception(RuntimeError("portal transport was aborted"))
 
 
-async def resolve_portal_binary(agent_url: str, data: bytes) -> None:
+async def resolve_portal_binary(
+    agent_url: str,
+    data: bytes,
+    source_ws: WebSocket | None = None,
+) -> None:
     """Decode, route-check, and enqueue one transient binary portal frame."""
+    if source_ws is not None and _connections.get(agent_url) is not source_ws:
+        logger.warning("WS: portal frame came from a stale connection for %s", agent_url)
+        return
     if len(data) > _PORTAL_MAX_WIRE_BYTES:
         logger.warning("WS: oversized portal frame from %s", agent_url)
-        _abort_portals_for_agent(agent_url)
+        _abort_portals_for_agent(agent_url, source_ws)
         return
     try:
         frame = decode_portal_wire_frame(data)
     except ValueError:
         logger.warning("WS: invalid portal wire frame from %s", agent_url)
-        _abort_portals_for_agent(agent_url)
+        _abort_portals_for_agent(agent_url, source_ws)
         return
     transport = _portal_transports.get(frame.transient.binding.session_id)
-    if transport is None or transport.agent_url != agent_url:
+    if (
+        transport is None
+        or transport.agent_url != agent_url
+        or (source_ws is not None and transport.websocket is not source_ws)
+    ):
         logger.warning(
             "WS: portal frame has no active route session=%s",
             frame.transient.binding.session_id,
@@ -424,6 +473,11 @@ async def resolve_portal_binary(agent_url: str, data: bytes) -> None:
 
 def is_connected(agent_url: str) -> bool:
     return agent_url in _connections
+
+
+def owns_connection(agent_url: str, source_ws: WebSocket) -> bool:
+    """Return whether *source_ws* is the currently registered transport."""
+    return _connections.get(agent_url) is source_ws
 
 
 def list_connected() -> list[str]:
@@ -466,9 +520,12 @@ async def dispatch_collect(
         account_session = session.to_wire()
 
     request_id = request_id or str(uuid.uuid4())
+    if request_id in _pending or request_id in _pending_agent_tasks:
+        raise ValueError("request_id is already active")
     loop = asyncio.get_running_loop()
     fut: asyncio.Future[dict] = loop.create_future()
     _pending[request_id] = fut
+    _collect_owners[request_id] = ws
 
     try:
         await ws.send_json(
@@ -499,11 +556,18 @@ async def dispatch_collect(
         raise
     finally:
         _pending.pop(request_id, None)
+        _collect_owners.pop(request_id, None)
 
 
-def resolve_response(request_id: str, result: dict[str, Any]) -> None:
+def resolve_response(
+    request_id: str,
+    result: dict[str, Any],
+    source_ws: WebSocket | None = None,
+) -> None:
     """Called from the WS receive loop when an agent returns a 'result' message."""
     fut = _pending.get(request_id)
+    if source_ws is not None and _collect_owners.get(request_id) is not source_ws:
+        return
     if fut is None or fut.done():
         logger.warning("WS: unexpected result for request_id=%s (no waiting future)", request_id)
         return
@@ -562,6 +626,7 @@ async def send_agent_task(
     loop = asyncio.get_running_loop()
     fut: asyncio.Future[dict] = loop.create_future()
     _pending_agent_tasks[request_id] = fut
+    _task_owners[request_id] = ws
     _agent_task_callbacks[request_id] = (on_event, agent_url)
 
     try:
@@ -581,6 +646,7 @@ async def send_agent_task(
         raise
     finally:
         _pending_agent_tasks.pop(request_id, None)
+        _task_owners.pop(request_id, None)
         _agent_task_callbacks.pop(request_id, None)
 
 
@@ -601,11 +667,17 @@ async def _invoke_on_event(
         await result
 
 
-async def resolve_agent_event(request_id: str, msg: dict[str, Any]) -> None:
+async def resolve_agent_event(
+    request_id: str,
+    msg: dict[str, Any],
+    source_ws: WebSocket | None = None,
+) -> None:
     """Called from the WS receive loop when an agent sends an 'agent_event' frame."""
     entry = _agent_task_callbacks.get(request_id)
     if entry is None:
         logger.warning("WS: unexpected agent_event for request_id=%s (no waiting task)", request_id)
+        return
+    if source_ws is not None and _task_owners.get(request_id) is not source_ws:
         return
     on_event, _owner = entry
     event = msg.get("event", {})
@@ -618,9 +690,15 @@ async def resolve_agent_event(request_id: str, msg: dict[str, Any]) -> None:
             fut.set_exception(exc)
 
 
-def resolve_agent_result(request_id: str, msg: dict[str, Any]) -> None:
+def resolve_agent_result(
+    request_id: str,
+    msg: dict[str, Any],
+    source_ws: WebSocket | None = None,
+) -> None:
     """Called from the WS receive loop when an agent sends the terminal 'agent_result' frame."""
     fut = _pending_agent_tasks.get(request_id)
+    if source_ws is not None and _task_owners.get(request_id) is not source_ws:
+        return
     if fut is None or fut.done():
         logger.warning(
             "WS: unexpected agent_result for request_id=%s (no waiting future)",
@@ -630,11 +708,20 @@ def resolve_agent_result(request_id: str, msg: dict[str, Any]) -> None:
     fut.set_result(msg.get("result", {}))
 
 
-def resolve_portal_prepared(agent_url: str, msg: dict[str, Any]) -> None:
-    """Resolve an edge-produced route only for its originating authenticated node."""
+def resolve_portal_prepared(
+    agent_url: str,
+    msg: dict[str, Any],
+    source_ws: WebSocket | None = None,
+) -> None:
+    """Resolve an edge-produced route only for its originating authenticated socket."""
 
     request_id = msg.get("request_id")
-    if not isinstance(request_id, str) or _portal_prepare_owners.get(request_id) != agent_url:
+    owner = _portal_prepare_owners.get(request_id) if isinstance(request_id, str) else None
+    if (
+        owner is None
+        or _connections.get(agent_url) is not owner
+        or (source_ws is not None and owner is not source_ws)
+    ):
         logger.warning("WS: unexpected portal_prepared response")
         return
     future = _pending_portal_prepares.get(request_id)

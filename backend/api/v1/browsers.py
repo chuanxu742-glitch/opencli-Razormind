@@ -5,7 +5,15 @@ import secrets
 import socket
 from datetime import UTC
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -663,13 +671,18 @@ async def agent_ws_endpoint(ws: WebSocket) -> None:
         # ── 3. Receive loop: results + pings ──────────────────────────────────
         while True:
             msg = await ws.receive_json()
+            if not ws_agent_manager.owns_connection(agent_url, ws):
+                logger.warning("WS agent %s: ignoring frame from stale connection", agent_url)
+                return
             msg_type = msg.get("type")
             if msg_type == "result":
-                ws_agent_manager.resolve_response(msg.get("request_id", ""), msg)
+                ws_agent_manager.resolve_response(msg.get("request_id", ""), msg, source_ws=ws)
             elif msg_type == "agent_event":
-                await ws_agent_manager.resolve_agent_event(msg.get("request_id", ""), msg)
+                await ws_agent_manager.resolve_agent_event(
+                    msg.get("request_id", ""), msg, source_ws=ws
+                )
             elif msg_type == "agent_result":
-                ws_agent_manager.resolve_agent_result(msg.get("request_id", ""), msg)
+                ws_agent_manager.resolve_agent_result(msg.get("request_id", ""), msg, source_ws=ws)
             elif msg_type == "ping":
                 await ws.send_json({"type": "pong"})
             else:
@@ -680,8 +693,7 @@ async def agent_ws_endpoint(ws: WebSocket) -> None:
     except Exception as exc:
         logger.exception("WS agent %s: unexpected error: %s", agent_url or "<unregistered>", exc)
     finally:
-        if agent_url:
-            ws_agent_manager.unregister_connection(agent_url)
+        if agent_url and ws_agent_manager.unregister_connection(agent_url, ws):
             try:
                 from datetime import datetime
 

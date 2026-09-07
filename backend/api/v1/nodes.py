@@ -1009,9 +1009,12 @@ async def node_ws_endpoint(ws: WebSocket) -> None:
             received = await ws.receive()
             if received.get("type") == "websocket.disconnect":
                 raise WebSocketDisconnect
+            if not ws_agent_manager.owns_connection(agent_url, ws):
+                logger.warning("WS node %s: ignoring frame from stale connection", agent_url)
+                return
             raw_bytes = received.get("bytes")
             if raw_bytes is not None:
-                await ws_agent_manager.resolve_portal_binary(agent_url, raw_bytes)
+                await ws_agent_manager.resolve_portal_binary(agent_url, raw_bytes, source_ws=ws)
                 continue
             try:
                 msg = json.loads(received.get("text") or "{}")
@@ -1020,15 +1023,17 @@ async def node_ws_endpoint(ws: WebSocket) -> None:
                 continue
             msg_type = msg.get("type")
             if msg_type == "result":
-                ws_agent_manager.resolve_response(msg.get("request_id", ""), msg)
+                ws_agent_manager.resolve_response(msg.get("request_id", ""), msg, source_ws=ws)
             elif msg_type == "agent_event":
-                await ws_agent_manager.resolve_agent_event(msg.get("request_id", ""), msg)
+                await ws_agent_manager.resolve_agent_event(
+                    msg.get("request_id", ""), msg, source_ws=ws
+                )
             elif msg_type == "agent_result":
-                ws_agent_manager.resolve_agent_result(msg.get("request_id", ""), msg)
+                ws_agent_manager.resolve_agent_result(msg.get("request_id", ""), msg, source_ws=ws)
             elif msg_type in {"portal_ready", "portal_error"}:
-                await ws_agent_manager.resolve_portal_ready(agent_url, msg)
+                await ws_agent_manager.resolve_portal_ready(agent_url, msg, source_ws=ws)
             elif msg_type in {"portal_prepared", "portal_prepare_error"}:
-                ws_agent_manager.resolve_portal_prepared(agent_url, msg)
+                ws_agent_manager.resolve_portal_prepared(agent_url, msg, source_ws=ws)
             elif msg_type == "login_observation":
                 from backend.schemas.browser_account import LoginObservationV1
                 from backend.services.browser_account_service import apply_login_observation
@@ -1054,8 +1059,7 @@ async def node_ws_endpoint(ws: WebSocket) -> None:
     except Exception as exc:
         logger.exception("WS node %s: error: %s", agent_url or "<unregistered>", exc)
     finally:
-        if agent_url:
-            ws_agent_manager.unregister_connection(agent_url)
+        if agent_url and ws_agent_manager.unregister_connection(agent_url, ws):
             # Write offline event
             try:
                 async with AsyncSessionLocal() as db:
