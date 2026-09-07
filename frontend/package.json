@@ -20,6 +20,7 @@
     "check:record-hygiene": "node --test scripts/check-record-hygiene-regressions.mjs",
     "check:record-relationships": "node --test scripts/check-record-relationship-regressions.mjs",
     "check:opencli-business-workflows": "node --test scripts/check-opencli-business-workflows.mjs",
+    "check:browser-account-portal": "node scripts/check-browser-account-portal-regressions.mjs",
     "test": "playwright test",
     "check:browser-spaces": "node --test scripts/check-browser-spaces-regressions.mjs",
     "test:smoke": "playwright test",
