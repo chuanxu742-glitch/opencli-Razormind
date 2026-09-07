@@ -99,9 +99,9 @@ export interface BrowserLoginSession {
   profile_state: 'new' | 'uncommitted' | 'committed'
   login_rule_id: string | null
   login_rule_version: string | null
-  tab_id: string | null
-  frame_id: string | null
-  document_id: string | null
+  tab_id: string | number | null
+  frame_id: string | number | null
+  document_id: string | number | null
   origin: string | null
   view_generation: number
   purpose: BrowserLoginPurpose

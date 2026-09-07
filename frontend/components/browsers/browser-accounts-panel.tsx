@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useSearchParams } from 'next/navigation'
 import { CheckCircle2, ExternalLink, Loader2, Plus, RefreshCw, ShieldAlert, Wifi, X } from 'lucide-react'
 import { toast } from 'sonner'
@@ -86,7 +86,7 @@ function EvidenceSummary({ account }: { account: BrowserAccount }) {
         <p className="mt-1 truncate font-mono text-xs text-muted-foreground">{account.platform_identity?.provider ?? '身份不可用'}</p>
       </div>
       <div className="rounded-md border p-3">
-        <p className="text-xs text-muted-foreground">运行时健康度</p>
+        <p className="text-xs text-muted-foreground">运行资源分配</p>
         <p className="mt-1 truncate font-mono text-xs">{account.runtime_bundle_id ?? '未分配'}</p>
         <p className="mt-1 text-xs text-muted-foreground">{account.node_id ? `节点 ${account.node_id}` : '节点待定'}</p>
       </div>
@@ -142,9 +142,9 @@ function CreateAccountForm({ workspaceId, canManage, onCreated }: { workspaceId:
 }
 
 type PortalTarget = {
-  tab_id: string
-  frame_id: string
-  document_id: string
+  tab_id: string | number
+  frame_id: string | number
+  document_id: string | number
   origin: string
 }
 
@@ -169,12 +169,12 @@ type PortalWirePixel = PortalBinding & {
   mime_type: 'image/png' | 'image/jpeg' | 'image/webp'
   region_kind: 'qr' | 'form' | 'approved'
   byte_length: number
+  expires_at: string
   frame_bytes?: string
   focused_field_ref?: string
 }
 
 const MAX_PORTAL_FRAME_BYTES = 4_000_000
-const MAX_PORTAL_BASE64_BYTES = Math.ceil(MAX_PORTAL_FRAME_BYTES / 3) * 4
 const MAX_PORTAL_METADATA_BYTES = 128 * 1024
 const PORTAL_MIME_TYPES = ['image/png', 'image/jpeg', 'image/webp'] as const
 const PORTAL_REGION_KINDS = ['qr', 'form', 'approved'] as const
@@ -184,7 +184,7 @@ function makePortalCsrfToken(): string {
 }
 
 function sessionTarget(session: BrowserLoginSession): PortalTarget | null {
-  if (!session.tab_id || !session.frame_id || !session.document_id || !session.origin) return null
+  if (session.tab_id == null || session.frame_id == null || session.document_id == null || !session.origin) return null
   return {
     tab_id: session.tab_id,
     frame_id: session.frame_id,
@@ -211,11 +211,12 @@ function readPositiveInteger(value: unknown, maximum = MAX_PORTAL_FRAME_BYTES): 
 
 function readPortalTarget(value: unknown): PortalTarget | null {
   if (!isRecord(value)) return null
-  const tab_id = readNonEmptyString(value.tab_id)
-  const frame_id = readNonEmptyString(value.frame_id)
-  const document_id = readNonEmptyString(value.document_id)
+  const targetId = (id: unknown) => typeof id === 'number' && Number.isSafeInteger(id) && id >= 0 ? id : readNonEmptyString(id)
+  const tab_id = targetId(value.tab_id)
+  const frame_id = targetId(value.frame_id)
+  const document_id = targetId(value.document_id)
   const origin = readNonEmptyString(value.origin, 2048)
-  return tab_id && frame_id && document_id && origin ? { tab_id, frame_id, document_id, origin } : null
+  return tab_id !== null && frame_id !== null && document_id !== null && origin ? { tab_id, frame_id, document_id, origin } : null
 }
 
 function readPortalBinding(value: unknown): PortalBinding | null {
@@ -267,10 +268,11 @@ function readPortalPixel(value: unknown, bytes: Uint8Array): PortalWirePixel | n
   const mime_type = typeof value.mime_type === 'string' ? PORTAL_MIME_TYPES.find((candidate) => candidate === value.mime_type) : undefined
   const region_kind = typeof value.region_kind === 'string' ? PORTAL_REGION_KINDS.find((candidate) => candidate === value.region_kind) : undefined
   const byte_length = readPositiveInteger(value.byte_length)
-  if (!identity || !mime_type || !region_kind || byte_length !== bytes.byteLength) return null
+  const expires_at = typeof value.expires_at === 'string' ? value.expires_at : ''
+  if (!identity || !mime_type || !region_kind || byte_length !== bytes.byteLength || !Number.isFinite(Date.parse(expires_at)) || Date.parse(expires_at) <= Date.now()) return null
   const focused_field_ref = value.focused_field_ref === undefined ? undefined : readNonEmptyString(value.focused_field_ref, 128)
   if (value.focused_field_ref !== undefined && !focused_field_ref) return null
-  return { ...identity, mime_type, region_kind, byte_length, ...(focused_field_ref ? { focused_field_ref } : {}) }
+  return { ...identity, mime_type, region_kind, byte_length, expires_at, ...(focused_field_ref ? { focused_field_ref } : {}) }
 }
 
 type DecodedPortalFrame =
@@ -284,48 +286,6 @@ function portalWebSocketUrl(path: string): string | null {
     if (url.origin !== window.location.origin) return null
     url.protocol = 'wss:'
     return url.toString()
-  } catch {
-    return null
-  }
-}
-
-function decodeBase64(value: unknown): Uint8Array | null {
-  if (typeof value !== 'string' || value.length === 0 || value.length > MAX_PORTAL_BASE64_BYTES || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) return null
-  try {
-    const decoded = atob(value)
-    if (decoded.length < 1 || decoded.length > MAX_PORTAL_FRAME_BYTES) return null
-    return Uint8Array.from(decoded, (character) => character.charCodeAt(0))
-  } catch {
-    return null
-  }
-}
-function decodePortalJsonFrame(data: string, expectedBinding: PortalBinding): DecodedPortalFrame | null {
-  if (data.length > MAX_PORTAL_METADATA_BYTES) return null
-  try {
-    const parsed: unknown = JSON.parse(data)
-    if (!isRecord(parsed)) return null
-    const envelope = isRecord(parsed.transient) ? parsed.transient : parsed
-    const encoding = envelope.encoding ?? parsed.encoding
-    const declaredSequence = envelope.sequence ?? parsed.sequence
-    const binding = readPortalBinding(envelope.binding)
-    if (!binding || !samePortalBinding(binding, expectedBinding)) return null
-    const rawControl = envelope.control ?? parsed.control
-    const rawPixel = envelope.pixel ?? parsed.pixel
-    if ((rawControl === undefined) === (rawPixel === undefined)) return null
-    if (rawControl !== undefined) {
-      if (encoding !== 'control-json' || envelope.content_type !== undefined && envelope.content_type !== 'application/json') return null
-      const control = readPortalControl(rawControl)
-      if (!control || (declaredSequence !== undefined && declaredSequence !== control.sequence)) return null
-      return { kind: 'control', binding, sequence: control.sequence, control }
-    }
-    if (encoding !== 'pixel-binary' || !isRecord(rawPixel)) return null
-    const rawPixelRecord = rawPixel
-    const bytes = decodeBase64(rawPixelRecord.frame_bytes)
-    if (!bytes) return null
-    const pixel = readPortalPixel(rawPixelRecord, bytes)
-    if (!pixel || (declaredSequence !== undefined && declaredSequence !== pixel.sequence)) return null
-    if (envelope.mime_type !== undefined && envelope.mime_type !== pixel.mime_type || envelope.content_type !== undefined && envelope.content_type !== pixel.mime_type || envelope.byte_length !== undefined && envelope.byte_length !== pixel.byte_length) return null
-    return { kind: 'pixel', binding, sequence: pixel.sequence, pixel, bytes }
   } catch {
     return null
   }
@@ -350,12 +310,12 @@ function decodePortalBinaryFrame(data: ArrayBuffer, expectedBinding: PortalBindi
     if (encoding === 0) {
       if (payloadBytes !== 0 || parsed.content_type !== 'application/json' || parsed.byte_length !== null) return null
       const control = readPortalControl(rawMessage)
-      return control && control.sequence === sequence ? { kind: 'control', binding, sequence, control } : null
+      return control && samePortalBinding(control, binding) && control.sequence === sequence ? { kind: 'control', binding, sequence, control } : null
     }
-    if (parsed.content_type !== rawMessage.mime_type || parsed.byte_length !== payloadBytes) return null
+    if (parsed.content_type !== 'application/octet-stream' || parsed.mime_type !== rawMessage.mime_type || parsed.byte_length !== payloadBytes) return null
     const payload = bytes.slice(16 + metadataBytes)
     const pixel = readPortalPixel(rawMessage, payload)
-    return pixel && pixel.sequence === sequence ? { kind: 'pixel', binding, sequence, pixel, bytes: payload } : null
+    return pixel && samePortalBinding(pixel, binding) && pixel.sequence === sequence ? { kind: 'pixel', binding, sequence, pixel, bytes: payload } : null
   } catch {
     return null
   }
@@ -414,12 +374,14 @@ function PortalView({ workspaceId, accountId, session, onClose }: { workspaceId:
     let currentFrameUrl: string | null = null
     let lastIncomingSequence = 0
     let terminalError = false
+    let frameExpiryTimer: ReturnType<typeof setTimeout> | undefined
     const target = sessionTarget(session)
     const expectedBinding: PortalBinding | null = target
       ? { workspace_id: workspaceId, account_id: accountId, session_id: session.id, epoch: session.epoch, target, view_generation: session.view_generation }
       : null
 
     const clearProjection = () => {
+      clearTimeout(frameExpiryTimer)
       if (currentFrameUrl) {
         URL.revokeObjectURL(currentFrameUrl)
         currentFrameUrl = null
@@ -444,6 +406,8 @@ function PortalView({ workspaceId, accountId, session, onClose }: { workspaceId:
       setFrameUrl(currentFrameUrl)
       setFrameKind(decoded.pixel.region_kind)
       setFocusedFieldRef(decoded.pixel.focused_field_ref ?? null)
+      clearTimeout(frameExpiryTimer)
+      frameExpiryTimer = setTimeout(clearProjection, Math.max(0, Date.parse(decoded.pixel.expires_at) - Date.now()))
       setMessage(decoded.pixel.region_kind === 'qr' ? '当前二维码投影' : decoded.pixel.region_kind === 'form' ? '已批准的表单投影' : '已批准的门户投影')
     }
     const acceptIncoming = (decoded: DecodedPortalFrame | null): decoded is DecodedPortalFrame => {
@@ -462,10 +426,6 @@ function PortalView({ workspaceId, accountId, session, onClose }: { workspaceId:
         return
       }
       showFrame(decoded)
-    }
-    const handleJsonMessage = (value: string) => {
-      if (disposed || !expectedBinding) return
-      handleDecoded(decodePortalJsonFrame(value, expectedBinding))
     }
     const sendControl = (kind: PortalWireControl['kind'], value?: string, fieldRef?: string) => {
       if (disposed || !socket || socket.readyState !== WebSocket.OPEN) return
@@ -530,7 +490,7 @@ function PortalView({ workspaceId, accountId, session, onClose }: { workspaceId:
         socket.onmessage = (event) => {
           if (disposed) return
           if (typeof event.data === 'string') {
-            handleJsonMessage(event.data)
+            failTransport('门户发送了非约定的消息格式，已清除当前投影。')
             return
           }
           if (event.data instanceof ArrayBuffer) {
@@ -571,7 +531,7 @@ function PortalView({ workspaceId, accountId, session, onClose }: { workspaceId:
   return (
     <div className="space-y-3 rounded-md border border-primary/30 bg-primary/5 p-4" data-testid="browser-account-portal">
       <div className="flex flex-wrap items-start justify-between gap-2">
-        <div><p className="font-medium">同一会话门户</p><p className="mt-1 text-xs text-muted-foreground">票据仅在响应体中兑换；HttpOnly Cookie 与 CSRF 绑定由服务端管理。</p></div>
+        <div><p className="font-medium">同一会话门户</p><p className="mt-1 text-xs text-muted-foreground">在当前登录会话中查看二维码或填写表单，关闭后会立即清除画面和输入。</p></div>
         <div className="flex items-center gap-2"><Badge variant="outline"><Wifi className="mr-1 size-3" />{transport === 'connected' ? '已连接' : transport === 'opening' ? '连接中' : transport === 'closed' ? '已关闭' : '错误'}</Badge><Button size="icon-xs" variant="ghost" onClick={onClose} aria-label="关闭门户"><X className="size-3" /></Button></div>
       </div>
       <p role="status" className="text-xs text-muted-foreground">{message}</p>
@@ -592,7 +552,7 @@ function SessionCard({ workspaceId, account, session, canOperate, onChanged }: {
       onChanged(next)
       if (action === 'view' || action === 'takeover') setPortalSession(next)
       if (action === 'close') setPortalSession(null)
-      toast.success(action === 'view' || action === 'takeover' ? 'Same-session portal authorized' : `Session ${action} accepted`)
+      toast.success(action === 'view' || action === 'takeover' ? '登录窗口已打开' : `Session ${action} accepted`)
     } catch (error) {
       toast.error(errorText(error))
     } finally {
@@ -605,12 +565,12 @@ function SessionCard({ workspaceId, account, session, canOperate, onChanged }: {
   }
   return (
     <div className="space-y-3 rounded-md border p-4" data-testid="browser-account-session">
-      <div className="flex flex-wrap items-start justify-between gap-3"><div><p className="font-medium">Login session</p><p className="mt-1 font-mono text-xs text-muted-foreground">{session.id} · revision {session.revision}</p></div><AccountStatus status={session.status} /></div>
+      <div className="flex flex-wrap items-start justify-between gap-3"><div><p className="font-medium">登录会话</p><p className="mt-1 font-mono text-xs text-muted-foreground">{session.id} · revision {session.revision}</p></div><AccountStatus status={session.status} /></div>
       <div className="grid gap-2 sm:grid-cols-3"><div><p className="text-xs text-muted-foreground">Lease / epoch</p><p className="mt-1 font-mono text-xs">{session.lease_id ?? 'pending'} / {session.epoch}</p></div><div><p className="text-xs text-muted-foreground">Node / boot</p><p className="mt-1 truncate font-mono text-xs">{session.node_id ?? 'pending'} / {session.node_boot_id ?? 'pending'}</p></div><div><p className="text-xs text-muted-foreground">Target tab / frame</p><p className="mt-1 font-mono text-xs">{session.tab_id ?? 'pending'} / {session.frame_id ?? 'pending'}</p></div></div>
       <div className="grid gap-2 sm:grid-cols-3"><div><p className="text-xs text-muted-foreground">Profile</p><p className="mt-1 font-mono text-xs">{session.profile_id ?? 'new'} · v{session.profile_version ?? '—'} · {session.profile_state}</p></div><div><p className="text-xs text-muted-foreground">View generation</p><p className="mt-1 font-mono text-xs">{session.view_generation}</p></div><div><p className="text-xs text-muted-foreground">Origin</p><p className="mt-1 truncate font-mono text-xs">{session.origin ?? 'not established'}</p></div></div>
-      {challenge ? <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-800 dark:text-amber-200"><ShieldAlert className="mt-0.5 size-4 shrink-0" /><p>Challenge or unknown state stays in this same session. Take over the approved portal, then confirm the observed identity; no new session or account is guessed.</p></div> : null}
-      <div className="flex flex-wrap gap-2"><Button size="sm" variant="outline" disabled={pending !== null || session.status === 'closed'} onClick={() => void run('view')}>{pending === 'view' ? <Loader2 className="size-4 animate-spin" /> : <ExternalLink className="size-4" />}Open portal</Button>{challenge ? <Button size="sm" variant="outline" disabled={pending !== null} onClick={() => void run('takeover')}>{pending === 'takeover' ? <Loader2 className="size-4 animate-spin" /> : null}Take over session</Button> : null}{challenge ? <Button size="sm" variant="outline" disabled={pending !== null || session.status === 'closed'} onClick={() => void run('confirm')}>{pending === 'confirm' ? <Loader2 className="size-4 animate-spin" /> : <CheckCircle2 className="size-4" />}Confirm observed identity</Button> : null}<Button size="sm" variant="ghost" disabled={pending !== null || session.status === 'closed'} onClick={() => void run('close')}>Close session</Button></div>
-      {portalSession ? <PortalView workspaceId={workspaceId} accountId={account.id} session={portalSession} onClose={() => setPortalSession(null)} /> : null}
+      {challenge ? <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-800 dark:text-amber-200"><ShieldAlert className="mt-0.5 size-4 shrink-0" /><p>请在当前会话中完成平台验证，核对身份后确认。</p></div> : null}
+      <div className="flex flex-wrap gap-2"><Button size="sm" variant="outline" disabled={pending !== null || session.status === 'closed'} onClick={() => void run('view')}>{pending === 'view' ? <Loader2 className="size-4 animate-spin" /> : <ExternalLink className="size-4" />}打开登录窗口</Button>{challenge ? <Button size="sm" variant="outline" disabled={pending !== null} onClick={() => void run('takeover')}>{pending === 'takeover' ? <Loader2 className="size-4 animate-spin" /> : null}接管当前会话</Button> : null}{challenge ? <Button size="sm" variant="outline" disabled={pending !== null || session.status === 'closed'} onClick={() => void run('confirm')}>{pending === 'confirm' ? <Loader2 className="size-4 animate-spin" /> : <CheckCircle2 className="size-4" />}确认已核对身份</Button> : null}<Button size="sm" variant="ghost" disabled={pending !== null || session.status === 'closed'} onClick={() => void run('close')}>关闭会话</Button></div>
+      {portalSession && !['closed', 'expired', 'error'].includes(session.status) ? <PortalView workspaceId={workspaceId} accountId={account.id} session={session.id === portalSession.id ? session : portalSession} onClose={() => setPortalSession(null)} /> : null}
     </div>
   )
 }
@@ -643,10 +603,10 @@ function AccountDetail({ workspaceId, account, canManage, canOperate, onRefresh 
     <section className="space-y-4" data-testid="browser-account-detail">
       <div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-lg font-semibold">{current.label}</p><p className="mt-1 font-mono text-xs text-muted-foreground">{current.site} · account_id {current.id}</p></div><div className="flex items-center gap-2"><AccountStatus status={current.status} /><span className="font-mono text-xs text-muted-foreground">revision {current.revision}</span></div></div>
       <EvidenceSummary account={current} />
-      {current.status === 'challenge' || current.status === 'unknown' ? <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-sm"><p className="font-medium">Manual attention required</p><p className="mt-1 text-xs text-muted-foreground">The account is not treated as verified. Continue in the same session and confirm only after platform identity and page origin agree.</p></div> : null}
+      {current.status === 'challenge' || current.status === 'unknown' ? <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-sm"><p className="font-medium">需要人工处理</p><p className="mt-1 text-xs text-muted-foreground">当前账号尚未验证。请在同一会话中处理登录，核对平台身份后再确认。</p></div> : null}
       {current.status_reason_code ? <p role="alert" className="rounded-md border border-destructive/30 bg-destructive/10 p-3 text-xs text-destructive">{current.status_reason_code}</p> : null}
       <div className="flex flex-wrap items-end gap-2 rounded-md border p-3"><label className="min-w-64 flex-1 space-y-1 text-sm"><span>绑定来源版本 <span className="text-muted-foreground">（可选）</span></span><Input value={sourceBindingRevisionId} onChange={(event) => setSourceBindingRevisionId(event.target.value)} placeholder="已固定版本 ID" disabled={!canOperate || login.isPending || current.status === 'closed'} /></label><Button disabled={!canOperate || login.isPending || current.status === 'closed'} onClick={() => login.mutate()}>{login.isPending ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}{login.isPending ? '正在打开…' : '打开登录会话'}</Button><Button variant="outline" disabled={!canManage || accountOperation.isPending || current.status === 'closed'} onClick={() => accountOperation.mutate(current.auth_required ? 'resume' : 'auth_required')}>{accountOperation.isPending ? <Loader2 className="size-4 animate-spin" /> : null}{current.auth_required ? '恢复账号' : '要求重新认证'}</Button></div>
-      <div className="rounded-md border bg-muted/20 p-3 text-xs text-muted-foreground">Lifecycle is server-owned: opening → presenting → refreshing/verifying → saving → saved/dormant. A failed save remains visible as saving/error and never reports success or retries transient input.</div>
+      <div className="rounded-md border bg-muted/20 p-3 text-xs text-muted-foreground">登录验证和保存结果以服务端状态为准。保存失败会显示错误，请检查后处理。</div>
       {effectiveSession ? <SessionCard workspaceId={workspaceId} account={current} session={effectiveSession} canOperate={canOperate} onChanged={setSession} /> : null}
       {detailQuery.error ? <ErrorState message={errorText(detailQuery.error)} hint={BACKEND_HINT} /> : null}
     </section>
@@ -666,8 +626,15 @@ export function BrowserAccountsPanel() {
   const hasBrowserAccountReadPermission = Boolean(workspace?.active && membershipKnown && !currentMember?.disabled)
   const canManageBrowserAccounts = hasBrowserAccountReadPermission && (identity?.is_platform_admin === true || currentMember?.role === 'admin' || currentMember?.role === 'maintainer')
   const canOperateBrowserAccounts = hasBrowserAccountReadPermission && (identity?.is_platform_admin === true || currentMember?.role === 'admin' || currentMember?.role === 'maintainer' || currentMember?.role === 'operator')
-  const accountsQuery = useQuery({ queryKey: ['browser-accounts', workspaceId], queryFn: () => listBrowserAccounts(workspaceId as string), enabled: hasBrowserAccountReadPermission, refetchInterval: 5_000 })
-  const accounts = useMemo(() => accountsQuery.data?.items ?? [], [accountsQuery.data])
+  const accountsQuery = useInfiniteQuery({
+    queryKey: ['browser-accounts', workspaceId, 'pages'],
+    queryFn: ({ pageParam }) => listBrowserAccounts(workspaceId as string, { cursor: pageParam }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (page) => page.next_cursor ?? undefined,
+    enabled: hasBrowserAccountReadPermission,
+    refetchInterval: 5_000,
+  })
+  const accounts = useMemo(() => accountsQuery.data?.pages.flatMap((page) => page.items) ?? [], [accountsQuery.data])
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const selected = selectedId ? accounts.find((account) => account.id === selectedId) ?? null : null
   useEffect(() => { setSelectedId(null) }, [workspaceId])
@@ -676,16 +643,16 @@ export function BrowserAccountsPanel() {
     return (
       <Card className="overflow-hidden py-0">
         <CardHeader className="border-b bg-muted/20 py-4"><CardTitle className="text-base">浏览器账号</CardTitle><CardDescription>账号、登录会话和门户投影都必须在工作区读取权限确认后才能显示。</CardDescription></CardHeader>
-        <CardContent><EmptyState title="暂无法确认工作区读取权限" description="当前前端没有权威的工作区成员资格或能力来源，因此已安全禁用账号列表和所有操作。请先提供工作区读取权限接口。" /></CardContent>
+        <CardContent>{workspaces.isLoading || membersQuery.isLoading ? <LoadingState /> : membersQuery.error ? <ErrorState message="无法读取工作区权限，请重试。" hint={BACKEND_HINT} /> : <EmptyState title={workspaceId ? '无权访问此工作区' : '尚无可用工作区'} description={workspaceId ? '请切换到有访问权限的工作区，或联系管理员。' : '创建或加入工作区后即可管理浏览器账号。'} />}</CardContent>
       </Card>
     )
   }
   const refresh = () => { void queryClient.invalidateQueries({ queryKey: ['browser-accounts', workspaceId] }); if (selected) void queryClient.invalidateQueries({ queryKey: ['browser-account', workspaceId, selected.id] }) }
   return (
     <Card className="overflow-hidden py-0">
-      <CardHeader className="border-b bg-muted/20 py-4"><CardTitle className="text-base">工作区浏览器账号</CardTitle><CardDescription>每个账号拥有独立的认证资料和登录会话；账号身份、凭据和运行时健康度分别展示。</CardDescription><CardAction><Badge variant="outline">{identity?.subject ? '操作员会话' : '工作区上下文'}</Badge></CardAction></CardHeader>
+      <CardHeader className="border-b bg-muted/20 py-4"><CardTitle className="text-base">工作区浏览器账号</CardTitle><CardDescription>每个账号拥有独立的认证资料和登录会话；账号认证状态与资源分配分别展示；资源已分配不代表节点健康。</CardDescription><CardAction><Badge variant="outline">{identity?.subject ? '操作员会话' : '工作区上下文'}</Badge></CardAction></CardHeader>
       <CardContent className="grid gap-6 p-4 xl:grid-cols-[minmax(16rem,0.8fr)_minmax(0,1.2fr)]">
-        <section className="space-y-4" aria-labelledby="browser-account-create-title"><div><h3 id="browser-account-create-title" className="font-medium">添加账号</h3><p className="mt-1 text-xs text-muted-foreground">普通登录会开启一个真实会话；二维码刷新和原生表单只会在已批准的会话中展示。</p></div><CreateAccountForm workspaceId={workspaceId} canManage={canManageBrowserAccounts} onCreated={(account) => { setSelectedId(account.id); refresh() }} /><div className="border-t pt-4"><div className="flex items-center justify-between gap-2"><h3 className="font-medium">账号</h3><Button size="xs" variant="ghost" onClick={refresh} disabled={accountsQuery.isFetching}><RefreshCw className={accountsQuery.isFetching ? 'size-3 animate-spin' : 'size-3'} /></Button></div>{accountsQuery.isLoading ? <LoadingState /> : accountsQuery.error ? <ErrorState message={errorText(accountsQuery.error)} hint={BACKEND_HINT} /> : accounts.length === 0 ? <EmptyState title="暂无浏览器账号" description="创建工作区账号后即可开始已验证的登录会话。" /> : <div className="mt-2 space-y-2">{accounts.map((account) => <button key={account.id} type="button" onClick={() => setSelectedId(account.id)} className={`w-full rounded-md border p-3 text-left transition-colors ${selected?.id === account.id ? 'border-primary bg-primary/5' : 'hover:bg-muted/40'}`}><div className="flex items-center justify-between gap-2"><span className="truncate font-medium">{account.label}</span><AccountStatus status={account.status} /></div><p className="mt-1 truncate font-mono text-xs text-muted-foreground">{account.site} · {account.id}</p><p className="mt-1 text-xs text-muted-foreground">{account.evidence_source ?? '认证凭据未知'} · revision {account.revision}</p></button>)}</div>}{accountsQuery.data?.next_cursor ? <p className="text-3xs text-muted-foreground">还有更多账号；此视图使用 keyset 游标，不执行无界扫描。</p> : null}</div></section>
+        <section className="space-y-4" aria-labelledby="browser-account-create-title"><div><h3 id="browser-account-create-title" className="font-medium">添加账号</h3><p className="mt-1 text-xs text-muted-foreground">普通登录会开启一个真实会话；二维码刷新和原生表单只会在已批准的会话中展示。</p></div><CreateAccountForm workspaceId={workspaceId} canManage={canManageBrowserAccounts} onCreated={(account) => { setSelectedId(account.id); refresh() }} /><div className="border-t pt-4"><div className="flex items-center justify-between gap-2"><h3 className="font-medium">账号</h3><Button size="xs" variant="ghost" onClick={refresh} disabled={accountsQuery.isFetching}><RefreshCw className={accountsQuery.isFetching ? 'size-3 animate-spin' : 'size-3'} /></Button></div>{accountsQuery.isLoading ? <LoadingState /> : accountsQuery.error ? <ErrorState message={errorText(accountsQuery.error)} hint={BACKEND_HINT} /> : accounts.length === 0 ? <EmptyState title="暂无浏览器账号" description="创建工作区账号后即可开始已验证的登录会话。" /> : <div className="mt-2 space-y-2">{accounts.map((account) => <button key={account.id} type="button" onClick={() => setSelectedId(account.id)} className={`w-full rounded-md border p-3 text-left transition-colors ${selected?.id === account.id ? 'border-primary bg-primary/5' : 'hover:bg-muted/40'}`}><div className="flex items-center justify-between gap-2"><span className="truncate font-medium">{account.label}</span><AccountStatus status={account.status} /></div><p className="mt-1 truncate font-mono text-xs text-muted-foreground">{account.site} · {account.id}</p><p className="mt-1 text-xs text-muted-foreground">{account.evidence_source ?? '认证凭据未知'} · revision {account.revision}</p></button>)}</div>}{accountsQuery.hasNextPage ? <Button variant="outline" size="sm" disabled={accountsQuery.isFetchingNextPage} onClick={() => void accountsQuery.fetchNextPage()}>{accountsQuery.isFetchingNextPage ? "加载中…" : "加载更多账号"}</Button> : null}</div></section>
         <section className="min-w-0" aria-labelledby="browser-account-detail-title"><h3 id="browser-account-detail-title" className="sr-only">所选账号详情</h3>{!workspaceId ? <EmptyState title="选择工作区" description="账号操作需要明确的工作区范围。" /> : !selected ? <EmptyState title="选择账号" description="创建或选择工作区账号以查看认证凭据和登录会话。" /> : <AccountDetail key={`${workspaceId}:${selected.id}`} workspaceId={workspaceId} account={selected} canManage={canManageBrowserAccounts} canOperate={canOperateBrowserAccounts} onRefresh={refresh} />}</section>
       </CardContent>
     </Card>
