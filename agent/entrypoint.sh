@@ -10,6 +10,10 @@ RUNTIME_HOME="${RUNTIME_HOME:-/home/agent}"
 RUNTIME_CACHE_DIR="${RUNTIME_CACHE_DIR:-$RUNTIME_HOME/.cache}"
 RUNTIME_STATE_DIR="${RUNTIME_STATE_DIR:-$RUNTIME_HOME/.local/state/opencli-account-runtime}"
 CHROMIUM_POLICY_FILE="${CHROMIUM_POLICY_FILE:-/etc/chromium/policies/managed/opencli-account-runtime.json}"
+ACCOUNT_RUNTIME_ROOT="${ACCOUNT_RUNTIME_ROOT:-/var/lib/opencli-account-runtime/sessions}"
+ACCOUNT_PROFILE_ROOT="${ACCOUNT_PROFILE_ROOT:-/var/lib/opencli-account-runtime/profiles}"
+ACCOUNT_RUNTIME_STATE_ROOT="${ACCOUNT_RUNTIME_STATE_ROOT:-/var/lib/opencli-account-runtime/state}"
+export ACCOUNT_RUNTIME_ROOT ACCOUNT_PROFILE_ROOT ACCOUNT_RUNTIME_STATE_ROOT
 validate_runtime_path() {
   local path="$1"
   local label="$2"
@@ -82,7 +86,48 @@ verify_chromium_policy() {
   node -e 'const p=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); if(p.PasswordManagerEnabled!==false || (p.AutofillAddressEnabled!==undefined && p.AutofillAddressEnabled!==false) || (p.AutofillCreditCardEnabled!==undefined && p.AutofillCreditCardEnabled!==false)) process.exit(1);' "$CHROMIUM_POLICY_FILE"
 }
 
-if [ "$HAVE_CHROME" = "true" ]; then
+ACCOUNT_RUNTIME_MANAGED=false
+if [ "$HAVE_CHROME" = "true" ] \
+  && [ "${OPENCLI_BROWSER_PROFILE_KIND:-authenticated}" = "authenticated" ] \
+  && [ -n "${AGENT_NODE_ID:-}" ] \
+  && [ -n "${AGENT_NODE_CREDENTIAL_ID:-}" ] \
+  && [ -n "${AGENT_NODE_CREDENTIAL:-}" ]; then
+  ACCOUNT_RUNTIME_MANAGED=true
+fi
+
+if [ "$ACCOUNT_RUNTIME_MANAGED" = "true" ]; then
+  [ -n "${BROWSER_RUNTIME_BUNDLE_ID:-}" ] || {
+    echo "[agent] BROWSER_RUNTIME_BUNDLE_ID is required for account runtime" >&2
+    exit 1
+  }
+  for command_name in Xvfb bbx bbx-daemon node; do
+    command -v "$command_name" >/dev/null 2>&1 || {
+      echo "[agent] account runtime prerequisite unavailable: $command_name" >&2
+      exit 1
+    }
+  done
+  ACCOUNT_RUNTIME_BBX_EXTENSION_ID_FILE="${ACCOUNT_RUNTIME_BBX_EXTENSION_ID_FILE:-/etc/browser-bridge-extension-id}"
+  [ -s "$ACCOUNT_RUNTIME_BBX_EXTENSION_ID_FILE" ] || {
+    echo "[agent] Browser Bridge extension identity is unavailable" >&2
+    exit 1
+  }
+  export ACCOUNT_RUNTIME_BBX_EXTENSION_ID_FILE
+  BROWSER_ENGINE="${BROWSER_ENGINE-chromium}"
+  ACCOUNT_RUNTIME_BROWSER_BIN="$(node /usr/local/bin/resolve-browser-executable.mjs "$BROWSER_ENGINE")" || {
+    echo "[agent] account runtime browser binary is unavailable" >&2
+    exit 1
+  }
+  ACCOUNT_RUNTIME_OPENCLI_DAEMON_JS="$(npm root -g)/@jackwener/opencli/dist/src/daemon.js"
+  [ -f "$ACCOUNT_RUNTIME_OPENCLI_DAEMON_JS" ] || {
+    echo "[agent] account runtime OpenCLI daemon is unavailable" >&2
+    exit 1
+  }
+  mkdir -p "$ACCOUNT_RUNTIME_ROOT" "$ACCOUNT_PROFILE_ROOT" "$ACCOUNT_RUNTIME_STATE_ROOT"
+  chmod 700 "$ACCOUNT_RUNTIME_ROOT" "$ACCOUNT_PROFILE_ROOT" "$ACCOUNT_RUNTIME_STATE_ROOT"
+  export ACCOUNT_RUNTIME_BROWSER_BIN ACCOUNT_RUNTIME_OPENCLI_DAEMON_JS
+  verify_chromium_policy
+  echo "[agent] Account allocator enabled; no shared :99/profile stack will start"
+elif [ "$HAVE_CHROME" = "true" ]; then
   export OPENCLI_CDP_ENDPOINT="http://localhost:9222"
   echo "[agent] Chrome detected — starting embedded browser stack"
   CHROME_PROFILE="$PROFILE_DIR"
