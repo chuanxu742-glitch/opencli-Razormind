@@ -11,6 +11,7 @@ on:
       - agent/entrypoint.sh
       - backend/browser_account_runtime.py
       - tests/unit/test_process_tree_supervisor.py
+      - tests/unit/test_agent_entrypoint_lifecycle.py
       - chrome/runtime-bundles/**
       - chrome/script-host/**
       - scripts/verify_account_runtime_container.py
@@ -43,6 +44,17 @@ jobs:
           timeout 60 docker run --rm --init \
             --mount "type=bind,src=$PWD/tests/unit/test_process_tree_supervisor.py,dst=/verification/test_process_tree_supervisor.py,readonly" \
             --entrypoint python "$IMAGE" /verification/test_process_tree_supervisor.py
+
+      - name: Run POSIX entrypoint lifecycle regression
+        env:
+          IMAGE: account-runtime-smoke:${{ github.sha }}
+        run: |
+          set -euo pipefail
+          timeout 60 docker run --rm --init \
+            --mount "type=bind,src=$PWD/agent,dst=/verification/agent,readonly" \
+            --mount "type=bind,src=$PWD/tests/unit,dst=/verification/tests/unit,readonly" \
+            --workdir /verification \
+            --entrypoint python "$IMAGE" /verification/tests/unit/test_agent_entrypoint_lifecycle.py
 
       - name: Run isolated managed account runtimes
         env:
