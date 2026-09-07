@@ -6,6 +6,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from backend.channels.base import ChannelFetchError, ChannelResult
 from backend.pipeline.pipeline import run_pipeline
 
+pytestmark = pytest.mark.usefixtures("anonymous_account_resolution")
+
 
 @pytest.mark.asyncio
 async def test_pipeline_storage_error(db_session):
@@ -31,7 +33,7 @@ async def test_pipeline_storage_error(db_session):
         patch("backend.pipeline.collector.collect", return_value=channel_result),
         patch("backend.pipeline.storer.store_records", side_effect=Exception("DB error")),
     ):
-        result = await run_pipeline(db_session, source, task.id)
+        result = await run_pipeline(task.id, source)
 
     assert result.success is False
     assert "DB error" in result.error
@@ -55,7 +57,7 @@ async def test_pipeline_collect_exception(db_session):
     await db_session.flush()
 
     with patch("backend.pipeline.collector.collect", side_effect=RuntimeError("network down")):
-        result = await run_pipeline(db_session, source, task.id)
+        result = await run_pipeline(task.id, source)
 
     assert result.success is False
     assert "network down" in result.error
@@ -136,7 +138,7 @@ async def test_pipeline_ordinary_failure_does_not_pause_source(db_session):
         patch("backend.pipeline.collector.collect", return_value=channel_result),
         patch("backend.control.actuator.pause_source_for_captcha", new_callable=AsyncMock) as mock_pause,
     ):
-        result = await run_pipeline(db_session, source, task.id)
+        result = await run_pipeline(task.id, source)
 
     assert result.success is False
     assert "feed malformed" in result.error
@@ -212,7 +214,7 @@ async def test_pipeline_collect_retryable_exception_propagates(db_session):
 
     with patch("backend.pipeline.collector.collect", side_effect=ConnectionError("dial tcp: refused")):
         with pytest.raises(ConnectionError, match="dial tcp"):
-            await run_pipeline(db_session, source, task.id)
+            await run_pipeline(task.id, source)
 
 
 @pytest.mark.asyncio
@@ -233,7 +235,7 @@ async def test_pipeline_collect_permanent_exception_still_swallowed(db_session):
     await db_session.flush()
 
     with patch("backend.pipeline.collector.collect", side_effect=ValueError("bad config")):
-        result = await run_pipeline(db_session, source, task.id)
+        result = await run_pipeline(task.id, source)
 
     assert result.success is False
     assert "bad config" in result.error
@@ -260,7 +262,7 @@ async def test_pipeline_collect_result_fail_retryable_error_type_raises(db_sessi
     failing_result = ChannelResult.fail("timed out", error_type="TimeoutException")
     with patch("backend.pipeline.collector.collect", return_value=failing_result):
         with pytest.raises(ChannelFetchError, match="timed out"):
-            await run_pipeline(db_session, source, task.id)
+            await run_pipeline(task.id, source)
 
 
 @pytest.mark.asyncio
@@ -287,7 +289,7 @@ async def test_pipeline_sink_retryable_exception_propagates(db_session):
         patch("backend.pipeline.storer.store_records", side_effect=ConnectionError("pool exhausted")),
     ):
         with pytest.raises(ConnectionError, match="pool exhausted"):
-            await run_pipeline(db_session, source, task.id)
+            await run_pipeline(task.id, source)
 
 
 # ── notification trigger_event producers (W2): on_ai_processed / on_task_failed ──

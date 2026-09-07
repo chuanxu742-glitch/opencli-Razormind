@@ -9,6 +9,8 @@ from backend.channels.opencli_channel import OpenCLIChannel
 from backend.channels.skill_channel import SkillChannel
 from backend.pipeline.sinks import SinkResult
 
+pytestmark = pytest.mark.usefixtures("anonymous_account_resolution")
+
 
 def _session_cm():
     sess = AsyncMock()

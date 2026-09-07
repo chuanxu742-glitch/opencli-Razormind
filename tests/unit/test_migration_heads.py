@@ -1,20 +1,28 @@
+import asyncio
+import os
 import re
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import pytest
 from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from backend.config import get_settings
+from tests.postgres_conformance import temporary_postgres_database
 
 
 def test_alembic_has_one_head():
     config = Config()
     config.set_main_option("script_location", "backend/migrations")
 
-    assert ScriptDirectory.from_config(config).get_heads() == ["finalize_browser_account_cutover"]
+    assert ScriptDirectory.from_config(config).get_heads() == ["add_task_execution_actor"]
 
 
 def test_ci_downgrade_target_is_unambiguous():
@@ -48,6 +56,12 @@ def test_upgrade_head_creates_identity_and_operations_tables(monkeypatch):
                 row[0]
                 for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
             }
+            task_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(collection_tasks)")
+            }
+            task_foreign_keys = list(
+                connection.execute("PRAGMA foreign_key_list(collection_tasks)")
+            )
         finally:
             connection.close()
 
@@ -78,6 +92,68 @@ def test_upgrade_head_creates_identity_and_operations_tables(monkeypatch):
         "browser_portal_tickets",
         "browser_portal_owners",
     } <= tables
+    assert "requested_by_user_id" in task_columns
+    assert any(
+        row[2] == "users"
+        and row[3] == "requested_by_user_id"
+        and row[4] == "id"
+        and row[6] == "SET NULL"
+        for row in task_foreign_keys
+    )
+
+
+@pytest.mark.asyncio
+async def test_task_actor_migration_upgrades_disposable_postgres():
+    async with temporary_postgres_database("task_actor_migration") as database_url:
+        environment = {**os.environ, "DATABASE_URL": database_url}
+        result = await asyncio.to_thread(
+            subprocess.run,
+            [sys.executable, "-m", "alembic", "upgrade", "head"],
+            cwd=Path(__file__).parents[2],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+        engine = create_async_engine(database_url)
+        try:
+            async with engine.connect() as connection:
+                column = (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT is_nullable
+                            FROM information_schema.columns
+                            WHERE table_schema = 'public'
+                              AND table_name = 'collection_tasks'
+                              AND column_name = 'requested_by_user_id'
+                            """
+                        )
+                    )
+                ).scalar_one_or_none()
+                delete_rule = (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT rc.delete_rule
+                            FROM information_schema.referential_constraints AS rc
+                            JOIN information_schema.key_column_usage AS kcu
+                              ON kcu.constraint_schema = rc.constraint_schema
+                             AND kcu.constraint_name = rc.constraint_name
+                            WHERE kcu.table_schema = 'public'
+                              AND kcu.table_name = 'collection_tasks'
+                              AND kcu.column_name = 'requested_by_user_id'
+                            """
+                        )
+                    )
+                ).scalar_one_or_none()
+        finally:
+            await engine.dispose()
+
+    assert column == "YES"
+    assert delete_rule == "SET NULL"
 
 
 def test_workflow_run_version_foreign_key_is_restrict(monkeypatch):

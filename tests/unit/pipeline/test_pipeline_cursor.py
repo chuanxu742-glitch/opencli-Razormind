@@ -9,6 +9,8 @@ import pytest
 from backend.channels.base import ChannelResult
 from backend.pipeline.sinks import SinkResult
 
+pytestmark = pytest.mark.usefixtures("anonymous_account_resolution")
+
 
 async def _seed(db_session):
     from backend.models.source import DataSource

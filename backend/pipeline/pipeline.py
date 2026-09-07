@@ -9,9 +9,10 @@ from typing import Any
 from sqlalchemy import select
 
 from backend.channels.base import ChannelFetchError
-from backend.control.error_kinds import map_error_type, map_exception
+from backend.control.error_kinds import map_exception
 from backend.control.recorder import FreshnessInfo, record_run_measurement
 from backend.models.source import DataSource
+from backend.models.task import CollectionTask
 from backend.pipeline import events
 from backend.pipeline.error_taxonomy import effective_error_type, is_captcha, is_retryable
 
@@ -128,74 +129,93 @@ def _display_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
 
 
 def _account_execution_inputs(
-    source: DataSource, parameters: dict[str, Any]
+    source: DataSource,
+    parameters: dict[str, Any],
+    *,
+    execution_id: str,
+    actor_user_id: str,
+    run_id: str | None,
 ) -> tuple[Any, Any] | None:
-    """Build the explicit account reference/context; never infer from site."""
-    from backend.schemas.browser_account import AccountRef, ExecutionContextV1
+    """Build an account context only from persisted task and source facts."""
+    from backend.schemas.browser_account import ExecutionContextV1
+    from backend.services.browser_account_service import execution_account_ref
 
-    raw_ref = parameters.get("account_ref") or parameters.get("accountRef")
-    config = source.channel_config or {}
-    if raw_ref is None:
-        raw_account_id = (
-            parameters.get("account_id")
-            or parameters.get("accountId")
-            or config.get("account_id")
-            or config.get("accountId")
-        )
-        raw_workspace_id = (
-            parameters.get("workspace_id")
-            or parameters.get("workspaceId")
-            or config.get("workspace_id")
-            or config.get("workspaceId")
-        )
-        if raw_account_id is None and raw_workspace_id is None:
-            return None
-        raw_ref = {
-            "workspace_id": raw_workspace_id,
-            "account_id": raw_account_id,
-            "source_binding_revision_id": (
-                parameters.get("source_binding_revision_id")
-                or parameters.get("sourceBindingRevisionId")
-                or config.get("source_binding_revision_id")
-                or config.get("sourceBindingRevisionId")
-            ),
-        }
-    ref = raw_ref if isinstance(raw_ref, AccountRef) else AccountRef.from_wire(raw_ref)
-    execution_id = parameters.get("execution_id") or parameters.get("executionId") or ""
-    caller_id = parameters.get("caller_id") or parameters.get("callerId") or ""
-    if not execution_id or not caller_id:
-        raise ValueError("account execution requires execution_id and caller_id")
+    ref = execution_account_ref(parameters, source.channel_config or {})
+    if ref is None:
+        return None
     context = ExecutionContextV1(
         account_ref=ref,
-        execution_id=str(execution_id),
-        run_id=str(parameters.get("run_id") or parameters.get("runId"))
-        if parameters.get("run_id") or parameters.get("runId")
-        else None,
-        caller_id=str(caller_id),
-        source_binding_revision_id=(
-            parameters.get("source_binding_revision_id")
-            or parameters.get("sourceBindingRevisionId")
-            or ref.source_binding_revision_id
-        ),
+        execution_id=execution_id,
+        run_id=run_id,
+        caller_id=actor_user_id,
+        source_binding_revision_id=ref.source_binding_revision_id,
     )
     return ref, context
 
 
 async def _resolve_account_execution(
-    source: DataSource, parameters: dict[str, Any]
+    task_id: str,
+    source: DataSource,
+    parameters: dict[str, Any],
+    *,
+    run_id: str | None = None,
 ) -> tuple[Any, Any] | None:
-    inputs = _account_execution_inputs(source, parameters)
-    if inputs is None:
-        return None
-    ref, context = inputs
-    from backend.database import AsyncSessionLocal
-    from backend.services.browser_account_service import resolve_account_session
-    from backend.schemas.browser_account import SessionEnvelopeV1
+    from backend.database import AsyncSessionLocal, commit_session
+    from backend.schemas.browser_account import (
+        SessionEnvelopeV1,
+        SessionResolutionWaitingV1,
+    )
+    from backend.services.browser_account_service import (
+        ensure_execution_session,
+        execution_account_ref,
+        resolve_account_session,
+    )
 
     async with AsyncSessionLocal() as session:
-        resolution = await resolve_account_session(session, ref, context)
+        task = await session.get(CollectionTask, task_id)
+        if task is None:
+            raise ValueError(f"account execution task {task_id} was not found")
+        if task.source_id != source.id:
+            raise ValueError("account execution task does not match the source")
+        persisted_parameters = dict(task.parameters or {})
+        ref = execution_account_ref(persisted_parameters, source.channel_config or {})
+        if ref is None:
+            return None
+        actor_user_id = task.requested_by_user_id
+        if not actor_user_id:
+            raise ValueError("account execution requires an authenticated task actor")
+        inputs = _account_execution_inputs(
+            source,
+            persisted_parameters,
+            execution_id=task.id,
+            actor_user_id=actor_user_id,
+            run_id=run_id,
+        )
+        assert inputs is not None
+        ref, context = inputs
+        resolution = await resolve_account_session(
+            session, ref, context, actor_user_id=actor_user_id
+        )
+    parameters["_execution_context"] = context
     if isinstance(resolution, SessionEnvelopeV1):
         return ref, resolution
+    if (
+        isinstance(resolution, SessionResolutionWaitingV1)
+        and resolution.reason == "capacity_missing"
+    ):
+        # Produce the durable request in its own transaction. Node execution
+        # must never begin until this transaction has committed.
+        async with AsyncSessionLocal() as session:
+            await ensure_execution_session(
+                session, ref, context, actor_user_id=actor_user_id
+            )
+            await commit_session(session)
+        async with AsyncSessionLocal() as session:
+            resolution = await resolve_account_session(
+                session, ref, context, actor_user_id=actor_user_id
+            )
+        if isinstance(resolution, SessionEnvelopeV1):
+            return ref, resolution
     status = getattr(resolution, "status", "blocked")
     code = getattr(resolution, "error_code", None) or getattr(resolution, "reason", None)
     raise RuntimeError(f"account session {status}: {code or 'unavailable'}")
@@ -252,7 +272,9 @@ async def run_pipeline(
     account_ref = None
     account_session = None
     try:
-        resolved_account = await _resolve_account_execution(source, params)
+        resolved_account = await _resolve_account_execution(
+            task_id, source, params, run_id=run_id
+        )
     except ValueError as exc:
         return PipelineResult(
             success=False,
@@ -272,7 +294,7 @@ async def run_pipeline(
         account_ref, account_session = resolved_account
         params["_account_ref"] = account_ref
         params["_account_session"] = account_session
-        params["_execution_context"] = _account_execution_inputs(source, params)[1]
+        # _resolve_account_execution set this from persisted task provenance.
     account_bound = account_session is not None
     for key in (
         "account_ref", "accountRef", "account_id", "accountId",

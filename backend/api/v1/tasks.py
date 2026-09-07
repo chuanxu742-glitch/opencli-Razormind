@@ -19,7 +19,13 @@ from backend.schemas.task import (
     TaskRunRead,
     TaskTriggerRequest,
 )
-from backend.services import source_service, task_service
+from backend.security.identity import get_request_identity
+from backend.security.workspace_rbac import (
+    WorkspacePermission,
+    get_workspace_access,
+    require_permission,
+)
+from backend.services import browser_account_service, source_service, task_service
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
@@ -39,6 +45,14 @@ def _serialize_run_event(event: TaskRunEvent) -> dict:
 
 def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+def _http_account_error(
+    exc: browser_account_service.BrowserAccountError,
+) -> HTTPException:
+    return HTTPException(
+        status_code=exc.status_code,
+        detail={"code": exc.code, "message": str(exc)},
+    )
 
 
 @router.get("", response_model=ApiResponse[list[CollectionTaskRead]])
@@ -68,7 +82,9 @@ async def list_tasks(
 
 @router.post("/trigger", response_model=ApiResponse[dict], status_code=202)
 async def trigger_task(
-    body: TaskTriggerRequest, db: AsyncSession = Depends(get_db)
+    body: TaskTriggerRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
 ) -> ApiResponse:
     source = await source_service.get_source(db, body.source_id)
     if not source:
@@ -76,20 +92,51 @@ async def trigger_task(
     if not source.enabled:
         raise HTTPException(status_code=400, detail="Source is disabled")
 
+    parameters = dict(body.parameters)
+    try:
+        account_ref = browser_account_service.execution_account_ref(
+            parameters, source.channel_config or {}
+        )
+    except browser_account_service.BrowserAccountError as exc:
+        raise _http_account_error(exc) from exc
+
+    requested_by_user_id: str | None = None
+    if account_ref is not None:
+        identity = await get_request_identity(request)
+        access = await get_workspace_access(db, account_ref.workspace_id, identity)
+        require_permission(access, WorkspacePermission.RUN_OPERATIONS_AGENTS)
+        try:
+            await browser_account_service.get_browser_account(
+                db, account_ref.workspace_id, account_ref.account_id
+            )
+        except browser_account_service.BrowserAccountError as exc:
+            raise _http_account_error(exc) from exc
+        requested_by_user_id = access.user_id
+        for key in (
+            "caller_id",
+            "callerId",
+            "execution_id",
+            "executionId",
+            "run_id",
+            "runId",
+        ):
+            parameters.pop(key, None)
+
     task = await task_service.create_task(
         db,
         source_id=body.source_id,
         trigger_type="manual",
-        parameters=body.parameters,
+        parameters=parameters,
         priority=body.priority,
         agent_id=body.agent_id,
+        requested_by_user_id=requested_by_user_id,
     )
     # Commit before dispatching so the background runner's new session can find the task.
     await db.commit()
 
     from backend.executor import get_executor
 
-    result = await get_executor().dispatch_collection(task.id, body.parameters)
+    result = await get_executor().dispatch_collection(task.id, parameters)
 
     return ApiResponse.ok(result)
 
