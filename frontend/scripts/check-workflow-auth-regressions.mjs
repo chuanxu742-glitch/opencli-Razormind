@@ -140,3 +140,56 @@ test('workflow requests separate identity Authorization from fleet transport cre
   await workflowRuns.replayWorkflowRunEventStream('run')
   for (const request of requestsWithoutFleet) assertIdentityAndFleet(request, false)
 })
+
+test('development bypass requires an exact non-production flag', async () => {
+  const stores = installStorage()
+  const { clearIdentityToken, isDevelopmentLoginAllowed, setDevelopmentSession, setRuntimeIdentityToken } =
+    await importTypeScript('lib/auth/session.ts')
+  const { getApiAuthHeaders } = await importTypeScript('lib/api/auth-headers.ts')
+  const originalNodeEnv = process.env.NODE_ENV
+  const originalFlag = process.env.NEXT_PUBLIC_ALLOW_UNAUTHENTICATED_DEV
+  const flagValues = [undefined, 'false', 'true', '1', 'TRUE', 'yes']
+
+  try {
+    for (const nodeEnv of ['development', 'test', 'production']) {
+      process.env.NODE_ENV = nodeEnv
+      for (const flag of flagValues) {
+        if (flag === undefined) delete process.env.NEXT_PUBLIC_ALLOW_UNAUTHENTICATED_DEV
+        else process.env.NEXT_PUBLIC_ALLOW_UNAUTHENTICATED_DEV = flag
+        assert.equal(
+          isDevelopmentLoginAllowed(),
+          nodeEnv !== 'production' && flag === 'true',
+          `${nodeEnv} with ${flag ?? 'absent'} flag`,
+        )
+      }
+    }
+
+    process.env.NODE_ENV = 'development'
+    process.env.NEXT_PUBLIC_ALLOW_UNAUTHENTICATED_DEV = 'true'
+    setRuntimeIdentityToken(identityToken)
+    setDevelopmentSession(true)
+    const developmentHeaders = getApiAuthHeaders()
+    assert.equal(developmentHeaders.Authorization, `Bearer ${identityToken}`)
+    assert.equal(developmentHeaders['X-OpenCLI-Development-Identity'], 'local-development')
+
+    setDevelopmentSession(false)
+    const authenticatedHeaders = getApiAuthHeaders()
+    assert.equal(authenticatedHeaders.Authorization, `Bearer ${identityToken}`)
+    assert.equal(authenticatedHeaders['X-OpenCLI-Development-Identity'], undefined)
+
+    setDevelopmentSession(true)
+    process.env.NODE_ENV = 'production'
+    const productionHeaders = getApiAuthHeaders()
+    assert.equal(productionHeaders.Authorization, `Bearer ${identityToken}`)
+    assert.equal(productionHeaders['X-OpenCLI-Development-Identity'], undefined)
+  } finally {
+    clearIdentityToken()
+    setDevelopmentSession(false)
+    stores.local.clear()
+    stores.session.clear()
+    if (originalNodeEnv === undefined) delete process.env.NODE_ENV
+    else process.env.NODE_ENV = originalNodeEnv
+    if (originalFlag === undefined) delete process.env.NEXT_PUBLIC_ALLOW_UNAUTHENTICATED_DEV
+    else process.env.NEXT_PUBLIC_ALLOW_UNAUTHENTICATED_DEV = originalFlag
+  }
+})

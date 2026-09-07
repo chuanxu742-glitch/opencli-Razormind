@@ -69,6 +69,6 @@ export function setDevelopmentSession(enabled: boolean): void {
 export function isDevelopmentLoginAllowed(): boolean {
   return (
     process.env.NODE_ENV !== 'production' &&
-    process.env.NEXT_PUBLIC_ALLOW_UNAUTHENTICATED_DEV !== 'false'
+    process.env.NEXT_PUBLIC_ALLOW_UNAUTHENTICATED_DEV === 'true'
   )
 }
