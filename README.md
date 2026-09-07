@@ -235,7 +235,7 @@ uv run python scripts/verify_browser_account_capacity.py \
 
 脚本只创建临时容量表，输出 keyset 分页和有界 claim 的 `EXPLAIN`、p95、RSS 与进程计数；输出不能冒充真实平台吞吐、浏览器隔离、节点迁移或认证成功。未提供专用 PostgreSQL、节点 Profile 卷加密挂载及运维审查记录时，相关验收必须标记 blocked，不得用数据库布尔字段或节点自报替代。
 
-迁移链回归使用同一专用 PostgreSQL 管理库，并在唯一临时 sibling database 中验证 recovered `refine_browser_account_contract` head：
+迁移链回归使用同一专用 PostgreSQL 管理库，并在唯一临时 sibling database 中验证 recovered `add_browser_portal_security` head：
 
 ~~~powershell
 $env:TEST_DATABASE_URL_PG = "postgresql+asyncpg://opencli_test:<password>@127.0.0.1:55432/opencli_test_db"
@@ -244,6 +244,23 @@ uv run pytest --no-cov --confcutdir=tests/integration tests/integration/test_bro
 ~~~
 
 该回归保留旧 source-only binding、回填 workspace，并证明跨 workspace account 引用被 composite foreign key 拒绝；这不是调度器、节点 fencing、Docker、Redis 或真实平台通过证明。
+
+账号 API 的业务 happy-path 使用真实 HTTP 请求/响应运行（不使用 ASGI mock、内部函数回声或源码断言）。在专用 workspace 中提供已认证 API token：
+
+~~~powershell
+$env:OPENCLI_ADMIN_API = "http://127.0.0.1:8031/api/v1"
+$env:OPENCLI_BEARER_TOKEN = "<workspace-operator-token>"
+$env:QRAC2_WORKSPACE_ID = "<dedicated-test-workspace>"
+uv run python scripts/smoke_browser_account_api.py
+~~~
+
+脚本覆盖账号创建/列表/详情/修订 CAS、登录会话创建/列表/视图、portal ticket
+签发与一次兑换、HttpOnly cookie 和会话关闭；创建的测试账号不会自动删除。ticket
+签发和兑换必须携带与 API 同源的 `Origin`，错误输出只含 HTTP 状态和结构化错误码。
+
+前后端 portal 二进制协议仍需在实际 UI/WS 部署中执行；后端固定帧编解码边界的
+回归可先运行 `uv run pytest --no-cov tests/unit/test_qrac2_g_contract_repairs.py`，
+其通过不等于真实浏览器、双中心、节点 fencing 或前端验收通过。
 
 登录协议回归使用受控真实 HTTP fixture：
 
