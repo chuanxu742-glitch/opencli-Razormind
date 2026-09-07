@@ -1,0 +1,75 @@
+name: account-runtime-smoke
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - codex/**
+    paths:
+      - agent/Dockerfile
+      - agent/entrypoint.sh
+      - backend/browser_account_runtime.py
+      - chrome/runtime-bundles/**
+      - chrome/script-host/**
+      - scripts/verify_account_runtime_container.py
+      - .github/workflows/account-runtime-smoke.yml
+
+permissions:
+  contents: read
+
+jobs:
+  managed-account-runtime:
+    name: Linux managed account runtime
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Build the current agent image
+        run: docker build --file agent/Dockerfile --tag account-runtime-smoke:${{ github.sha }} .
+
+      - name: Run isolated managed account runtimes
+        env:
+          IMAGE: account-runtime-smoke:${{ github.sha }}
+          NETWORK: account-runtime-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          FIRST: account-runtime-smoke-first-${{ github.run_id }}-${{ github.run_attempt }}
+          SECOND: account-runtime-smoke-second-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          docker network create "$NETWORK"
+          docker run --detach --name "$FIRST" --network "$NETWORK" \
+            --mount "type=bind,src=$PWD/scripts,dst=/verification,readonly" \
+            --entrypoint python "$IMAGE" /verification/verify_account_runtime_container.py
+          docker run --detach --name "$SECOND" --network "$NETWORK" \
+            --mount "type=bind,src=$PWD/scripts,dst=/verification,readonly" \
+            --entrypoint python "$IMAGE" /verification/verify_account_runtime_container.py
+          first_status="$(timeout 720 docker wait "$FIRST")"
+          second_status="$(timeout 720 docker wait "$SECOND")"
+          test "$first_status" = 0
+          test "$second_status" = 0
+
+      - name: Show bounded verification reports
+        if: always()
+        env:
+          FIRST: account-runtime-smoke-first-${{ github.run_id }}-${{ github.run_attempt }}
+          SECOND: account-runtime-smoke-second-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          docker logs "$FIRST" 2>/dev/null || true
+          docker logs "$SECOND" 2>/dev/null || true
+
+      - name: Remove ephemeral runtime containers and image
+        if: always()
+        env:
+          IMAGE: account-runtime-smoke:${{ github.sha }}
+          NETWORK: account-runtime-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          FIRST: account-runtime-smoke-first-${{ github.run_id }}-${{ github.run_attempt }}
+          SECOND: account-runtime-smoke-second-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          docker rm --force "$FIRST" "$SECOND" 2>/dev/null || true
+          docker network rm "$NETWORK" 2>/dev/null || true
+          docker image rm --force "$IMAGE" 2>/dev/null || true
