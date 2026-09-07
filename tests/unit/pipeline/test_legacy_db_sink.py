@@ -8,10 +8,10 @@ behavior-unchanged proof; these tests prove the seam itself exists and is wired.
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-pytestmark = pytest.mark.usefixtures("anonymous_account_resolution")
-
 
 from backend.pipeline.sinks import LegacyDbSink, RunContext, SinkResult
+
+pytestmark = pytest.mark.usefixtures("anonymous_account_resolution")
 
 
 def _ctx(**over):

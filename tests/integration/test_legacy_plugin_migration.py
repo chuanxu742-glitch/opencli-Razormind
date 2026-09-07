@@ -193,6 +193,11 @@ def test_legacy_plugin_database_rejoins_current_migration_head(tmp_path: Path) -
 def test_current_database_repairs_missing_plugin_installation_table(tmp_path: Path) -> None:
     database_path = tmp_path / "drifted-current.db"
     _create_stamped_database(database_path, "f3g4h5i6j7k8")
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DROP TABLE plugin_installations")
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'plugin_installations'"
+        ).fetchone() is None
     _upgrade_to(database_path, "head")
 
     connection = sqlite3.connect(database_path)
@@ -213,6 +218,15 @@ def test_current_database_repairs_missing_plugin_installation_table(tmp_path: Pa
 def test_current_head_repairs_missing_record_identity_schema(tmp_path: Path) -> None:
     database_path = tmp_path / "drifted-record-identity.db"
     _create_stamped_database(database_path, "h5i6j7k8l9m0")
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DROP INDEX ix_collected_records_source_identity")
+        connection.execute("ALTER TABLE collected_records DROP COLUMN identity_key")
+        assert "identity_key" not in {
+            row[1] for row in connection.execute("PRAGMA table_info(collected_records)")
+        }
+        assert "ix_collected_records_source_identity" not in {
+            row[1] for row in connection.execute("PRAGMA index_list(collected_records)")
+        }
     connection = sqlite3.connect(database_path)
     connection.executescript(
         """
