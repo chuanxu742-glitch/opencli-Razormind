@@ -4,6 +4,7 @@ Handles registration, lifecycle events, and management of remote agent nodes.
 Both HTTP-mode agents (center calls agent) and WS-mode agents (agent initiates
 reverse channel) register here and have their online/offline history tracked.
 """
+import json
 import io
 import logging
 import re
@@ -29,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.database import get_db
 from backend.schemas.common import ApiResponse
+from backend.schemas.browser_account import NodeIdentityV1
 from backend.schemas.edge_node import EdgeNodeEventRead, EdgeNodeRead
 
 if TYPE_CHECKING:
@@ -942,7 +944,12 @@ async def node_ws_endpoint(ws: WebSocket) -> None:
 
         if not account_capable:
             _pool_add(agent_url, mode, "ws", node_type, profile_kind)
-        ws_agent_manager.register_connection(agent_url, ws)
+        node_identity = (
+            NodeIdentityV1(node_id=node_id, boot_id=boot_id)
+            if account_capable and node_id and boot_id
+            else None
+        )
+        ws_agent_manager.register_connection(agent_url, ws, node_identity)
         await ws.send_json({"type": "registered", "agent_url": agent_url})
         logger.info(
             "WS node registered: %s (node_type=%s mode=%s label=%r)",
@@ -954,7 +961,18 @@ async def node_ws_endpoint(ws: WebSocket) -> None:
 
         # ── 3. Receive loop ───────────────────────────────────────────────
         while True:
-            msg = await ws.receive_json()
+            received = await ws.receive()
+            if received.get("type") == "websocket.disconnect":
+                raise WebSocketDisconnect
+            raw_bytes = received.get("bytes")
+            if raw_bytes is not None:
+                await ws_agent_manager.resolve_portal_binary(agent_url, raw_bytes)
+                continue
+            try:
+                msg = json.loads(received.get("text") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                logger.warning("WS node %s: invalid text message", agent_url)
+                continue
             msg_type = msg.get("type")
             if msg_type == "result":
                 ws_agent_manager.resolve_response(msg.get("request_id", ""), msg)
@@ -962,10 +980,12 @@ async def node_ws_endpoint(ws: WebSocket) -> None:
                 await ws_agent_manager.resolve_agent_event(msg.get("request_id", ""), msg)
             elif msg_type == "agent_result":
                 ws_agent_manager.resolve_agent_result(msg.get("request_id", ""), msg)
+            elif msg_type in {"portal_ready", "portal_error"}:
+                await ws_agent_manager.resolve_portal_ready(agent_url, msg)
             elif msg_type == "ping":
                 await ws.send_json({"type": "pong"})
             else:
-                logger.debug("WS node %s: unknown message type %r", agent_url, msg_type)
+                logger.debug("WS node %s: unknown type %r", agent_url, msg_type)
 
     except WebSocketDisconnect:
         logger.info("WS node disconnected: %s", agent_url or "<unregistered>")

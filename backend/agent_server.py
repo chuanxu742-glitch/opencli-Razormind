@@ -70,9 +70,12 @@ from pydantic import BaseModel
 from backend.agent_runtime_dispatch import (
     AccountRuntimeContext,
     RuntimeInvokeRequest,
+    apply_portal_control,
+    capture_portal_frame,
     cleanup_cdp_tabs,
     invoke_runtime,
     parse_output,
+    resolve_portal_target,
     resolve_account_runtime_context,
     snapshot_tab_ids,
 )
@@ -89,8 +92,11 @@ from backend.schemas.browser_account import (
     NodeClaimV1,
     NodeIdentityV1,
     NodeResultV1,
+    PortalOwnerRouteV1,
+    PortalWireFrameV1,
     SessionEnvelopeV1,
 )
+from backend.services.browser_portal_contract import decode_portal_wire_frame, encode_portal_wire_frame
 
 # Imported directly from the registry submodule (not the `backend.agent_runtimes`
 # package __init__) so this module's import graph is pinned to what registry.py
@@ -472,6 +478,162 @@ async def _handle_ws_collect(ws, msg: dict) -> None:
         await ws.send(json.dumps(result))
     except Exception as exc:
         logger.error("WS: failed to send result for request_id=%s: %s", request_id, exc)
+
+
+class _PortalRuntime:
+    """One short-lived route bound to one real CDP page target."""
+
+    def __init__(
+        self,
+        *,
+        portal_id: str,
+        route: PortalOwnerRouteV1,
+        cdp_endpoint: str,
+        websocket_url: str,
+    ) -> None:
+        self.portal_id = portal_id
+        self.route = route
+        self.cdp_endpoint = cdp_endpoint
+        self.websocket_url = websocket_url
+        self.pixel_sequence = 0
+        self.control_sequence = 0
+
+
+_ACTIVE_PORTALS: dict[str, _PortalRuntime] = {}
+_PORTAL_MAX_WIRE_BYTES = 4_200_000
+
+
+async def _send_ws_binary(ws, data: bytes) -> None:
+    sender = getattr(ws, "send_bytes", None)
+    if callable(sender):
+        await sender(data)
+    else:
+        await ws.send(data)
+
+
+async def _send_portal_pixel(ws, runtime: _PortalRuntime) -> None:
+    runtime.pixel_sequence += 1
+    frame = await capture_portal_frame(
+        websocket_url=runtime.websocket_url,
+        route=runtime.route,
+        sequence=runtime.pixel_sequence,
+    )
+    encoded = encode_portal_wire_frame(frame)
+    if len(encoded) > _PORTAL_MAX_WIRE_BYTES:
+        raise RuntimeError("portal pixel exceeds transport limit")
+    await _send_ws_binary(ws, encoded)
+
+
+def _portal_frame_matches_route(
+    frame: PortalWireFrameV1,
+    route: PortalOwnerRouteV1,
+) -> bool:
+    binding = frame.transient.binding
+    expected = route.binding
+    return (
+        binding.workspace_id == expected.account_ref.workspace_id
+        and binding.account_id == expected.account_ref.account_id
+        and binding.session_id == expected.session_id
+        and binding.epoch == expected.epoch
+        and binding.target == expected.target
+        and binding.view_generation == expected.view_generation
+    )
+
+
+async def _handle_ws_portal(ws, msg: dict, authenticated_identity: NodeIdentityV1 | None) -> None:
+    """Admit a route and bind it to the node's current real browser page."""
+    portal_id = msg.get("portal_id", "")
+    try:
+        route = PortalOwnerRouteV1.model_validate(msg.get("route") or {})
+        if route.binding.session_id != portal_id:
+            raise ValueError("portal id does not match route session")
+        if authenticated_identity is None or route.node_identity != authenticated_identity:
+            raise ValueError("portal route node identity is not authenticated")
+        binding = session_runtime_registry().resolve(
+            session_id=route.binding.session_id,
+            node_id=route.node_identity.node_id,
+            boot_id=route.node_identity.boot_id,
+            epoch=route.binding.epoch,
+        )
+        websocket_url = await resolve_portal_target(binding.cdp_endpoint, route)
+        if portal_id in _ACTIVE_PORTALS:
+            raise ValueError("portal route session is already active")
+        runtime = _PortalRuntime(
+            portal_id=portal_id,
+            route=route,
+            cdp_endpoint=binding.cdp_endpoint,
+            websocket_url=websocket_url,
+        )
+        _ACTIVE_PORTALS[portal_id] = runtime
+        await ws.send(
+            json.dumps({"type": "portal_ready", "portal_id": portal_id})
+        )
+        await _send_portal_pixel(ws, runtime)
+    except Exception as exc:
+        _ACTIVE_PORTALS.pop(portal_id, None)
+        try:
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "portal_error",
+                        "portal_id": portal_id,
+                        "error": "portal route admission failed",
+                    }
+                )
+            )
+        except Exception:
+            logger.debug("WS: failed to report portal admission error", exc_info=True)
+        logger.warning("WS portal admission rejected: %s", exc)
+
+
+async def _handle_ws_portal_binary(ws, data: bytes) -> None:
+    """Apply one center control frame to the active real browser route."""
+    if len(data) > _PORTAL_MAX_WIRE_BYTES:
+        return
+    try:
+        frame = decode_portal_wire_frame(data)
+    except ValueError:
+        logger.warning("WS: invalid portal control frame")
+        return
+    portal_id = frame.transient.binding.session_id
+    runtime = _ACTIVE_PORTALS.get(portal_id)
+    if runtime is None:
+        logger.warning("WS: control for inactive portal session=%s", portal_id)
+    try:
+        if runtime.route.route_expires_at <= datetime.now(UTC):
+            raise ValueError("portal route expired")
+        if (
+            frame.encoding != "control-json"
+            or not _portal_frame_matches_route(frame, runtime.route)
+            or frame.sequence <= runtime.control_sequence
+        ):
+            raise ValueError("portal control is outside active route")
+        control = frame.transient.control
+        if control is None:
+            raise ValueError("portal control payload is missing")
+        current_target = await resolve_portal_target(runtime.cdp_endpoint, runtime.route)
+        if current_target != runtime.websocket_url:
+            raise ValueError("portal browser target changed")
+        await apply_portal_control(
+            websocket_url=runtime.websocket_url,
+            cdp_endpoint=runtime.cdp_endpoint,
+            route=runtime.route,
+            control=control,
+        )
+        runtime.control_sequence = frame.sequence
+        if control.kind == "request_view":
+            await _send_portal_pixel(ws, runtime)
+        else:
+            await ws.send(
+                json.dumps({"type": "portal_applied", "portal_id": portal_id, "sequence": frame.sequence})
+            )
+    except Exception:
+        logger.warning("WS: portal control rejected for session=%s", portal_id, exc_info=True)
+        _ACTIVE_PORTALS.pop(portal_id, None)
+        try:
+            await ws.send(json.dumps({"type": "portal_error", "portal_id": portal_id, "error": "control rejected"}))
+        except Exception:
+            logger.debug("WS: failed to report portal control error", exc_info=True)
 async def _handle_ws_agent_task(
     ws,
     msg: dict,
@@ -556,15 +718,18 @@ async def _handle_ws_agent_task(
                 }
             )
             return
-    # fires this coroutine via asyncio.create_task, so an uncaught exception
+    try:
+    # Fires this coroutine via asyncio.create_task, so an uncaught exception
     # here would otherwise vanish into an unretrieved task exception and the
     # center would hang until its own send_agent_task timeout.
-    try:
         try:
             adapter = get_runtime(runtime_type)
         except ValueError as exc:
             logger.warning(
-                "WS agent_task request_id=%s: unknown runtime %r: %s", request_id, runtime_type, exc
+                "WS agent_task request_id=%s: unknown runtime %r: %s",
+                request_id,
+                runtime_type,
+                exc,
             )
             await _send_result(
                 {
@@ -619,9 +784,9 @@ async def _handle_ws_agent_task(
                     request_id,
                     exc,
                 )
+        # Contract violation (adapter yielded nothing) — still must resolve
+        # the center's pending future rather than hang it until timeout.
         if terminal_event is None:
-            # Contract violation (adapter yielded nothing) — still must resolve
-            # the center's pending future rather than hang it until timeout.
             terminal_event = {
                 "type": "error",
                 "task_id": request_id,
@@ -712,6 +877,7 @@ async def _register_via_ws(advertise_url: str) -> None:
             "mode": _AGENT_MODE,
             "node_type": _AGENT_DEPLOY_TYPE,
             "label": _AGENT_LABEL,
+            "node_id": (_node_identity(required=False).node_id if _node_identity(required=False) else None),
             "runtimes": runtimes,
             "runtime_capabilities": runtime_capabilities,
             "profile_kind": _BROWSER_PROFILE_KIND,
@@ -758,6 +924,9 @@ async def _register_via_ws(advertise_url: str) -> None:
 
                 # Main receive loop
                 async for raw_msg in ws:
+                    if isinstance(raw_msg, (bytes, bytearray)):
+                        await _handle_ws_portal_binary(ws, bytes(raw_msg))
+                        continue
                     try:
                         msg = json.loads(raw_msg)
                     except json.JSONDecodeError:
@@ -766,6 +935,12 @@ async def _register_via_ws(advertise_url: str) -> None:
                     msg_type = msg.get("type")
                     if msg_type == "collect":
                         asyncio.create_task(_handle_ws_collect(ws, msg))
+                    elif msg_type == "portal_open":
+                        asyncio.create_task(
+                            _handle_ws_portal(ws, msg, _node_identity(required=False))
+                        )
+                    elif msg_type == "portal_close":
+                        _ACTIVE_PORTALS.pop(msg.get("portal_id", ""), None)
                     elif msg_type == "agent_task":
                         _start_ws_agent_task(ws, msg, _node_identity(required=False))
                     elif msg_type == "cancel":
@@ -793,6 +968,7 @@ async def _register_via_ws(advertise_url: str) -> None:
             )
             await asyncio.sleep(wait)
         finally:
+            _ACTIVE_PORTALS.clear()
             for task in tuple(_ACTIVE_AGENT_TASKS.values()):
                 task.cancel()
 
