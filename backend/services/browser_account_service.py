@@ -1043,6 +1043,7 @@ async def resolve_account_session(
         lease is None
         or session.lease_id != lease.lease_id
         or lease.node_id != session.node_id
+        or lease.node_boot_id != session.node_boot_id
         or lease.epoch != session.epoch
     ):
         return waiting("fenced node lease is not available")
@@ -1060,9 +1061,6 @@ async def resolve_account_session(
         or manifest.state != "committed"
     ):
         return blocked(BrowserAccountErrorCode.PROFILE_CORRUPT)
-    session.node_id = lease.node_id
-    session.node_boot_id = lease.node_boot_id
-    session.lease_id = lease.lease_id
     try:
         envelope = await _session_envelope(account, session)
     except BrowserAccountError as exc:
