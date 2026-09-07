@@ -534,29 +534,15 @@ async def apply_portal_control(
     control: PortalControlMessageV1,
 ) -> bool:
     """Apply one approved control through CDP or the packaged Script Host."""
+
     payload = control.sensitive_payload
     if control.kind == "request_view":
         return True
     if control.kind == "field_input":
-        if payload is None or payload.value is None:
-            raise ValueError("portal field input has no transient value")
-        request = RuntimeInvokeRequest(
-            runtime="script-host",
-            workflow="field_input",
-            input={
-                "field_ref": control.field_ref,
-                "value": payload.value.get_secret_value(),
-            },
-            config={
-                "pack": "account-login",
-                "action": "field_input",
-                "tab_id": route.binding.target.tab_id,
-            },
-        )
-        result = await invoke_script_host(request, cdp_endpoint=cdp_endpoint)
-        if result.get("ok") is False:
-            raise RuntimeError("Script Host rejected portal field input")
-        return True
+        # The fixed account-login pack has no guarded input action. Do not
+        # route a credential through a generic capability or arbitrary CDP
+        # evaluation; a dedicated pack action must prove current focus.
+        raise RuntimeError("guarded portal field input adapter is unavailable")
     if payload is None:
         raise ValueError("portal control requires transient payload")
     if control.kind == "pointer":

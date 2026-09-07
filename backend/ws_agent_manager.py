@@ -72,7 +72,7 @@ from backend.schemas.browser_account import (
 from backend.services.browser_portal_contract import (
     decode_portal_wire_frame,
     encode_portal_wire_frame,
-    route_portal_frame,
+    validate_portal_frame_binding,
 )
 logger = logging.getLogger(__name__)
 
@@ -166,7 +166,7 @@ class PortalTransport:
             raise ValueError("portal owner transport accepts control frames only")
         if frame.sequence <= self._sequence:
             raise ValueError("portal control sequence must increase")
-        validated = await route_portal_frame(self.route, frame)
+        validated = validate_portal_frame_binding(self.route, frame)
         encoded = encode_portal_wire_frame(validated)
         if len(encoded) > _PORTAL_MAX_WIRE_BYTES:
             raise ValueError("portal wire frame exceeds transport limit")
@@ -385,7 +385,7 @@ async def resolve_portal_binary(agent_url: str, data: bytes) -> None:
         )
         return
     try:
-        await route_portal_frame(transport.route, frame)
+        validate_portal_frame_binding(transport.route, frame)
         if frame.encoding != "pixel-binary":
             raise ValueError("portal edge may only send pixel frames")
         transport._enqueue(frame)
