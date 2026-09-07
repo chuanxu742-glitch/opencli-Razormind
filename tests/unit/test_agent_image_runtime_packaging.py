@@ -138,7 +138,8 @@ def test_browser_images_fail_closed_until_userscripts_access_is_verified():
         assert (
             'VIOLENTMONKEY_VERSION="$(read_manifest_component_version violentmonkey)"'
         ) in entrypoint
-        assert "rm -f /tmp/browser-runtime-report.json" in entrypoint
+    assert "rm -f /tmp/browser-runtime-report.json" in chrome_entrypoint
+    assert 'rm -f "$BROWSER_RUNTIME_REPORT_FILE"' in agent_entrypoint
 
 
 def test_compose_and_native_start_use_the_opencli_v2_contract():

@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from backend.channels.base import ChannelResult
+from backend.schemas.workflow import WorkflowProject
 from backend.workflow import gaojixing_runtime as runtime
 from backend.workflow.gaojixing_runtime import (
     GAOJIXING_CAPABILITY_ID,
@@ -571,8 +572,14 @@ async def test_replay_preserves_provenance_for_webhook_delivery(
         sourceId=None,
         model_copy=lambda *, update: SimpleNamespace(**{**source_input.__dict__, **update}),
     )
+    source_project = WorkflowProject(
+        id="workflow",
+        name="Replay workflow",
+        profile="intelligence",
+        nodes=[{"id": "source", "kind": "source", "capability": "fetch"}],
+    )
     source_request = SimpleNamespace(
-        project=object(),
+        project=source_project,
         input=source_input,
         model_copy=lambda *, update, deep: SimpleNamespace(**{**source_request.__dict__, **update}),
     )
@@ -580,6 +587,7 @@ async def test_replay_preserves_provenance_for_webhook_delivery(
         projection=SimpleNamespace(status="completed", workflowId="workflow"),
         studio_workflow_version_id="version",
         workflow_version_id=None,
+        requested_by_user_id=None,
         request=source_request,
         events=[
             SimpleNamespace(

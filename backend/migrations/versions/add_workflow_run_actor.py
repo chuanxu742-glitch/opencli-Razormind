@@ -1,7 +1,7 @@
 """Persist the authenticated actor for account-bound workflow execution."""
 
 import sqlalchemy as sa
-from alembic import op
+from alembic import context, op
 
 revision = "add_workflow_run_actor"
 down_revision = "add_task_execution_actor"
@@ -10,6 +10,11 @@ depends_on = None
 
 
 def upgrade() -> None:
+    if (
+        not context.is_offline_mode()
+        and "workflow_runs" not in sa.inspect(op.get_bind()).get_table_names()
+    ):
+        return
     with op.batch_alter_table("workflow_runs") as batch:
         batch.add_column(sa.Column("requested_by_user_id", sa.String(36), nullable=True))
         batch.create_index(
@@ -27,6 +32,11 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    if (
+        not context.is_offline_mode()
+        and "workflow_runs" not in sa.inspect(op.get_bind()).get_table_names()
+    ):
+        return
     with op.batch_alter_table("workflow_runs") as batch:
         batch.drop_constraint(
             "fk_workflow_runs_requested_by_user_id_users",
