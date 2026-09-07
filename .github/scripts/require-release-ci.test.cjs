@@ -49,23 +49,26 @@ function run(id, overrides = {}) {
 function routesFor(runs, jobs, { link = null } = {}) {
   const base = `${options.apiUrl}/repos/${options.repository}/actions`;
   return new Map([
-    [`${base}/workflows/ci.yml/runs?event=push&branch=main&per_page=100`, response({ workflow_runs: runs }, { link })],
-    [`${base}/runs/${jobs.id}/jobs?per_page=100`, response({ jobs: jobs.items })],
+    [`${base}/workflows/ci.yml/runs?event=push&branch=main&head_sha=${options.sha}&per_page=100`, response({ workflow_runs: runs }, { link })],
+    [`${base}/runs/${jobs.id}/attempts/${jobs.attempt ?? 1}/jobs?per_page=100`, response({ jobs: jobs.items })],
   ]);
 }
 
-test("accepts the latest successful main CI run with its successful gate", async () => {
-  const jobs = { id: 42, items: [gate(1), gate(2, "completed", "success")] };
-  await requireReleaseCi({ ...options, fetchImpl: fakeFetch(routesFor([run(42)], jobs)) });
+test("uses the selected run's exact attempt for a successful CI Gate", async () => {
+  const jobs = { id: 42, attempt: 3, items: [gate(1), gate(2, "completed", "success")] };
+  await requireReleaseCi({
+    ...options,
+    fetchImpl: fakeFetch(routesFor([run(42, { run_attempt: 3 })], jobs)),
+  });
 });
 
-test("uses later pages and rejects the latest matching failed run", async () => {
+test("pages exact-SHA runs and rejects a newer same-second failure", async () => {
   const base = `${options.apiUrl}/repos/${options.repository}/actions`;
-  const first = `${base}/workflows/ci.yml/runs?event=push&branch=main&per_page=100`;
+  const first = `${base}/workflows/ci.yml/runs?event=push&branch=main&head_sha=${options.sha}&per_page=100`;
   const second = `${base}/workflows/ci.yml/runs?page=2`;
   const routes = new Map([
-    [first, response({ workflow_runs: [run(10, { created_at: "2026-09-07T00:00:00Z" })] }, { link: `<${second}>; rel="next"` })],
-    [second, response({ workflow_runs: [run(11, { created_at: "2026-09-08T00:00:00Z", conclusion: "failure" })] })],
+    [first, response({ workflow_runs: [run(10)] }, { link: `<${second}>; rel="next"` })],
+    [second, response({ workflow_runs: [run(11, { conclusion: "failure" })] })],
   ]);
   await assert.rejects(
     requireReleaseCi({ ...options, fetchImpl: fakeFetch(routes) }),
@@ -88,6 +91,7 @@ test("fails closed for wrong branch, SHA, API errors, and in-progress runs", asy
     run(1, { head_branch: "develop" }),
     run(1, { head_sha: "b".repeat(40) }),
     run(1, { status: "in_progress", conclusion: null }),
+    run(1, { run_attempt: 0 }),
   ]) {
     const data = { id: candidate.id, items: [gate(1)] };
     await assert.rejects(
@@ -98,7 +102,7 @@ test("fails closed for wrong branch, SHA, API errors, and in-progress runs", asy
 
   const base = `${options.apiUrl}/repos/${options.repository}/actions`;
   const failedRoutes = new Map([
-    [`${base}/workflows/ci.yml/runs?event=push&branch=main&per_page=100`, response({}, { status: 503 })],
+    [`${base}/workflows/ci.yml/runs?event=push&branch=main&head_sha=${options.sha}&per_page=100`, response({}, { status: 503 })],
   ]);
   await assert.rejects(
     requireReleaseCi({ ...options, fetchImpl: fakeFetch(failedRoutes) }),

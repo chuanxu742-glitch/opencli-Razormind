@@ -49,7 +49,7 @@ function latestRunForCommit(runs, sha) {
     const runTime = Date.parse(run.created_at ?? 0);
     if (runTime > latestTime) return run;
     if (runTime < latestTime) return latest;
-    return (run.run_attempt ?? 0) > (latest.run_attempt ?? 0) ? run : latest;
+    return Number(run.id) > Number(latest.id) ? run : latest;
   });
 }
 
@@ -65,7 +65,7 @@ async function requireReleaseCi({ repository, token, sha, apiUrl = "https://api.
   };
   const baseUrl = `${apiUrl.replace(/\/$/, "")}/repos/${repository}/actions`;
   const runs = await getAllPages(
-    `${baseUrl}/workflows/${CI_WORKFLOW}/runs?event=push&branch=main&per_page=100`,
+    `${baseUrl}/workflows/${CI_WORKFLOW}/runs?event=push&branch=main&head_sha=${encodeURIComponent(sha)}&per_page=100`,
     headers,
     fetchImpl,
   );
@@ -74,7 +74,14 @@ async function requireReleaseCi({ repository, token, sha, apiUrl = "https://api.
     fail(`Latest main CI run ${run.id} for commit ${sha} is ${run.status}/${run.conclusion}.`);
   }
 
-  const jobs = await getAllPages(`${baseUrl}/runs/${run.id}/jobs?per_page=100`, headers, fetchImpl);
+  if (!Number.isSafeInteger(run.run_attempt) || run.run_attempt < 1) {
+    fail(`Latest main CI run ${run.id} has no valid run attempt.`);
+  }
+  const jobs = await getAllPages(
+    `${baseUrl}/runs/${run.id}/attempts/${run.run_attempt}/jobs?per_page=100`,
+    headers,
+    fetchImpl,
+  );
   const gate = jobs.find((job) => job.name === CI_GATE_NAME);
   if (!gate || gate.status !== "completed" || gate.conclusion !== "success") {
     fail(`CI run ${run.id} lacks a successful ${CI_GATE_NAME} job.`);
