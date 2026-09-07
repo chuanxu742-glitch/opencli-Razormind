@@ -1055,20 +1055,12 @@ async def _authorized_execution_actor(
         )
 
 
-async def ensure_execution_session(
-    db: AsyncSession,
+def _parse_execution_session_request(
     account_ref: AccountRef | Mapping[str, Any],
     execution_context: ExecutionContextV1 | Mapping[str, Any],
-    *,
-    actor_user_id: str | None = None,
-) -> BrowserLoginSession:
-    """Idempotently produce one fixed-account execution session and command.
-
-    This is the write side of execution admission.  It only records a
-    structured ``EXECUTE_REFERENCE`` command; node allocation and browser
-    startup remain scheduler/runtime responsibilities.
-    """
-
+    actor_user_id: str | None,
+) -> tuple[AccountRef, ExecutionContextV1]:
+    """Parse and require one consistent persisted execution request."""
     try:
         ref = (
             account_ref
@@ -1100,6 +1092,15 @@ async def ensure_execution_session(
             "execution caller does not match the persisted task actor",
             403,
         )
+    return ref, context
+
+
+async def _execution_account_or_error(
+    db: AsyncSession,
+    ref: AccountRef,
+    actor_user_id: str | None,
+) -> tuple[BrowserAccount, str | None]:
+    """Authorize and lock one account whose committed profile is executable."""
     await _authorized_execution_actor(db, ref.workspace_id, actor_user_id)
     account = await _account_or_error(
         db, ref.workspace_id, ref.account_id, for_update=True
@@ -1168,12 +1169,19 @@ async def ensure_execution_session(
             BrowserAccountErrorCode.PROFILE_CORRUPT,
             "committed profile manifest does not match the account",
         )
+    return account, binding_revision_id
+
+
+async def _existing_execution_session_or_error(
+    db: AsyncSession,
+    account: BrowserAccount,
+    context: ExecutionContextV1,
+    binding_revision_id: str | None,
+    expected_payload: ExecuteReferenceCommandPayloadV1,
+) -> BrowserLoginSession | None:
+    """Return the locked idempotent execution session, if one already exists."""
     scope = f"execution:{account.id}"
     idempotency_key = f"{context.execution_id}:{binding_revision_id or '-'}"
-    expected_payload = ExecuteReferenceCommandPayloadV1(
-        execution_id=context.execution_id,
-        source_binding_revision_id=binding_revision_id,
-    )
     command = await db.scalar(
         select(BrowserDurableCommand)
         .where(
@@ -1201,10 +1209,9 @@ async def ensure_execution_session(
                 "scheduler_conflict",
                 "execution command has no session",
             )
-        session = await _session_or_error(
+        return await _session_or_error(
             db, account.workspace_id, account.id, command.session_id, for_update=True
         )
-        return session
 
     conflicting_command_id = await db.scalar(
         select(BrowserDurableCommand.id)
@@ -1236,27 +1243,37 @@ async def ensure_execution_session(
         .limit(1)
         .with_for_update()
     )
-    if session is not None:
-        if session.command_id is None:
-            raise BrowserAccountError(
-                "scheduler_conflict", "active execution session has no durable command"
-            )
-        session_command = await db.get(BrowserDurableCommand, session.command_id)
-        if session_command is None:
-            raise BrowserAccountError(
-                "scheduler_conflict", "active execution session command is missing"
-            )
-        if (
-            session_command.kind != BrowserCommandKind.EXECUTE_REFERENCE.value
-            or session_command.execution_id != context.execution_id
-            or session_command.binding_revision_id != binding_revision_id
-        ):
-            raise BrowserAccountError(
-                BrowserAccountErrorCode.ACCOUNT_MIGRATION_REQUIRED,
-                "execution session is bound to a different source revision",
-            )
-        return session
+    if session is None:
+        return None
+    if session.command_id is None:
+        raise BrowserAccountError(
+            "scheduler_conflict", "active execution session has no durable command"
+        )
+    session_command = await db.get(BrowserDurableCommand, session.command_id)
+    if session_command is None:
+        raise BrowserAccountError(
+            "scheduler_conflict", "active execution session command is missing"
+        )
+    if (
+        session_command.kind != BrowserCommandKind.EXECUTE_REFERENCE.value
+        or session_command.execution_id != context.execution_id
+        or session_command.binding_revision_id != binding_revision_id
+    ):
+        raise BrowserAccountError(
+            BrowserAccountErrorCode.ACCOUNT_MIGRATION_REQUIRED,
+            "execution session is bound to a different source revision",
+        )
+    return session
 
+
+async def _create_execution_session(
+    db: AsyncSession,
+    account: BrowserAccount,
+    context: ExecutionContextV1,
+    binding_revision_id: str | None,
+    expected_payload: ExecuteReferenceCommandPayloadV1,
+) -> BrowserLoginSession:
+    """Create one execution session and its durable command."""
     node = await db.get(EdgeNode, account.node_id)
     session = BrowserLoginSession(
         id=str(uuid.uuid4()),
@@ -1283,8 +1300,8 @@ async def ensure_execution_session(
         db,
         account,
         BrowserCommandKind.EXECUTE_REFERENCE,
-        idempotency_scope=scope,
-        idempotency_key=idempotency_key,
+        idempotency_scope=f"execution:{account.id}",
+        idempotency_key=f"{context.execution_id}:{binding_revision_id or '-'}",
         session_id=session.id,
         execution_id=context.execution_id,
         binding_revision_id=binding_revision_id,
@@ -1295,6 +1312,39 @@ async def ensure_execution_session(
     await db.flush()
     await db.refresh(session)
     return session
+
+
+async def ensure_execution_session(
+    db: AsyncSession,
+    account_ref: AccountRef | Mapping[str, Any],
+    execution_context: ExecutionContextV1 | Mapping[str, Any],
+    *,
+    actor_user_id: str | None = None,
+) -> BrowserLoginSession:
+    """Idempotently produce one fixed-account execution session and command.
+
+    This is the write side of execution admission.  It only records a
+    structured ``EXECUTE_REFERENCE`` command; node allocation and browser
+    startup remain scheduler/runtime responsibilities.
+    """
+    ref, context = _parse_execution_session_request(
+        account_ref, execution_context, actor_user_id
+    )
+    account, binding_revision_id = await _execution_account_or_error(
+        db, ref, actor_user_id
+    )
+    expected_payload = ExecuteReferenceCommandPayloadV1(
+        execution_id=context.execution_id,
+        source_binding_revision_id=binding_revision_id,
+    )
+    session = await _existing_execution_session_or_error(
+        db, account, context, binding_revision_id, expected_payload
+    )
+    if session is not None:
+        return session
+    return await _create_execution_session(
+        db, account, context, binding_revision_id, expected_payload
+    )
 
 
 async def resolve_account_session(
