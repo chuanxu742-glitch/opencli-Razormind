@@ -333,41 +333,7 @@ elif [ "$HAVE_CHROME" = "true" ]; then
   request_chrome_close() {
     local pid="${1:-}"
     pid_alive "$pid" || return 0
-    node -e '
-const endpoint = process.argv[1].replace(/\/+$/, "");
-const deadline = setTimeout(() => process.exit(1), 1000);
-let socket;
-let sent = false;
-let settled = false;
-const finish = (status) => {
-  if (settled) return;
-  settled = true;
-  clearTimeout(deadline);
-  try { socket?.close(); } catch {}
-  process.exit(status);
-};
-(async () => {
-  const response = await fetch(`${endpoint}/json/version`, {
-    signal: AbortSignal.timeout(500),
-  });
-  if (!response.ok) throw new Error(`CDP returned ${response.status}`);
-  const metadata = await response.json();
-  if (typeof metadata.webSocketDebuggerUrl !== "string") {
-    throw new Error("CDP browser WebSocket is unavailable");
-  }
-  socket = new WebSocket(metadata.webSocketDebuggerUrl);
-  socket.addEventListener("open", () => {
-    sent = true;
-    socket.send(JSON.stringify({id: 1, method: "Browser.close"}));
-  });
-  socket.addEventListener("message", (event) => {
-    const message = JSON.parse(String(event.data));
-    if (message.id === 1) finish(message.error ? 1 : 0);
-  });
-  socket.addEventListener("close", () => finish(sent ? 0 : 1));
-  socket.addEventListener("error", () => finish(1));
-})().catch(() => finish(1));
-' "$OPENCLI_CDP_ENDPOINT" >/dev/null 2>&1
+    python -c 'import asyncio; from backend.browser_account_runtime import _request_browser_shutdown; raise SystemExit(0 if asyncio.run(_request_browser_shutdown(9222, timeout_seconds=1.0)) else 1)' >/dev/null 2>&1
   }
   stop_chrome_tree() {
     local pid="${1:-}"

@@ -34,11 +34,10 @@ class AgentEntrypointLifecycleTests(unittest.TestCase):
 
         self._write_executable(
             fake_bin / "node",
-            r'''#!/bin/bash
+            r"""#!/bin/bash
 set -e
 if [ "$1" = "-e" ]; then
   case "$2" in
-    *Browser.close*) printf 'requested\n' > "$FAKE_STATE/browser-close.requested" ;;
     *direct*restricted*) printf 'direct' ;;
     *'filter((target)=>target.type') printf '0' ;;
   esac
@@ -58,34 +57,60 @@ case "$1" in
     while :; do sleep 0.05; done
 esac
 exit 0
-''',
+""",
         )
         self._write_executable(
             fake_bin / "npm",
-            'printf \'%s\\n\' "$FAKE_NODE_ROOT"\n',
+            "printf '%s\\n' \"$FAKE_NODE_ROOT\"\n",
         )
         self._write_executable(
             fake_bin / "curl",
-            r'''#!/bin/bash
+            r"""#!/bin/bash
 case "$*" in *'/json/list'*) printf '[]\n' ;; esac
 exit 0
-''',
+""",
         )
         self._write_executable(fake_bin / "envsubst", "cat\n")
         self._write_executable(fake_bin / "bbx", "exit 0\n")
+        self._write_executable(
+            fake_bin / "python",
+            '#!/bin/bash\ncase "$*" in *_request_browser_shutdown*) '
+            'printf "requested\\n" > "$FAKE_STATE/browser-close.requested" ;; '
+            "*) exit 1 ;; esac\n",
+        )
+        # Restrict executable discovery so host mode stays browserless even
+        # inside the real Chromium image used by the Linux smoke workflow.
+        for utility in (
+            "bash",
+            "mkdir",
+            "chmod",
+            "readlink",
+            "dirname",
+            "cat",
+            "tr",
+            "seq",
+            "sleep",
+            "rm",
+            "setsid",
+            "env",
+            "mktemp",
+        ):
+            resolved = shutil.which(utility)
+            if resolved:
+                (fake_bin / utility).symlink_to(resolved)
         for name in ("xvfb", "nginx", "x11vnc", "websockify", "bbx-daemon"):
             self._write_executable(
-                fake_bin / name,
-                f'''#!/bin/bash
+                fake_bin / ("Xvfb" if name == "xvfb" else name),
+                f"""#!/bin/bash
 printf '%s\\n' "$$" > "$FAKE_STATE/{name}.pid"
 printf '%s\\n' "$PPID" > "$FAKE_STATE/{name}-supervisor.pid"
 trap '[ -f "$FAKE_STATE/chromium.exited" ] || printf early > "$FAKE_STATE/{name}.before-chromium"; printf term > "$FAKE_STATE/{name}.term"; exit 0' TERM INT
 while :; do sleep 0.05; done
-''',
+""",
             )
         self._write_executable(
             fake_bin / "chromium",
-            r'''#!/bin/bash
+            r"""#!/bin/bash
 printf '%s\n' "$$" >> "$FAKE_STATE/chromium.starts"
 printf '%s\n' "$$" > "$FAKE_STATE/chromium.pid"
 printf '%s\n' "$PPID" > "$FAKE_STATE/chrome-supervisor.pid"
@@ -93,11 +118,11 @@ trap 'printf term > "$FAKE_STATE/chromium.term"; printf exited > "$FAKE_STATE/ch
 while [ ! -f "$FAKE_STATE/browser-close.requested" ]; do sleep 0.05; done
 printf graceful > "$FAKE_STATE/chromium.graceful"
 printf exited > "$FAKE_STATE/chromium.exited"
-''',
+""",
         )
         self._write_executable(
             fake_bin / "uvicorn",
-            r'''#!/bin/bash
+            r"""#!/bin/bash
 printf '%s\n' "$$" > "$FAKE_STATE/uvicorn.pid"
 if [ -n "${FAKE_UVICORN_EXIT:-}" ]; then
   sleep 0.2
@@ -105,7 +130,7 @@ if [ -n "${FAKE_UVICORN_EXIT:-}" ]; then
 fi
 trap 'printf term > "$FAKE_STATE/uvicorn.term"; exit 0' TERM INT
 while :; do sleep 0.05; done
-''',
+""",
         )
 
         if not embedded:
@@ -135,7 +160,7 @@ while :; do sleep 0.05; done
         env = os.environ.copy()
         env.update(
             {
-                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "PATH": str(fake_bin),
                 "FAKE_BIN": str(fake_bin),
                 "FAKE_STATE": str(state),
                 "FAKE_NODE_ROOT": str(fake_node_root),
