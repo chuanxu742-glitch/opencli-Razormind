@@ -130,6 +130,8 @@ RUN chmod +x /usr/local/bin/resolve-browser-executable.mjs
 WORKDIR /app
 COPY backend/agent_server.py ./backend/agent_server.py
 COPY backend/browser_account_runtime.py ./backend/browser_account_runtime.py
+COPY backend/browser_account_process.py ./backend/browser_account_process.py
+COPY backend/browser_account_errors.py ./backend/browser_account_errors.py
 COPY backend/agent_runtime_dispatch.py ./backend/agent_runtime_dispatch.py
 COPY backend/agent_runtimes/ ./backend/agent_runtimes/
 COPY backend/miniflow/ ./backend/miniflow/
