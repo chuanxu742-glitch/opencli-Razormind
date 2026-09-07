@@ -1,5 +1,4 @@
-"""session_affinity is generalized: the pipeline's browser-binding pre-step gates
-on capabilities.session_affinity, not a hardcoded channel list."""
+"""Session affinity never infers account identity from legacy site mappings."""
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -31,7 +30,7 @@ def test_opencli_and_skill_declare_session_affinity():
 
 
 @pytest.mark.asyncio
-async def test_pipeline_binds_for_session_affinity_channel(db_session):
+async def test_pipeline_does_not_infer_account_from_legacy_site(db_session):
     from backend.models.source import DataSource
     from backend.models.task import CollectionTask
     from backend.pipeline.pipeline import run_pipeline
@@ -43,8 +42,10 @@ async def test_pipeline_binds_for_session_affinity_channel(db_session):
     db_session.add(task)
     await db_session.flush()
 
-    binding = MagicMock()
-    binding.browser_endpoint = "ws://chrome:9222"
+    from backend.models.browser import BrowserBinding
+
+    db_session.add(BrowserBinding(browser_endpoint="ws://chrome:9222", site="x.com"))
+    await db_session.flush()
     captured = {}
 
     async def fake_collect(src, params):
@@ -53,18 +54,13 @@ async def test_pipeline_binds_for_session_affinity_channel(db_session):
 
     with (
         patch("backend.pipeline.collector.collect", new=fake_collect),
-        patch(
-            "backend.services.browser_service.get_binding_by_site",
-            new=AsyncMock(return_value=binding),
-        ),
         patch("backend.database.AsyncSessionLocal", return_value=_session_cm()),
     ):
         await run_pipeline(
             task.id, source, enable_ai=False, enable_notifications=False, sink=_ok_sink()
         )
 
-    # The capability-gated pre-step resolved the chrome endpoint into collect params.
-    assert captured["params"].get("chrome_endpoint") == "ws://chrome:9222"
+    assert "chrome_endpoint" not in captured["params"]
 
 
 @pytest.mark.asyncio
@@ -84,7 +80,6 @@ async def test_pipeline_skips_binding_for_non_affinity_channel(db_session):
     db_session.add(task)
     await db_session.flush()
 
-    bind_mock = AsyncMock()
     captured = {}
 
     async def fake_collect(src, params):
@@ -93,13 +88,10 @@ async def test_pipeline_skips_binding_for_non_affinity_channel(db_session):
 
     with (
         patch("backend.pipeline.collector.collect", new=fake_collect),
-        patch("backend.services.browser_service.get_binding_by_site", new=bind_mock),
         patch("backend.database.AsyncSessionLocal", return_value=_session_cm()),
     ):
         await run_pipeline(
             task.id, source, enable_ai=False, enable_notifications=False, sink=_ok_sink()
         )
 
-    # rss has session_affinity=False → no binding lookup, no chrome_endpoint injected.
-    bind_mock.assert_not_called()
     assert "chrome_endpoint" not in captured["params"]

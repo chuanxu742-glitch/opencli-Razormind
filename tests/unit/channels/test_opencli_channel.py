@@ -709,18 +709,13 @@ async def test_health_check_cdp_mode_unreachable_returns_false(channel):
 
 
 @pytest.mark.asyncio
-async def test_health_check_routes_to_source_bound_endpoint(channel, db_engine):
-    """A source with a browser binding for its site must probe that bound
-    endpoint, not an arbitrary pool member — same lookup pipeline.py does
-    before collect() so the probe reflects the endpoint this source actually
-    uses."""
-    from backend.services import browser_service
+async def test_health_check_ignores_preserved_global_site_binding(channel, db_engine):
+    """Capability health checks cannot select an account by global site mapping."""
+    from backend.models.browser import BrowserBinding
 
     sm = _sessionmaker(db_engine)
     async with sm() as session:
-        await browser_service.create_binding(
-            session, browser_endpoint="http://bound-chrome:9222", site="example.com"
-        )
+        session.add(BrowserBinding(browser_endpoint="http://bound-chrome:9222", site="example.com"))
         await session.commit()
 
     mock_pool = _make_mock_pool(mode="cdp")
@@ -745,7 +740,7 @@ async def test_health_check_routes_to_source_bound_endpoint(channel, db_engine):
         result = await channel.health_check({"site": "example.com"})
 
     assert result is True
-    mock_pool.acquire.assert_called_once_with(endpoint="http://bound-chrome:9222")
+    mock_pool.acquire.assert_called_once_with(endpoint=None)
 
 
 @pytest.mark.asyncio

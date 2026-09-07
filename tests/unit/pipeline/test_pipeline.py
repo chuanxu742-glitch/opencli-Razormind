@@ -533,8 +533,8 @@ async def test_run_pipeline_notification_exception_continues(db_session):
 
 
 @pytest.mark.asyncio
-async def test_run_pipeline_opencli_auto_binding(db_session):
-    """OpenCLI source auto-resolves chrome_endpoint from browser binding."""
+async def test_run_pipeline_opencli_does_not_infer_legacy_identity(db_session):
+    """A preserved site mapping cannot silently select an account."""
     from backend.models.source import DataSource
     from backend.models.task import CollectionTask
 
@@ -550,10 +550,15 @@ async def test_run_pipeline_opencli_auto_binding(db_session):
     db_session.add(task)
     await db_session.flush()
 
-    mock_binding = MagicMock()
-    mock_binding.browser_endpoint = "http://chrome:9222"
+    from backend.models.browser import BrowserBinding
 
-    mock_channel_result = ChannelResult.ok([{"id": 1}])
+    db_session.add(BrowserBinding(browser_endpoint="http://chrome:9222", site="example.com"))
+    await db_session.flush()
+    captured = {}
+
+    async def fake_collect(src, params):
+        captured.update(params)
+        return ChannelResult.ok([{"id": 1}])
 
     mock_browser_session = AsyncMock()
     mock_browser_session.commit = AsyncMock()
@@ -562,9 +567,8 @@ async def test_run_pipeline_opencli_auto_binding(db_session):
     browser_cm.__aexit__ = AsyncMock(return_value=False)
 
     with (
-        patch("backend.services.browser_service.get_binding_by_site", new=AsyncMock(return_value=mock_binding)),
         patch("backend.database.AsyncSessionLocal", return_value=browser_cm),
-        patch("backend.pipeline.collector.collect", return_value=mock_channel_result),
+        patch("backend.pipeline.collector.collect", new=fake_collect),
         patch("backend.pipeline.storer.store_records", new=AsyncMock(return_value=([], 0))),
     ):
         result = await run_pipeline(
@@ -574,6 +578,9 @@ async def test_run_pipeline_opencli_auto_binding(db_session):
             enable_ai=False,
             enable_notifications=False,
         )
+
+    assert result.success is True
+    assert "chrome_endpoint" not in captured
 
 
 # ── C17: opencli display-string must not spawn --help on the hot path ──────

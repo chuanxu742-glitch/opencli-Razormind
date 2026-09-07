@@ -14,7 +14,6 @@ from backend.api.v1.browser_containers import docker_client, update_env_file
 from backend.config import get_settings
 from backend.database import get_db
 from backend.schemas.browser import (
-    BrowserBindingCreate,
     BrowserBindingRead,
     BrowserCapabilityInvocationRead,
     BrowserInstanceConfigUpdate,
@@ -113,25 +112,24 @@ async def inspect_binding_migration(
     )
 
 
-@router.post("/bindings", response_model=ApiResponse[BrowserBindingRead])
-async def create_binding(
-    body: BrowserBindingCreate, db: AsyncSession = Depends(get_db)
-) -> ApiResponse:
-    existing = await browser_service.get_binding_by_site(db, body.site)
-    if existing:
-        raise HTTPException(status_code=409, detail=f"Site '{body.site}' is already bound")
-    binding = await browser_service.create_binding(db, body.browser_endpoint, body.site, body.notes)
-    await db.commit()
-    return ApiResponse.ok(BrowserBindingRead.model_validate(binding))
+_LEGACY_BINDING_MIGRATION_DETAIL = {
+    "code": "browser_account_migration_required",
+    "message": (
+        "Legacy browser bindings are read-only. Create and manage browser accounts "
+        "through the workspace browser-account UI."
+    ),
+}
 
 
-@router.delete("/bindings/{binding_id}", response_model=ApiResponse[None])
-async def delete_binding(binding_id: str, db: AsyncSession = Depends(get_db)) -> ApiResponse:
-    deleted = await browser_service.delete_binding(db, binding_id)
-    if not deleted:
-        raise HTTPException(status_code=404, detail="Binding not found")
-    await db.commit()
-    return ApiResponse.ok(None)
+@router.post("/bindings")
+async def create_binding() -> None:
+    raise HTTPException(status_code=410, detail=_LEGACY_BINDING_MIGRATION_DETAIL)
+
+
+@router.delete("/bindings/{binding_id}")
+async def delete_binding(binding_id: str) -> None:
+    del binding_id
+    raise HTTPException(status_code=410, detail=_LEGACY_BINDING_MIGRATION_DETAIL)
 
 
 # ── Versioned browser runtime bundles ─────────────────────────────────────────
