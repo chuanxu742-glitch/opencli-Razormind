@@ -2991,7 +2991,7 @@ function SourceBindingRevisionControls({
           <Select
             value={source.accountId ?? UNBOUND_SOURCE_BINDING_VALUE}
             disabled={accountsQuery.isLoading}
-            onValueChange={(value) => onChange({ accountId: value === UNBOUND_SOURCE_BINDING_VALUE ? undefined : value })}
+            onValueChange={(value) => onChange({ accountId: value == null || value === UNBOUND_SOURCE_BINDING_VALUE ? undefined : value })}
           >
             <SelectTrigger aria-label="Browser account" className="h-8 rounded-xs border-ops-line bg-ops-black text-2xs shadow-none focus:ring-0">
               <SelectValue>
