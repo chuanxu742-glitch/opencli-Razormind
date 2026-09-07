@@ -38,13 +38,13 @@ set -e
 if [ "$1" = "-e" ]; then
   case "$2" in
     *direct*restricted*) printf 'direct' ;;
-    *'filter((target)=>target.type') printf '0' ;;
+    *'filter((target)=>target.type'*) printf '0' ;;
   esac
   exit 0
 fi
 case "$1" in
   */resolve-browser-runtime-bundle.mjs)
-    [ "$3" = "--report" ] && printf '{}'
+    [ "$4" = "--report" ] && printf '{}'
     ;;
   */resolve-browser-executable.mjs)
     printf '%s/chromium' "$FAKE_BIN"
@@ -231,10 +231,15 @@ while :; do sleep 0.05; done
                 self._wait_for(state / "chromium.starts")
                 process.send_signal(signal.SIGTERM)
                 output, _ = process.communicate(timeout=10)
+            except AssertionError as error:
+                if process.poll() is None:
+                    process.send_signal(signal.SIGTERM)
+                output, _ = process.communicate(timeout=10)
+                self.fail(f"{error}\n{output}")
             finally:
                 if process.poll() is None:
                     process.kill()
-                    process.wait(timeout=3)
+                    process.communicate(timeout=3)
             self.assertEqual(process.returncode, 143, output)
             self.assertTrue((state / "uvicorn.term").exists(), output)
             self.assertTrue((state / "browser-close.requested").exists(), output)

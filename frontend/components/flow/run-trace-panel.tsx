@@ -182,7 +182,7 @@ export function RunTracePanel({ runRequestId = 0 }: { runRequestId?: number }) {
   const isRunning = runState.status === "running"
   const isBackendRunning = backendState.status === "running"
 
-  const monitorActiveRun = async (started: WorkflowRunProjection, authorization?: string | null) => {
+  const monitorActiveRun = async (started: WorkflowRunProjection, authorization: string | null = null) => {
     runMonitorAbortRef.current?.abort()
     const controller = new AbortController()
     runMonitorAbortRef.current = controller
