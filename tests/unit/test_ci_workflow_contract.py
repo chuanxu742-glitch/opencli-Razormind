@@ -1,5 +1,10 @@
+import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 
@@ -59,30 +64,76 @@ def test_ci_keeps_existing_jobs_and_adds_a_fail_closed_gate() -> None:
     assert REQUIRED_CI_JOBS <= set(jobs)
     assert set(jobs) == REQUIRED_CI_JOBS | {"ci-gate"}
     assert all(jobs[job]["timeout-minutes"] > 0 for job in jobs)
-
     gate = jobs["ci-gate"]
     assert gate["name"] == "CI Gate"
     assert gate["if"].strip() == "${{ always() }}"
     assert set(gate["needs"]) == REQUIRED_CI_JOBS
-    gate_condition = next(
-        step["if"]
+    gate_decision = next(
+        step
         for step in gate["steps"]
         if step.get("name") == "Reject incomplete CI"
     )
-    expected_results = {
-        job: (
-            f"needs['{job}'].result == 'success'"
-            if "-" in job
-            else f"needs.{job}.result == 'success'"
-        )
-        for job in REQUIRED_CI_JOBS
-    }
-    assert all(expression in gate_condition for expression in expected_results.values())
+    assert gate_decision["env"]["NEEDS_JSON"] == "${{ toJSON(needs) }}"
+    assert "python - <<'PY'" in gate_decision["run"]
     assert "node --test .github/scripts/require-release-ci.test.cjs" in "\n".join(
         step.get("run", "")
         for step in gate["steps"]
         if "run" in step
     )
+
+
+def gate_decision_script() -> str:
+    workflow = load_workflow(CI_WORKFLOW)
+    decision = next(
+        step
+        for step in workflow["jobs"]["ci-gate"]["steps"]
+        if step.get("name") == "Reject incomplete CI"
+    )
+    marker = "python - <<'PY'\n"
+    _, found, body = decision["run"].partition(marker)
+    assert found
+    script, _, _ = body.partition("\nPY")
+    assert script
+    return script
+
+
+def run_gate(needs: dict[str, dict[str, str]]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-c", gate_decision_script()],
+        env={**os.environ, "NEEDS_JSON": json.dumps(needs)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def successful_needs() -> dict[str, dict[str, str]]:
+    return {job: {"result": "success"} for job in REQUIRED_CI_JOBS}
+
+
+def test_ci_gate_script_accepts_all_successful_dependencies() -> None:
+    result = run_gate(successful_needs())
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("status", ["failure", "cancelled", "skipped"])
+def test_ci_gate_script_rejects_any_non_success_dependency(status: str) -> None:
+    needs = successful_needs()
+    needs["backend"]["result"] = status
+
+    result = run_gate(needs)
+
+    assert result.returncode != 0
+
+
+def test_ci_gate_script_rejects_missing_dependency() -> None:
+    needs = successful_needs()
+    del needs["cargo"]
+
+    result = run_gate(needs)
+
+    assert result.returncode != 0
 
 
 def test_runtime_smoke_preserves_steps_and_adds_pr_scoped_cancellation() -> None:

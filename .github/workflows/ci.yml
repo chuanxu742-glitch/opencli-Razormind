@@ -366,21 +366,41 @@ jobs:
       - cargo
     steps:
       - name: Reject incomplete CI
-        if: >-
-          ${{
-            !(
-              needs.extension.result == 'success' &&
-              needs.frontend.result == 'success' &&
-              needs['release-contract'].result == 'success' &&
-              needs.backend.result == 'success' &&
-              needs['frontend-workflow-checks'].result == 'success' &&
-              needs.migrations.result == 'success' &&
-              needs.cargo.result == 'success'
-            )
-          }}
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
-          echo "CI Gate requires every required CI job to succeed."
-          exit 1
+          python - <<'PY'
+          import json
+          import os
+          import sys
+
+          required = {
+              "extension",
+              "frontend",
+              "release-contract",
+              "backend",
+              "frontend-workflow-checks",
+              "migrations",
+              "cargo",
+          }
+          try:
+              needs = json.loads(os.environ["NEEDS_JSON"])
+          except (KeyError, json.JSONDecodeError):
+              print("CI Gate requires a valid needs payload.", file=sys.stderr)
+              raise SystemExit(1)
+
+          if (
+              not isinstance(needs, dict)
+              or set(needs) != required
+              or any(
+                  not isinstance(needs[job], dict)
+                  or needs[job].get("result") != "success"
+                  for job in required
+              )
+          ):
+              print("CI Gate requires every required CI job to succeed.", file=sys.stderr)
+              raise SystemExit(1)
+          PY
 
       - name: Checkout
         uses: actions/checkout@v6
