@@ -146,9 +146,15 @@ def run() -> dict[str, str]:
     resumed, _ = _request(
         "POST",
         _route(account_id, "/resume"),
-        {"expected_revision": 1},
+        {
+            "account_ref": {"workspace_id": WORKSPACE_ID, "account_id": account_id},
+            "expected_revision": 1,
+            "operation": "resume",
+        },
         headers={"If-Match": "1"},
     )
+    _assert(resumed["operation"] == "resume", "resume operation contract mismatch")
+    _assert(resumed["account_ref"]["account_id"] == account_id, "resume account mismatch")
     _assert(
         resumed["paused"] is False and resumed["revision"] == 2,
         "resume revision did not advance",
@@ -157,7 +163,7 @@ def run() -> dict[str, str]:
     session, _ = _request(
         "POST",
         _route(account_id, "/login-sessions"),
-        {"purpose": "login", "expires_in_seconds": 600},
+        {"purpose": "login", "expected_revision": resumed["revision"]},
         headers={"Idempotency-Key": secrets.token_urlsafe(18)},
         expected_status=201,
     )

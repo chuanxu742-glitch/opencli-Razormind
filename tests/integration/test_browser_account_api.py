@@ -86,9 +86,18 @@ async def test_account_crud_session_portal_ticket_and_close_use_real_http_contra
             await client.post(
                 _route(account_id, "/resume"),
                 headers={"If-Match": "1"},
-                json={"expected_revision": 1},
+                json={
+                    "account_ref": {
+                        "workspace_id": _WORKSPACE_ID,
+                        "account_id": account_id,
+                    },
+                    "expected_revision": 1,
+                    "operation": "resume",
+                },
             )
         )
+        assert resumed["operation"] == "resume"
+        assert resumed["account_ref"]["account_id"] == account_id
         assert resumed["paused"] is False
         assert resumed["revision"] == 2
 
@@ -102,7 +111,7 @@ async def test_account_crud_session_portal_ticket_and_close_use_real_http_contra
         session = _data(
             await client.post(
                 _route(account_id, "/login-sessions"),
-                json={"purpose": "login", "expires_in_seconds": 600},
+                json={"purpose": "login", "expected_revision": resumed["revision"]},
             )
         )
         session_id = session["id"]
