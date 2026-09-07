@@ -10,9 +10,9 @@ RUNTIME_HOME="${RUNTIME_HOME:-/home/agent}"
 RUNTIME_CACHE_DIR="${RUNTIME_CACHE_DIR:-$RUNTIME_HOME/.cache}"
 RUNTIME_STATE_DIR="${RUNTIME_STATE_DIR:-$RUNTIME_HOME/.local/state/opencli-account-runtime}"
 CHROMIUM_POLICY_FILE="${CHROMIUM_POLICY_FILE:-/etc/chromium/policies/managed/opencli-account-runtime.json}"
-ACCOUNT_RUNTIME_ROOT="${ACCOUNT_RUNTIME_ROOT:-/var/lib/opencli-account-runtime/sessions}"
-ACCOUNT_PROFILE_ROOT="${ACCOUNT_PROFILE_ROOT:-/var/lib/opencli-account-runtime/profiles}"
-ACCOUNT_RUNTIME_STATE_ROOT="${ACCOUNT_RUNTIME_STATE_ROOT:-/var/lib/opencli-account-runtime/state}"
+ACCOUNT_RUNTIME_ROOT="${ACCOUNT_RUNTIME_ROOT:-$RUNTIME_STATE_DIR/sessions}"
+ACCOUNT_PROFILE_ROOT="${ACCOUNT_PROFILE_ROOT:-$RUNTIME_STATE_DIR/profiles}"
+ACCOUNT_RUNTIME_STATE_ROOT="${ACCOUNT_RUNTIME_STATE_ROOT:-$RUNTIME_STATE_DIR/state}"
 export ACCOUNT_RUNTIME_ROOT ACCOUNT_PROFILE_ROOT ACCOUNT_RUNTIME_STATE_ROOT
 validate_runtime_path() {
   local path="$1"

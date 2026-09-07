@@ -25,6 +25,22 @@ from backend.schemas.browser_account import (
     SessionEnvelopeV1,
 )
 
+
+def test_account_paths_follow_configured_persistent_volume(monkeypatch, tmp_path):
+    volume = tmp_path / "mounted-account-volume"
+    monkeypatch.setenv("RUNTIME_STATE_DIR", str(volume))
+    for name in ("ACCOUNT_RUNTIME_ROOT", "ACCOUNT_PROFILE_ROOT", "ACCOUNT_RUNTIME_STATE_ROOT"):
+        monkeypatch.delenv(name, raising=False)
+    configuration = AccountRuntimeConfiguration.from_environment()
+    assert configuration.runtime_root == volume / "sessions"
+    assert configuration.profile_root == volume / "profiles"
+    assert configuration.state_root == volume / "state"
+
+    override = tmp_path / "separately-mounted-profiles"
+    monkeypatch.setenv("ACCOUNT_PROFILE_ROOT", str(override))
+    assert AccountRuntimeConfiguration.from_environment().profile_root == override
+
+
 _RUNTIME_PROCESS = r"""
 import json
 import os

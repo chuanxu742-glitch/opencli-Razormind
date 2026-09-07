@@ -2230,14 +2230,19 @@ class AccountRuntimeConfiguration:
     def from_environment(cls) -> AccountRuntimeConfiguration:
         """Load a single trusted bundle and fixed process toolchain."""
 
+        # Compose mounts this existing volume; standalone defaults match the
+        # image's writable directory. Honor the same parent as the entrypoint.
+        persistent_root = Path(
+            os.environ.get("RUNTIME_STATE_DIR", "/var/lib/opencli/account-runtime")
+        ).expanduser()
         runtime_root = Path(
-            os.environ.get("ACCOUNT_RUNTIME_ROOT", "/var/lib/opencli-account-runtime/sessions")
+            os.environ.get("ACCOUNT_RUNTIME_ROOT", str(persistent_root / "sessions"))
         ).expanduser()
         profile_root = Path(
-            os.environ.get("ACCOUNT_PROFILE_ROOT", "/var/lib/opencli-account-runtime/profiles")
+            os.environ.get("ACCOUNT_PROFILE_ROOT", str(persistent_root / "profiles"))
         ).expanduser()
         state_root = Path(
-            os.environ.get("ACCOUNT_RUNTIME_STATE_ROOT", "/var/lib/opencli-account-runtime/state")
+            os.environ.get("ACCOUNT_RUNTIME_STATE_ROOT", str(persistent_root / "state"))
         ).expanduser()
         bundle_root = Path(
             os.environ.get("BROWSER_RUNTIME_BUNDLE_ROOT", "/opt/browser-runtime-bundles")
