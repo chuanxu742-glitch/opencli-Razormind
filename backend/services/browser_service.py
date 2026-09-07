@@ -1,7 +1,7 @@
 from pathlib import PurePosixPath
 
 from jsonschema import Draft202012Validator
-from sqlalchemy import delete, func, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.browser import (
@@ -190,9 +190,6 @@ async def get_binding(session: AsyncSession, binding_id: str) -> BrowserBinding 
     return await session.get(BrowserBinding, binding_id)
 
 
-async def get_binding_by_site(session: AsyncSession, site: str) -> BrowserBinding | None:
-    result = await session.execute(select(BrowserBinding).where(BrowserBinding.site == site))
-    return result.scalar_one_or_none()
 
 
 async def inspect_legacy_binding_migration(
@@ -243,19 +240,6 @@ async def inspect_legacy_binding_migration(
     }
 
 
-async def create_binding(
-    session: AsyncSession, browser_endpoint: str, site: str, notes: str | None = None
-) -> BrowserBinding:
-    binding = BrowserBinding(browser_endpoint=browser_endpoint, site=site, notes=notes)
-    session.add(binding)
-    await session.flush()
-    await session.refresh(binding)
-    return binding
-
-
-async def delete_binding(session: AsyncSession, binding_id: str) -> bool:
-    result = await session.execute(delete(BrowserBinding).where(BrowserBinding.id == binding_id))
-    return result.rowcount > 0
 
 
 async def list_runtime_bundles(session: AsyncSession) -> list[BrowserRuntimeBundle]:

@@ -13,7 +13,6 @@ from typing import Any
 from urllib.parse import urlparse
 
 import yaml
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.channels.base import (
     AbstractChannel,
@@ -126,39 +125,6 @@ async def _account_node_endpoint(pool: Any, node_id: str) -> str | None:
     endpoints = getattr(pool, "endpoints", ())
     return endpoint if endpoint in endpoints else None
 
-async def _site_bound_agent_endpoint(pool: Any, site: str, session: AsyncSession) -> str | None:
-    if not site:
-        return None
-
-    from backend.services import browser_service
-
-    binding = await browser_service.get_binding_by_site(session, site)
-    if not binding:
-        return None
-
-    endpoint = binding.browser_endpoint
-    if endpoint not in pool.endpoints:
-        logger.warning(
-            "agent mode: site binding for %s points at endpoint %s outside the pool",
-            site,
-            endpoint,
-        )
-        return None
-    if not pool.get_agent_protocol(endpoint):
-        logger.warning(
-            "agent mode: site binding for %s points at endpoint %s without an agent protocol",
-            site,
-            endpoint,
-        )
-        return None
-    return endpoint
-
-
-async def _select_agent_endpoint(pool: Any, site: str, session: AsyncSession) -> str | None:
-    """Select an explicitly registered agent; site is not an identity key."""
-    del site, session
-    agent_eps = [ep for ep in pool.endpoints if pool.get_agent_protocol(ep)]
-    return agent_eps[0] if agent_eps else None
 
 
 async def _kill_subprocess(proc, *, platform: str | None = None) -> None:
@@ -754,10 +720,10 @@ class OpenCLIChannel(AbstractChannel):
             and not chrome_endpoint
             and isinstance(pool, LocalBrowserPool)
         ):
-            from backend.database import AsyncSessionLocal
-
-            async with AsyncSessionLocal() as session:
-                _acquire_endpoint = await _select_agent_endpoint(pool, site, session)
+            _acquire_endpoint = next(
+                (endpoint for endpoint in pool.endpoints if pool.get_agent_protocol(endpoint)),
+                None,
+            )
             if not _acquire_endpoint:
                 return ChannelResult.fail(
                     "No registered agent nodes available. Please add an agent node first."
@@ -887,15 +853,9 @@ class OpenCLIChannel(AbstractChannel):
         except RuntimeError:
             return True  # pool not initialized yet (e.g. tested standalone) — binary check stands
 
+        # Capability health is anonymous fleet liveness. It deliberately does
+        # not resolve a legacy site binding or an account identity.
         acquire_endpoint: str | None = None
-        site = (config or {}).get("site")
-        if site:
-            from backend.database import AsyncSessionLocal
-            from backend.services import browser_service
-            async with AsyncSessionLocal() as session:
-                binding = await browser_service.get_binding_by_site(session, site)
-                if binding:
-                    acquire_endpoint = binding.browser_endpoint
 
         try:
             async with pool.acquire(endpoint=acquire_endpoint) as cdp_endpoint:

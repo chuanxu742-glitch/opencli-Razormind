@@ -4,12 +4,6 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
-class BrowserBindingCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    browser_endpoint: str
-    site: str
-    notes: str | None = None
 
 class BrowserBindingRead(BaseModel):
     id: str
