@@ -76,8 +76,14 @@ def test_public_release_has_a_runnable_control_plane_and_durable_defaults() -> N
         assert services[service]["restart"] == "unless-stopped"
 
     assert services["api"]["volumes"][0] == "db_data:/data"
-    assert services["agent-1"]["volumes"][0] == ("agent_profile_1:/home/chrome/.config/chromium")
-    assert {"db_data", "agent_profile_1"} <= compose["volumes"].keys()
+    agent_environment = services["agent-1"]["environment"]
+    assert services["agent-1"]["volumes"][0] == (
+        f"agent_profile_1:{agent_environment['PROFILE_DIR']}"
+    )
+    assert services["agent-1"]["volumes"][1] == (
+        f"agent_runtime_state_1:{agent_environment['RUNTIME_STATE_DIR']}"
+    )
+    assert {"db_data", "agent_profile_1", "agent_runtime_state_1"} <= compose["volumes"].keys()
     assert services["agent-1"]["ports"] == ["127.0.0.1:${NOVNC_PORT:-6080}:6080"]
     assert "./backend:/app/backend" not in source("docker-compose.yml")
     assert "${INVOKEAI_ATTESTED_IMAGE:?" not in source("docker-compose.yml")
