@@ -9,7 +9,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+import websockets
 
+import backend.browser_account_runtime as browser_runtime
 from backend.browser_account_runtime import (
     AccountRuntimeConfiguration,
     BrowserAccountRuntimeAllocator,
@@ -281,6 +283,185 @@ def _accepts(port: int) -> bool:
         return False
 
 
+class _CdpVersionResponse:
+    status = 200
+
+    def __init__(self, websocket_url: str, *, response_url: str) -> None:
+        self._body = json.dumps({"webSocketDebuggerUrl": websocket_url}).encode()
+        self._response_url = response_url
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def geturl(self) -> str:
+        return self._response_url
+
+    def read(self, _limit: int) -> bytes:
+        return self._body
+
+
+def test_cdp_websocket_url_canonicalizes_the_owned_loopback_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port = 32_123
+    version_url = f"http://127.0.0.1:{port}/json/version"
+    response = _CdpVersionResponse(
+        f"ws://localhost:{port}/devtools/browser/browser-id",
+        response_url=version_url,
+    )
+    monkeypatch.setattr(browser_runtime, "urlopen", lambda *_args, **_kwargs: response)
+
+    assert (
+        browser_runtime._read_cdp_browser_websocket_url(port)
+        == f"ws://127.0.0.1:{port}/devtools/browser/browser-id"
+    )
+
+
+@pytest.mark.parametrize(
+    "websocket_url",
+    (
+        "ws://attacker.invalid:32123/devtools/browser/browser-id",
+        "ws://127.0.0.1:32124/devtools/browser/browser-id",
+        "wss://127.0.0.1:32123/devtools/browser/browser-id",
+        "ws://127.0.0.1:32123/devtools/page/page-id",
+    ),
+)
+def test_cdp_websocket_url_rejects_unowned_or_non_browser_endpoints(
+    monkeypatch: pytest.MonkeyPatch,
+    websocket_url: str,
+) -> None:
+    port = 32_123
+    version_url = f"http://127.0.0.1:{port}/json/version"
+    response = _CdpVersionResponse(websocket_url, response_url=version_url)
+    monkeypatch.setattr(browser_runtime, "urlopen", lambda *_args, **_kwargs: response)
+
+    assert browser_runtime._read_cdp_browser_websocket_url(port) is None
+
+
+def test_cdp_websocket_url_rejects_redirected_version_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port = 32_123
+    response = _CdpVersionResponse(
+        f"ws://127.0.0.1:{port}/devtools/browser/browser-id",
+        response_url="http://attacker.invalid/json/version",
+    )
+    monkeypatch.setattr(browser_runtime, "urlopen", lambda *_args, **_kwargs: response)
+
+    assert browser_runtime._read_cdp_browser_websocket_url(port) is None
+
+
+@pytest.mark.asyncio
+async def test_browser_shutdown_sends_browser_close_to_the_owned_loopback_peer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received: list[dict[str, object]] = []
+
+    async def browser(websocket) -> None:
+        received.append(json.loads(await websocket.recv()))
+
+    async with websockets.serve(browser, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        monkeypatch.setattr(
+            browser_runtime,
+            "_read_cdp_browser_websocket_url",
+            lambda requested_port: (
+                f"ws://127.0.0.1:{requested_port}/devtools/browser/browser-id"
+            ),
+        )
+        assert (
+            await browser_runtime._request_browser_shutdown(port, timeout_seconds=1.0) is True
+        )
+
+    assert received == [{"id": 1, "method": "Browser.close"}]
+
+
+@pytest.mark.asyncio
+async def test_browser_shutdown_does_not_follow_a_redirect_to_another_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    foreign_messages: list[str] = []
+
+    async def foreign_browser(websocket) -> None:
+        foreign_messages.append(await websocket.recv())
+
+    async with websockets.serve(foreign_browser, "127.0.0.1", 0) as foreign_server:
+        foreign_port = foreign_server.sockets[0].getsockname()[1]
+
+        async def redirect(_reader, writer) -> None:
+            await _reader.readuntil(b"\r\n\r\n")
+            writer.write(
+                (
+                    "HTTP/1.1 302 Found\r\n"
+                    f"Location: ws://127.0.0.1:{foreign_port}/devtools/browser/foreign\r\n"
+                    "Content-Length: 0\r\n"
+                    "\r\n"
+                ).encode()
+            )
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        redirect_server = await asyncio.start_server(redirect, "127.0.0.1", 0)
+        async with redirect_server:
+            owned_port = redirect_server.sockets[0].getsockname()[1]
+            monkeypatch.setattr(
+                browser_runtime,
+                "_read_cdp_browser_websocket_url",
+                lambda requested_port: (
+                    f"ws://127.0.0.1:{requested_port}/devtools/browser/browser-id"
+                ),
+            )
+            assert (
+                await browser_runtime._request_browser_shutdown(
+                    owned_port,
+                    timeout_seconds=1.0,
+                )
+                is False
+            )
+
+    assert foreign_messages == []
+
+
+@pytest.mark.asyncio
+async def test_browser_shutdown_deadline_bounds_an_unresponsive_peer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received = asyncio.Event()
+    release = asyncio.Event()
+
+    async def browser(websocket) -> None:
+        await websocket.recv()
+        received.set()
+        await release.wait()
+
+    async with websockets.serve(browser, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        monkeypatch.setattr(
+            browser_runtime,
+            "_read_cdp_browser_websocket_url",
+            lambda requested_port: (
+                f"ws://127.0.0.1:{requested_port}/devtools/browser/browser-id"
+            ),
+        )
+        started_at = asyncio.get_running_loop().time()
+        try:
+            assert (
+                await browser_runtime._request_browser_shutdown(
+                    port,
+                    timeout_seconds=0.1,
+                )
+                is True
+            )
+            assert received.is_set()
+            assert asyncio.get_running_loop().time() - started_at < 0.75
+        finally:
+            release.set()
+
+
 @pytest.mark.asyncio
 async def test_start_login_allocates_one_real_isolated_stack_and_is_idempotent(
     tmp_path: Path,
@@ -442,6 +623,88 @@ async def test_lease_loss_stops_stack_before_releasing_profile(tmp_path: Path) -
     assert not _accepts(running.binding.daemon_port)
     assert running.paths.read_state()["state"] == "stopped"
     assert not running.paths.dirty_marker.exists()
+
+
+
+
+@pytest.mark.asyncio
+async def test_stop_requests_orderly_browser_shutdown_before_profile_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allocator = BrowserAccountRuntimeAllocator(_configuration(tmp_path))
+    command, claim, session, identity = _contracts()
+    running = await allocator.start(
+        command=command,
+        claim=claim,
+        session=session,
+        node_identity=identity,
+    )
+    singleton = running.paths.profile_dir / "SingletonLock"
+    singleton.write_text("chromium-owned\n", encoding="utf-8")
+    requested_ports: list[int] = []
+
+    async def orderly_shutdown(port: int) -> bool:
+        requested_ports.append(port)
+        singleton.unlink()
+        return True
+
+    monkeypatch.setattr(
+        "backend.browser_account_runtime._request_browser_shutdown",
+        orderly_shutdown,
+    )
+    await allocator.stop(
+        session_id=session.session_id,
+        node_id=identity.node_id,
+        boot_id=identity.boot_id,
+        epoch=claim.epoch,
+    )
+
+    assert requested_ports == [running.binding.cdp_port]
+    assert running.paths.read_state()["state"] == "stopped"
+    assert not running.paths.dirty_marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_stop_quarantines_a_profile_when_a_foreign_singleton_lock_remains(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allocator = BrowserAccountRuntimeAllocator(_configuration(tmp_path))
+    command, claim, session, identity = _contracts()
+    running = await allocator.start(
+        command=command,
+        claim=claim,
+        session=session,
+        node_identity=identity,
+    )
+    singleton = running.paths.profile_dir / "SingletonLock"
+    singleton.write_text("foreign-or-stale\n", encoding="utf-8")
+
+    async def unavailable_shutdown(_port: int) -> bool:
+        return False
+
+    monkeypatch.setattr(browser_runtime, "_request_browser_shutdown", unavailable_shutdown)
+    with pytest.raises(BrowserRuntimeError, match="profile_locked"):
+        await allocator.stop(
+            session_id=session.session_id,
+            node_id=identity.node_id,
+            boot_id=identity.boot_id,
+            epoch=claim.epoch,
+        )
+
+    assert allocator.active_count() == 1
+    assert singleton.exists()
+    assert running.paths.read_state()["state"] == "quarantined"
+    assert running.paths.dirty_marker.exists()
+
+    singleton.unlink()
+    await allocator.stop(
+        session_id=session.session_id,
+        node_id=identity.node_id,
+        boot_id=identity.boot_id,
+        epoch=claim.epoch,
+    )
+    assert allocator.active_count() == 0
 
 
 def test_missing_trusted_bundle_id_fails_before_process_start(tmp_path: Path) -> None:
