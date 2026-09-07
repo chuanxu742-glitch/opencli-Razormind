@@ -457,6 +457,103 @@ def _portal_binding(route: PortalOwnerRouteV1) -> PortalOuterBindingV1:
     )
 
 
+async def _portal_masked_regions(
+    websocket_url: str,
+    route: PortalOwnerRouteV1,
+) -> list[dict[str, int]]:
+    """Measure sensitive fields in the approved clip without reading their values."""
+
+    regions = await _evaluate_cdp_target(
+        websocket_url,
+        """(() => [...document.querySelectorAll('[data-sensitive-field]')].map((node) => {
+          const rect = node.getBoundingClientRect();
+          return {x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height)};
+        }))()""",
+    )
+    if not isinstance(regions, list):
+        return []
+    allowed = route.region_focus.approved_regions
+    masked: list[dict[str, int]] = []
+    for region in regions[:32]:
+        if not isinstance(region, dict):
+            continue
+        values = {name: region.get(name) for name in ("x", "y", "width", "height")}
+        if not all(isinstance(value, int) for value in values.values()):
+            continue
+        if values["width"] <= 0 or values["height"] <= 0:
+            continue
+        if any(
+            candidate.x <= values["x"]
+            and candidate.y <= values["y"]
+            and values["x"] + values["width"] <= candidate.x + candidate.width
+            and values["y"] + values["height"] <= candidate.y + candidate.height
+            for candidate in allowed
+        ):
+            masked.append(values)
+    return masked
+
+
+async def _apply_guarded_field_input(
+    websocket_url: str,
+    route: PortalOwnerRouteV1,
+    control: PortalControlMessageV1,
+) -> None:
+    """Set transient input only on the current L-approved focused DOM field."""
+
+    payload = control.sensitive_payload
+    if (
+        payload is None
+        or payload.value is None
+        or control.field_ref != route.region_focus.focused_field_ref
+        or not control.field_ref
+    ):
+        raise ValueError("portal field input is outside approved focus")
+    field = control.field_ref.removeprefix("controlled-login-fixture:")
+    if not field or field == control.field_ref:
+        raise ValueError("portal field reference is invalid")
+    expected = {
+        "origin": route.binding.target.origin,
+        "documentId": route.binding.target.document_id,
+        "viewGeneration": route.binding.view_generation,
+        "field": field,
+        "value": payload.value.get_secret_value(),
+    }
+    expression = f"""(async (expected) => {{
+      if (window.location.origin !== expected.origin) return false;
+      const [identityResponse, statusResponse] = await Promise.all([
+        fetch('/identity', {{credentials: 'same-origin', cache: 'no-store'}}),
+        fetch('/auth-status', {{credentials: 'same-origin', cache: 'no-store'}}),
+      ]);
+      if (!identityResponse.ok || !statusResponse.ok) return false;
+      const [identity, status] = await Promise.all([identityResponse.json(), statusResponse.json()]);
+      const evidence = status && status.evidence;
+      if (!evidence ||
+          String(identity.document_generation) !== String(expected.documentId) ||
+          identity.view_generation !== expected.viewGeneration ||
+          String(evidence.document_generation) !== String(expected.documentId) ||
+          evidence.view_generation !== expected.viewGeneration) return false;
+      const matches = [...document.querySelectorAll('[data-sensitive-field]')].filter(
+        (node) => node.getAttribute('data-sensitive-field') === expected.field,
+      );
+      if (matches.length !== 1 || document.activeElement !== matches[0]) return false;
+      const rect = matches[0].getBoundingClientRect();
+      const allowed = {json.dumps([region.model_dump() for region in route.region_focus.approved_regions], separators=(",", ":"))};
+      if (!allowed.some((region) => rect.x >= region.x && rect.y >= region.y &&
+          rect.x + rect.width <= region.x + region.width &&
+          rect.y + rect.height <= region.y + region.height)) return false;
+      matches[0].value = expected.value;
+      matches[0].dispatchEvent(new Event('input', {{bubbles: true}}));
+      matches[0].dispatchEvent(new Event('change', {{bubbles: true}}));
+      return true;
+    }})({json.dumps(expected, separators=(",", ":"))})"""
+    try:
+        accepted = await _evaluate_cdp_target(websocket_url, expression)
+    finally:
+        expected["value"] = ""
+    if accepted is not True:
+        raise ValueError("portal field input target is stale or unfocused")
+
+
 async def capture_portal_frame(
     *,
     websocket_url: str,
@@ -482,6 +579,29 @@ async def capture_portal_frame(
         },
     )
     raw = base64.b64decode(result.get("data", ""), validate=True)
+    masked_regions = await _portal_masked_regions(websocket_url, route)
+    try:
+        from PIL import Image, ImageDraw
+
+        image = Image.open(io.BytesIO(raw))
+        draw = ImageDraw.Draw(image)
+        for masked in masked_regions:
+            draw.rectangle(
+                (
+                    masked["x"] - region.x,
+                    masked["y"] - region.y,
+                    masked["x"] - region.x + masked["width"],
+                    masked["y"] - region.y + masked["height"],
+                ),
+                fill=(0, 0, 0),
+            )
+        projected = io.BytesIO()
+        image.save(projected, format="PNG")
+        raw = projected.getvalue()
+    except ImportError:
+        if masked_regions:
+            raise RuntimeError("portal screenshot masking requires Pillow")
+
     pixel = PortalPixelFrameV1(
         workspace_id=route.binding.account_ref.workspace_id,
         account_id=route.binding.account_ref.account_id,
@@ -494,6 +614,7 @@ async def capture_portal_frame(
         mime_type="image/png",
         expires_at=datetime.now(UTC) + timedelta(seconds=5),
         clip=region,
+        masked_regions=masked_regions,
         byte_length=len(raw),
         frame_bytes=raw,
     )
@@ -539,10 +660,8 @@ async def apply_portal_control(
     if control.kind == "request_view":
         return True
     if control.kind == "field_input":
-        # The fixed account-login pack has no guarded input action. Do not
-        # route a credential through a generic capability or arbitrary CDP
-        # evaluation; a dedicated pack action must prove current focus.
-        raise RuntimeError("guarded portal field input adapter is unavailable")
+        await _apply_guarded_field_input(websocket_url, route, control)
+        return True
     if payload is None:
         raise ValueError("portal control requires transient payload")
     if control.kind == "pointer":

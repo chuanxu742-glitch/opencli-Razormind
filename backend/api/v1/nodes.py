@@ -982,6 +982,23 @@ async def node_ws_endpoint(ws: WebSocket) -> None:
                 ws_agent_manager.resolve_agent_result(msg.get("request_id", ""), msg)
             elif msg_type in {"portal_ready", "portal_error"}:
                 await ws_agent_manager.resolve_portal_ready(agent_url, msg)
+            elif msg_type in {"portal_prepared", "portal_prepare_error"}:
+                ws_agent_manager.resolve_portal_prepared(agent_url, msg)
+            elif msg_type == "login_observation":
+                from backend.schemas.browser_account import LoginObservationV1
+                from backend.services.browser_account_service import apply_login_observation
+
+                observation = LoginObservationV1.model_validate(msg.get("observation"))
+                if observation.node_identity != node_identity:
+                    raise ValueError("login observation node identity is not authenticated")
+                async with AsyncSessionLocal() as db:
+                    await apply_login_observation(
+                        db,
+                        observation.account_ref.workspace_id,
+                        observation.account_ref.account_id,
+                        observation,
+                    )
+                    await db.commit()
             elif msg_type == "ping":
                 await ws.send_json({"type": "pong"})
             else:

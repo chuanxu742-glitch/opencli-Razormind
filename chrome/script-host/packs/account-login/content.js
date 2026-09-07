@@ -267,6 +267,51 @@ async function trustedAuthEvidence(rule, target) {
   };
 }
 
+function focusForForm(rule) {
+  const form = nodesFor(selectorFor(rule, "form"));
+  if (form.length !== 1) return null;
+  const fields = [...form[0].querySelectorAll("[data-sensitive-field]")].filter(
+    (node) => node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement,
+  );
+  const active = document.activeElement;
+  const focused = fields.includes(active) ? active : fields.length === 1 ? fields[0] : null;
+  if (!focused) return null;
+  if (document.activeElement !== focused) focused.focus({ preventScroll: true });
+  const rect = rectFor(focused);
+  const field = focused.getAttribute("data-sensitive-field");
+  if (!rect || !field || !/^[A-Za-z0-9_-]{1,80}$/.test(field)) return null;
+  return {
+    region: rectFor(form[0]),
+    focused_field_ref: `controlled-login-fixture:${field}`,
+  };
+}
+
+function approvedRegionFocus(rule, target) {
+  const { approved, qrNodes } = uniqueQrCandidates(rule);
+  if (qrNodes.length === 1 && approved.length === 1) {
+    const region = rectFor(approved[0]);
+    if (region) {
+      return {
+        target: targetWire(target),
+        view_generation: target.viewGeneration,
+        region_kind: "qr",
+        approved_regions: [region],
+      };
+    }
+  }
+  const form = focusForForm(rule);
+  if (form?.region && form.focused_field_ref) {
+    return {
+      target: targetWire(target),
+      view_generation: target.viewGeneration,
+      region_kind: "form",
+      approved_regions: [form.region],
+      focused_field_ref: form.focused_field_ref,
+    };
+  }
+  return null;
+}
+
 async function observe(message, args, target, rule) {
   if (!(await targetGenerationIsCurrent(target, rule))) return fail("stale_generation");
   if (
@@ -330,6 +375,11 @@ async function observe(message, args, target, rule) {
     errorCode = "auth_required";
   }
 
+  const regionFocus = approvedRegionFocus(rule, target);
+  if (state === "presenting" && regionFocus === null) {
+    state = "unknown";
+    errorCode = "capability_missing";
+  }
   const result = {
     session_id: args.session_id,
     epoch: args.epoch,
@@ -341,6 +391,7 @@ async function observe(message, args, target, rule) {
     evidence_kind: evidenceKind,
     observed_at: new Date().toISOString(),
   };
+  if (regionFocus !== null) result.region_focus = regionFocus;
   if (externalIdentity) result.external_identity = externalIdentity;
   if (errorCode) result.error_code = errorCode;
   return { ok: true, result };

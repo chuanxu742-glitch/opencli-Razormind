@@ -83,9 +83,11 @@ from backend.agent_runtime_dispatch import (
 from backend.browser_account_runtime import (
     BrowserRuntimeError,
     EpochStore,
+    PortalRuntimeRegistration,
     ProfileRuntimePaths,
     RuntimeLeaseAdmission,
     runtime_lease_book,
+    session_portal_registry,
     session_runtime_registry,
 )
 from backend.schemas.browser_account import (
@@ -466,6 +468,7 @@ async def _handle_ws_collect(ws, msg: dict) -> None:
         positional_args=msg.get("positional_args", []),
         format=msg.get("format", "json"),
         mode=msg.get("mode", "bridge"),
+        account_session=msg.get("account_session"),
         execution_id=request_id,
     )
     try:
@@ -500,6 +503,55 @@ class _PortalRuntime:
         self.control_sequence = 0
 
 
+_ACTIVE_PORTAL_RECORDS: dict[str, Any] = {}
+
+
+async def _register_login_portal_runtime(
+    session: SessionEnvelopeV1,
+    *,
+    agent_url: str,
+) -> None:
+    """Bind the login session to the real page RecordSession before portal use."""
+
+    if session.purpose != "login" or session.session_id in _ACTIVE_PORTAL_RECORDS:
+        return
+    owner_endpoint = _CENTRAL_API_URL
+    tunnel_handle = os.environ.get("OPENCLI_PORTAL_TUNNEL_HANDLE", "")
+    tunnel_auth_digest = os.environ.get("OPENCLI_PORTAL_TUNNEL_AUTH_DIGEST", "")
+    if not agent_url.startswith("https://") or not owner_endpoint.startswith("https://"):
+        raise BrowserRuntimeError("portal_registration_invalid", "portal relay endpoints must use TLS")
+    if not tunnel_handle or not tunnel_auth_digest:
+        raise BrowserRuntimeError("portal_registration_invalid", "portal relay registration is unavailable")
+    binding = session_runtime_registry().resolve(
+        session_id=session.session_id,
+        node_id=session.node_id,
+        boot_id=session.node_boot_id,
+        epoch=session.epoch,
+    )
+    from backend.skills.record import start_recording
+
+    record_session = await start_recording(
+        binding.cdp_endpoint,
+        domain=session.target.origin or "controlled-login-fixture",
+        capability="account-login",
+    )
+    registration = PortalRuntimeRegistration(
+        session_id=session.session_id,
+        node_id=session.node_id,
+        boot_id=session.node_boot_id,
+        epoch=session.epoch,
+        agent_url=agent_url,
+        owner_endpoint=owner_endpoint,
+        tunnel_handle=tunnel_handle,
+        tunnel_auth_digest=tunnel_auth_digest,
+        record_session=record_session,
+    )
+    try:
+        session_portal_registry().register(registration)
+    except BaseException:
+        await record_session.stop(status="failed", note="portal registration failed")
+        raise
+    _ACTIVE_PORTAL_RECORDS[session.session_id] = record_session
 _ACTIVE_PORTALS: dict[str, _PortalRuntime] = {}
 _PORTAL_MAX_WIRE_BYTES = 4_200_000
 
@@ -770,6 +822,15 @@ async def _handle_ws_agent_task(
                     "display",
                 }
             }
+            if (
+                runtime_request.command is not None
+                and runtime_request.command.kind.value == "start_login"
+                and runtime_request.session is not None
+            ):
+                await _register_login_portal_runtime(
+                    runtime_request.session,
+                    agent_url=_detect_advertise_url(),
+                )
         except (ValueError, HTTPException) as exc:
             await _send_result(
                 {
@@ -1089,6 +1150,7 @@ class CollectRequest(BaseModel):
     # CDP endpoint override is retained only for legacy anonymous collection.
     cdp_endpoint: str = ""
     execution_id: str = ""
+    account_session: dict[str, Any] | None = None
 class RuntimeClaimRequest(BaseModel):
     command: DurableCommandV1
     claim: NodeClaimV1
@@ -1276,15 +1338,37 @@ async def result_runtime(
 
 
 async def collect(req: CollectRequest) -> dict:
-    cdp_ep = req.cdp_endpoint.strip() or _DEFAULT_CDP
+    cdp_ep = req.cdp_endpoint.strip()
+    if req.account_session is not None:
+        try:
+            account_session = SessionEnvelopeV1.model_validate(req.account_session)
+            identity = _node_identity()
+            if (
+                account_session.node_id != identity.node_id
+                or account_session.node_boot_id != identity.boot_id
+            ):
+                raise ValueError("account session belongs to another node")
+            cdp_ep = session_runtime_registry().resolve(
+                session_id=account_session.session_id,
+                node_id=account_session.node_id,
+                boot_id=account_session.node_boot_id,
+                epoch=account_session.epoch,
+            ).cdp_endpoint
+        except (ValueError, BrowserRuntimeError) as exc:
+            return {
+                "success": False,
+                "items": [],
+                "error": f"capability_missing: account runtime session unavailable ({exc})",
+            }
+    else:
+        cdp_ep = cdp_ep or _DEFAULT_CDP
     if not cdp_ep:
         return {
             "success": False,
             "items": [],
             "error": "capability_missing: server-resolved runtime endpoint required",
         }
-    mode = req.mode
-
+    mode = "cdp" if req.account_session is not None else req.mode
     bin_path = _resolve_bin(mode)
 
     cmd = [bin_path, req.site, req.command]
