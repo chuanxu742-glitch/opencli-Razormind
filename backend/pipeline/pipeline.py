@@ -188,14 +188,33 @@ async def _resolve_account_execution(
     if inputs is None:
         return None
     ref, context = inputs
-    from backend.database import AsyncSessionLocal
-    from backend.services.browser_account_service import resolve_account_session
-    from backend.schemas.browser_account import SessionEnvelopeV1
+    from backend.database import AsyncSessionLocal, commit_session
+    from backend.schemas.browser_account import (
+        SessionEnvelopeV1,
+        SessionResolutionWaitingV1,
+    )
+    from backend.services.browser_account_service import (
+        ensure_execution_session,
+        resolve_account_session,
+    )
 
     async with AsyncSessionLocal() as session:
         resolution = await resolve_account_session(session, ref, context)
     if isinstance(resolution, SessionEnvelopeV1):
         return ref, resolution
+    if (
+        isinstance(resolution, SessionResolutionWaitingV1)
+        and resolution.reason == "capacity_missing"
+    ):
+        # Produce the durable request in its own transaction.  Node execution
+        # must never begin until this transaction has committed.
+        async with AsyncSessionLocal() as session:
+            await ensure_execution_session(session, ref, context)
+            await commit_session(session)
+        async with AsyncSessionLocal() as session:
+            resolution = await resolve_account_session(session, ref, context)
+        if isinstance(resolution, SessionEnvelopeV1):
+            return ref, resolution
     status = getattr(resolution, "status", "blocked")
     code = getattr(resolution, "error_code", None) or getattr(resolution, "reason", None)
     raise RuntimeError(f"account session {status}: {code or 'unavailable'}")
