@@ -239,3 +239,107 @@ export const operateBrowserAccount = (
       },
     )
     .then((response) => response.data.data)
+export interface PortalTicketIssueRequest {
+  contract_version: typeof QRAC2_CONTRACT_VERSION
+  first_entry: 'initial'
+  account_ref: {
+    workspace_id: string
+    account_id: string
+  }
+  session_id: string
+  expected_session_revision: number
+  csrf_token: string
+}
+
+export interface PortalTicketIssued {
+  contract_version: typeof QRAC2_CONTRACT_VERSION
+  status: 'issued'
+  account_ref: PortalTicketIssueRequest['account_ref']
+  session_id: string
+  session_revision: number
+  ticket_id: string
+  ticket: string
+  csrf_token: string
+  issued_at: string
+  expires_at: string
+  hard_expires_at: string
+  http_status: 200
+}
+
+export interface PortalTicketRedeemRequest {
+  contract_version: typeof QRAC2_CONTRACT_VERSION
+  first_entry: 'initial' | 'reconnect'
+  account_ref: PortalTicketIssueRequest['account_ref']
+  session_id: string
+  expected_session_revision: number
+  ticket_id: string
+  ticket: string
+  csrf_token: string
+}
+
+export interface PortalTicketGrant {
+  contract_version: typeof QRAC2_CONTRACT_VERSION
+  status: 'granted'
+  http_status: 200
+  workspace_id: string
+  account_id: string
+  ticket_id: string
+  session_revision: number
+  session_id: string
+  issued_at: string
+  expires_at: string
+  hard_expires_at: string
+  cookie_name: string
+  websocket_path: string
+  cookie_http_only: true
+  cookie_secure: true
+  same_site: 'strict' | 'lax'
+  origin_required: true
+  csrf_bound: true
+}
+
+export const issueBrowserPortalTicket = (
+  workspaceId: string,
+  accountId: string,
+  sessionId: string,
+  expectedSessionRevision: number,
+  csrfToken: string,
+) =>
+  apiClient
+    .post<ApiResponse<PortalTicketIssued>>(
+      `${sessionPath(workspaceId, accountId, sessionId)}/portal-ticket/issue`,
+      {
+        contract_version: QRAC2_CONTRACT_VERSION,
+        first_entry: 'initial',
+        account_ref: { workspace_id: workspaceId, account_id: accountId },
+        session_id: sessionId,
+        expected_session_revision: expectedSessionRevision,
+        csrf_token: csrfToken,
+      } satisfies PortalTicketIssueRequest,
+      {
+        headers: { [REVISION_HEADER]: String(expectedSessionRevision) },
+        withCredentials: true,
+      },
+    )
+    .then((response) => response.data.data)
+
+export const redeemBrowserPortalTicket = (
+  workspaceId: string,
+  accountId: string,
+  sessionId: string,
+  data: Omit<PortalTicketRedeemRequest, 'account_ref' | 'session_id'>,
+) =>
+  apiClient
+    .post<ApiResponse<PortalTicketGrant>>(
+      `${sessionPath(workspaceId, accountId, sessionId)}/portal-ticket/redeem`,
+      {
+        ...data,
+        account_ref: { workspace_id: workspaceId, account_id: accountId },
+        session_id: sessionId,
+      } satisfies PortalTicketRedeemRequest,
+      {
+        headers: { [REVISION_HEADER]: String(data.expected_session_revision) },
+        withCredentials: true,
+      },
+    )
+    .then((response) => response.data.data)
