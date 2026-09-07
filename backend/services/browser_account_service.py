@@ -953,24 +953,99 @@ async def get_portal_session_envelope(
     return node.url.rstrip("/"), envelope, session.revision
 
 
-async def _authenticated_execution_caller(
+def execution_account_ref(
+    parameters: Mapping[str, Any],
+    source_config: Mapping[str, Any] | None,
+) -> AccountRef | None:
+    """Resolve one fixed account reference and reject request/config conflicts."""
+
+    def candidate(values: Mapping[str, Any]) -> AccountRef | None:
+        raw_ref = values.get("account_ref") or values.get("accountRef")
+        account_keys = (
+            "account_id",
+            "accountId",
+            "workspace_id",
+            "workspaceId",
+            "source_binding_revision_id",
+            "sourceBindingRevisionId",
+        )
+        has_flat_ref = any(values.get(key) is not None for key in account_keys)
+        if raw_ref is None and not has_flat_ref:
+            return None
+        if raw_ref is None:
+            raw_ref = {
+                "workspace_id": values.get("workspace_id") or values.get("workspaceId"),
+                "account_id": values.get("account_id") or values.get("accountId"),
+                "source_binding_revision_id": (
+                    values.get("source_binding_revision_id")
+                    or values.get("sourceBindingRevisionId")
+                ),
+            }
+        try:
+            return raw_ref if isinstance(raw_ref, AccountRef) else AccountRef.from_wire(raw_ref)
+        except Exception as exc:
+            raise BrowserAccountError(
+                "invalid_account_ref", "account execution reference is invalid", 422
+            ) from exc
+
+    requested = candidate(parameters)
+    configured = candidate(source_config or {})
+    if requested is None:
+        return configured
+    if configured is None:
+        return requested
+    if (
+        requested.workspace_id != configured.workspace_id
+        or requested.account_id != configured.account_id
+    ):
+        raise BrowserAccountError(
+            BrowserAccountErrorCode.PERMISSION_DENIED,
+            "requested account conflicts with the source account binding",
+            403,
+        )
+    if (
+        requested.source_binding_revision_id is not None
+        and configured.source_binding_revision_id is not None
+        and requested.source_binding_revision_id != configured.source_binding_revision_id
+    ):
+        raise BrowserAccountError(
+            BrowserAccountErrorCode.ACCOUNT_MIGRATION_REQUIRED,
+            "requested source binding revision conflicts with the fixed source binding",
+        )
+    return AccountRef(
+        workspace_id=requested.workspace_id,
+        account_id=requested.account_id,
+        source_binding_revision_id=(
+            requested.source_binding_revision_id
+            or configured.source_binding_revision_id
+        ),
+    )
+
+
+async def _authorized_execution_actor(
     db: AsyncSession,
     workspace_id: str,
-    caller_id: str,
+    actor_user_id: str | None,
 ) -> None:
-    """Require an active workspace member before producing execution work."""
-
+    """Require the persisted task actor to retain execution permission."""
+    if not actor_user_id:
+        raise BrowserAccountError(
+            BrowserAccountErrorCode.PERMISSION_DENIED,
+            "account execution has no authenticated task actor",
+            403,
+        )
     row = await db.scalar(
         select(WorkspaceMembership)
         .join(User, User.id == WorkspaceMembership.user_id)
         .join(Workspace, Workspace.id == WorkspaceMembership.workspace_id)
         .where(
             WorkspaceMembership.workspace_id == workspace_id,
-            or_(User.id == caller_id, User.subject == caller_id),
+            User.id == actor_user_id,
             User.disabled.is_(False),
             Workspace.active.is_(True),
             WorkspaceMembership.role.in_(("admin", "maintainer", "operator")),
         )
+        .limit(1)
     )
     if row is None:
         raise BrowserAccountError(
@@ -984,6 +1059,8 @@ async def ensure_execution_session(
     db: AsyncSession,
     account_ref: AccountRef | Mapping[str, Any],
     execution_context: ExecutionContextV1 | Mapping[str, Any],
+    *,
+    actor_user_id: str | None = None,
 ) -> BrowserLoginSession:
     """Idempotently produce one fixed-account execution session and command.
 
@@ -1017,7 +1094,13 @@ async def ensure_execution_session(
             "execution context account or binding does not match the requested account",
             403,
         )
-    await _authenticated_execution_caller(db, ref.workspace_id, context.caller_id)
+    if context.caller_id != actor_user_id:
+        raise BrowserAccountError(
+            BrowserAccountErrorCode.PERMISSION_DENIED,
+            "execution caller does not match the persisted task actor",
+            403,
+        )
+    await _authorized_execution_actor(db, ref.workspace_id, actor_user_id)
     account = await _account_or_error(
         db, ref.workspace_id, ref.account_id, for_update=True
     )
@@ -1098,6 +1181,7 @@ async def ensure_execution_session(
             BrowserDurableCommand.idempotency_scope == scope,
             BrowserDurableCommand.idempotency_key == idempotency_key,
         )
+        .limit(1)
         .with_for_update()
     )
     if command is not None:
@@ -1122,31 +1206,46 @@ async def ensure_execution_session(
         )
         return session
 
-    existing_sessions = list(
-        (
-            await db.scalars(
-                select(BrowserLoginSession)
-                .where(
-                    BrowserLoginSession.workspace_id == account.workspace_id,
-                    BrowserLoginSession.account_id == account.id,
-                    BrowserLoginSession.purpose == "execution",
-                    BrowserLoginSession.execution_id == context.execution_id,
-                )
-                .order_by(BrowserLoginSession.updated_at.desc(), BrowserLoginSession.id.desc())
-                .with_for_update()
-            )
-        ).all()
+    conflicting_command_id = await db.scalar(
+        select(BrowserDurableCommand.id)
+        .where(
+            BrowserDurableCommand.workspace_id == account.workspace_id,
+            BrowserDurableCommand.account_id == account.id,
+            BrowserDurableCommand.kind == BrowserCommandKind.EXECUTE_REFERENCE.value,
+            BrowserDurableCommand.execution_id == context.execution_id,
+            BrowserDurableCommand.binding_revision_id.is_distinct_from(binding_revision_id),
+        )
+        .limit(1)
     )
-    for session in existing_sessions:
+    if conflicting_command_id is not None:
+        raise BrowserAccountError(
+            BrowserAccountErrorCode.ACCOUNT_MIGRATION_REQUIRED,
+            "execution is already bound to a different source revision",
+        )
+
+    session = await db.scalar(
+        select(BrowserLoginSession)
+        .where(
+            BrowserLoginSession.workspace_id == account.workspace_id,
+            BrowserLoginSession.account_id == account.id,
+            BrowserLoginSession.purpose == "execution",
+            BrowserLoginSession.execution_id == context.execution_id,
+            BrowserLoginSession.status.not_in(_TERMINAL_SESSION_STATUSES),
+        )
+        .order_by(BrowserLoginSession.updated_at.desc(), BrowserLoginSession.id.desc())
+        .limit(1)
+        .with_for_update()
+    )
+    if session is not None:
         if session.command_id is None:
-            if session.status in _TERMINAL_SESSION_STATUSES:
-                continue
-            break
+            raise BrowserAccountError(
+                "scheduler_conflict", "active execution session has no durable command"
+            )
         session_command = await db.get(BrowserDurableCommand, session.command_id)
         if session_command is None:
-            if session.status in _TERMINAL_SESSION_STATUSES:
-                continue
-            break
+            raise BrowserAccountError(
+                "scheduler_conflict", "active execution session command is missing"
+            )
         if (
             session_command.kind != BrowserCommandKind.EXECUTE_REFERENCE.value
             or session_command.execution_id != context.execution_id
@@ -1202,6 +1301,8 @@ async def resolve_account_session(
     db: AsyncSession,
     account_ref: AccountRef | Mapping[str, Any],
     execution_context: ExecutionContextV1 | Mapping[str, Any],
+    *,
+    actor_user_id: str | None = None,
 ) -> SessionResolutionV1:
     """Resolve one fixed account session without acquiring another slot."""
 
@@ -1228,6 +1329,13 @@ async def resolve_account_session(
             "execution context account does not match the requested account",
             403,
         )
+    if context.caller_id != actor_user_id:
+        raise BrowserAccountError(
+            BrowserAccountErrorCode.PERMISSION_DENIED,
+            "execution caller does not match the persisted task actor",
+            403,
+        )
+    await _authorized_execution_actor(db, ref.workspace_id, actor_user_id)
     account = await _account_or_error(db, ref.workspace_id, ref.account_id)
 
     def waiting(reason: str) -> SessionResolutionWaitingV1:
@@ -1280,7 +1388,9 @@ async def resolve_account_session(
         )
         .where(BrowserLoginSession.execution_id == context.execution_id)
     )
-    session = await db.scalar(statement.order_by(BrowserLoginSession.updated_at.desc()))
+    session = await db.scalar(
+        statement.order_by(BrowserLoginSession.updated_at.desc()).limit(1)
+    )
     if session is None:
         return waiting("no execution session has been claimed")
     lease = await _active_lease(db, ref.workspace_id, ref.account_id)
@@ -1925,6 +2035,7 @@ __all__ = [
     "create_browser_account",
     "create_login_session",
     "ensure_execution_session",
+    "execution_account_ref",
     "get_browser_account",
     "get_login_session",
     "get_portal_authorization_batch",
