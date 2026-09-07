@@ -1,5 +1,6 @@
 'use client'
 
+import { useQueryClient } from '@tanstack/react-query'
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 
 import { changeLocalPassword, getCurrentIdentity, getHealth, loginWithPassword } from '@/lib/api/endpoints'
@@ -73,9 +74,21 @@ const DEVELOPMENT_IDENTITY: AuthIdentity = {
   auth_method: 'development',
 }
 
+function isSameIdentityPrincipal(left: AuthIdentity | null, right: AuthIdentity | null): boolean {
+  return (
+    left !== null &&
+    right !== null &&
+    left.subject === right.subject &&
+    left.auth_method === right.auth_method &&
+    left.is_platform_admin === right.is_platform_admin
+  )
+}
+
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [status, setStatus] = useState<AuthStatus>('loading')
   const [identity, setIdentity] = useState<AuthIdentity | null>(null)
+  const identityRef = useRef<AuthIdentity | null>(null)
+  identityRef.current = identity
   const [recoveryError, setRecoveryError] = useState<string | null>(null)
   const [recoveryMode, setRecoveryMode] = useState<'service' | 'incompatible' | null>(null)
   const [recoveryPending, setRecoveryPending] = useState(false)
@@ -93,6 +106,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const recoveryCoordinator = recoveryCoordinatorRef.current
   const oidcEnabled = isOidcConfigured()
   const developmentLoginEnabled = isDevelopmentLoginAllowed()
+  const queryClient = useQueryClient()
+  const cancelAuthQueryCache = useCallback(() => {
+    void queryClient.cancelQueries()
+  }, [queryClient])
+  const clearAuthQueryCache = useCallback(() => {
+    void queryClient.cancelQueries()
+    queryClient.clear()
+  }, [queryClient])
 
   const isRecoveryCurrent = useCallback(
     (epoch: RecoveryEpoch) => mountedRef.current && recoveryCoordinator.isCurrent(epoch),
@@ -113,11 +134,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const acceptIdentityToken = useCallback(
     async (token: string, owner: IdentityTokenOwner, epoch: RecoveryEpoch) => {
+      const previousIdentity = identityRef.current
       requireCurrentRecovery(epoch)
+      cancelAuthQueryCache()
       claimOidcOwnership(owner)
       setRuntimeIdentityToken(token)
       const nextIdentity = await getCurrentIdentity()
       requireCurrentRecovery(epoch)
+      if (!isSameIdentityPrincipal(previousIdentity, nextIdentity)) clearAuthQueryCache()
       claimOidcOwnership(isOidcIdentity(nextIdentity.auth_method) ? 'oidc' : false)
       setIdentity(nextIdentity)
       setStatus('authenticated')
@@ -126,10 +150,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setDevelopmentSession(false)
       return nextIdentity
     },
-    [claimOidcOwnership, requireCurrentRecovery],
+    [cancelAuthQueryCache, claimOidcOwnership, clearAuthQueryCache, requireCurrentRecovery],
   )
 
   const clearLocalIdentity = useCallback(() => {
+    clearAuthQueryCache()
     claimOidcOwnership(false)
     recoveryCoordinator.invalidate()
     clearIdentityToken()
@@ -138,7 +163,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setRecoveryError(null)
     setRecoveryMode(null)
     setStatus('anonymous')
-  }, [claimOidcOwnership, recoveryCoordinator])
+  }, [claimOidcOwnership, clearAuthQueryCache, recoveryCoordinator])
 
   const removeOidcUser = useCallback((): Promise<boolean> => {
     if (oidcRemovalPromiseRef.current) return oidcRemovalPromiseRef.current
@@ -340,10 +365,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         }
         return
       }
-
-      requireCurrentRecovery(epoch)
-      claimOidcOwnership(false)
       if (developmentLoginEnabled && hasDevelopmentSession()) {
+        if (!isSameIdentityPrincipal(identityRef.current, DEVELOPMENT_IDENTITY)) clearAuthQueryCache()
         setRecoveryError(null)
         setRecoveryMode(null)
         setIdentity(DEVELOPMENT_IDENTITY)
@@ -358,6 +381,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     },
     [
       claimOidcOwnership,
+      clearAuthQueryCache,
       developmentLoginEnabled,
       isRecoveryCurrent,
       removeOidcUser,
@@ -504,6 +528,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const enterDevelopmentMode = useCallback(() => {
     if (!developmentLoginEnabled) throw new Error('本地开发模式不可用')
     recoveryCoordinator.beginEpoch()
+    if (!isSameIdentityPrincipal(identityRef.current, DEVELOPMENT_IDENTITY)) clearAuthQueryCache()
     claimOidcOwnership(false)
     clearIdentityToken()
     setDevelopmentSession(true)
@@ -511,7 +536,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setRecoveryError(null)
     setRecoveryMode(null)
     setStatus('authenticated')
-  }, [claimOidcOwnership, developmentLoginEnabled, recoveryCoordinator])
+  }, [claimOidcOwnership, clearAuthQueryCache, developmentLoginEnabled, recoveryCoordinator])
 
   const signOut = useCallback(async () => {
     const manager = getOidcManager()

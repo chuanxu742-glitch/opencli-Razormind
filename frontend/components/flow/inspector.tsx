@@ -20,6 +20,7 @@ import {
 import { driver, type Driver } from "driver.js"
 import "driver.js/dist/driver.css"
 import { useReactFlow } from "@xyflow/react"
+import { useQuery } from "@tanstack/react-query"
 import { Ripple } from "@/components/canvasui/Ripple"
 import { clearParameterDraftEntry, useFlowStore } from "@/lib/flow/store"
 import { portTypesCompatible, wouldCreateCycle } from "@/lib/flow/graph"
@@ -30,6 +31,7 @@ import {
   useSources,
 } from "@/lib/api/hooks"
 import type { SourceBinding, SourceBindingRevision } from "@/lib/api/types"
+import { listBrowserAccounts, type BrowserAccount } from "@/lib/api/browser-accounts"
 import type {
   FieldConfig,
   GeneratedWorkflowEdgeMapping,
@@ -2928,6 +2930,13 @@ function SourceBindingRevisionControls({
   onChange: (patch: Partial<OpenCLISourceSlot>) => void
 }) {
   const selectedBinding = bindings.find((binding) => binding.id === source.sourceBindingId)
+  const accountsQuery = useQuery({
+    queryKey: ["browser-accounts", workspaceId],
+    queryFn: () => listBrowserAccounts(workspaceId as string),
+    enabled: Boolean(workspaceId),
+    staleTime: 5_000,
+  })
+  const accounts = accountsQuery.data?.items ?? []
   const revisionsQuery = useProjectSourceBindingRevisions(
     workspaceId,
     projectId,
@@ -2978,7 +2987,24 @@ function SourceBindingRevisionControls({
           {language === "zh-CN" ? "Project Source Bindings 加载失败。" : "Project Source Bindings failed to load."}
         </p>
       ) : (
-        <div className="grid grid-cols-2 gap-2">
+        <div className="grid gap-2 md:grid-cols-3">
+          <Select
+            value={source.accountId ?? UNBOUND_SOURCE_BINDING_VALUE}
+            disabled={accountsQuery.isLoading}
+            onValueChange={(value) => onChange({ accountId: value == null || value === UNBOUND_SOURCE_BINDING_VALUE ? undefined : value })}
+          >
+            <SelectTrigger aria-label="Browser account" className="h-8 rounded-xs border-ops-line bg-ops-black text-2xs shadow-none focus:ring-0">
+              <SelectValue>
+                {accounts.find((account) => account.id === source.accountId)?.label ?? (language === "zh-CN" ? "未绑定账号" : "Unbound account")}
+              </SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={UNBOUND_SOURCE_BINDING_VALUE}>{language === "zh-CN" ? "未绑定账号" : "Unbound account"}</SelectItem>
+              {accounts.map((account: BrowserAccount) => (
+                <SelectItem key={account.id} value={account.id}>{account.label} · {account.site} · {account.status}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
           <Select
             value={source.sourceBindingId ?? UNBOUND_SOURCE_BINDING_VALUE}
             disabled={loading}
