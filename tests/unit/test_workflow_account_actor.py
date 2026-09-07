@@ -13,6 +13,13 @@ from backend.models.source_binding import (
     SourceLifecycleStatus,
     SourceRevision,
 )
+from backend.models.studio import (
+    StudioProject,
+    StudioWorkflow,
+    StudioWorkflowValidationRun,
+    StudioWorkflowVersion,
+    StudioWorkspace,
+)
 from backend.models.workflow import Project
 from backend.models.workflow_run import WorkflowRun
 from backend.schemas.workflow import CompiledWorkflowNode, WorkflowRunStartRequest
@@ -152,6 +159,68 @@ async def _seed_account_binding(db_session):
     return workspace, user, source, binding, account, revision
 
 
+async def _seed_studio_published_workflow(db_session, *, user_id: str) -> str:
+    graph = _workflow_project(
+        account_id="actor-account",
+        revision_id="actor-binding-r1",
+    )
+    graph["id"] = "actor-studio-workflow"
+    workspace = StudioWorkspace(
+        id="actor-workspace",
+        name="Actor Studio Workspace",
+        slug="actor-studio-workspace",
+    )
+    project = StudioProject(
+        id="actor-studio-project",
+        workspace_id=workspace.id,
+        name="Actor Studio Project",
+        slug="actor-studio-project",
+        created_by_user_id=user_id,
+    )
+    db_session.add_all([workspace, project])
+    await db_session.flush()
+    workflow = StudioWorkflow(
+        id="actor-studio-workflow",
+        project_id=project.id,
+        name="Actor Studio Workflow",
+        current_published_version=1,
+    )
+    db_session.add(workflow)
+    await db_session.flush()
+    project.primary_workflow_id = workflow.id
+    validation = StudioWorkflowValidationRun(
+        id="actor-studio-validation",
+        workflow_id=workflow.id,
+        draft_revision=1,
+        status="completed",
+        valid=True,
+        errors=[],
+        warnings=[],
+        compile_version="workflow-compile.v1",
+        resolved_graph=graph,
+    )
+    db_session.add(validation)
+    await db_session.flush()
+    db_session.add(
+        StudioWorkflowVersion(
+            id="actor-studio-version",
+            workflow_id=workflow.id,
+            version=1,
+            draft_revision=1,
+            graph=graph,
+            compile_version="workflow-compile.v1",
+            validation_run_id=validation.id,
+            published_by_user_id=user_id,
+            reason="Actor regression",
+        )
+    )
+    await db_session.commit()
+    return (
+        "/api/v1/workspaces/actor-workspace/projects/actor-studio-project"
+        "/workflows/actor-studio-workflow"
+    )
+
+
 def _catalog():
     return (
         {
@@ -248,6 +317,8 @@ async def test_workflow_start_api_captures_server_identity(client, db_session, m
     assert row is not None
     assert row.requested_by_user_id == user.id
     assert seen_actors == [user.id]
+    valid_read = await client.get("/api/v1/workflows/runs/actor-api-run")
+    assert valid_read.status_code == 200, valid_read.text
     valid_resume = await client.post(
         "/api/v1/workflows/runs/actor-api-run/source-outputs",
         json={"sourceOutputs": {"source-bbc": [{"title": "continued"}]}},
@@ -286,6 +357,8 @@ async def test_workflow_start_api_captures_server_identity(client, db_session, m
         json={"sourceOutputs": {"source-bbc": [{"title": "forged"}]}},
     )
     assert forged_resume.status_code == 403
+    forged_read = await client.get("/api/v1/workflows/runs/actor-api-run")
+    assert forged_read.status_code == 403
     forged_restart = await client.post(
         "/api/v1/workflows/runs",
         json={
@@ -435,6 +508,159 @@ async def test_account_workflow_rejects_cross_workspace_binding_and_disabled_sou
             request_identity=RequestIdentity(subject=user.subject),
         )
     assert disabled_source.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_account_workflow_authorizes_before_invalid_compile_and_rejects_graph_reuse(
+    db_session, monkeypatch
+):
+    _workspace, user, _source, _binding, account, revision = await _seed_account_binding(db_session)
+    monkeypatch.setattr("backend.workflow.opencli_adapter_nodes._load_opencli_catalog", _catalog)
+    invalid_project = _workflow_project(account_id=account.id, revision_id=revision.id)
+    invalid_project["adapters"] = []
+    invalid_request = WorkflowRunStartRequest.model_validate(
+        {"project": invalid_project, "runId": "invalid-account-run"}
+    )
+
+    with pytest.raises(HTTPException) as unauthorized:
+        await tracer.start_workflow_run(invalid_request, session=db_session)
+    assert unauthorized.value.status_code == 401
+    assert await db_session.get(WorkflowRun, "invalid-account-run") is None
+
+    async def fake_dispatch(_dispatch, _match, *, node, actor_user_id):
+        return [{"title": node.id}], {"success": True, "actor": actor_user_id}
+
+    monkeypatch.setattr(tracer, "_dispatch_opencli_source_to_fleet", fake_dispatch)
+    original_request = WorkflowRunStartRequest.model_validate(
+        {
+            "project": _workflow_project(account_id=account.id, revision_id=revision.id),
+            "runId": "actor-graph-run",
+        }
+    )
+    identity = RequestIdentity(subject=user.subject)
+    await tracer.start_workflow_run(
+        original_request,
+        session=db_session,
+        request_identity=identity,
+    )
+    replacement = original_request.model_copy(deep=True)
+    replacement.project.name = "Caller replacement graph"
+
+    with pytest.raises(HTTPException) as collision:
+        await tracer.start_workflow_run(
+            replacement,
+            session=db_session,
+            request_identity=identity,
+        )
+    assert collision.value.status_code == 409
+    row = await db_session.get(WorkflowRun, "actor-graph-run")
+    assert row is not None
+    assert row.request["project"]["name"] == "Actor workflow"
+
+
+@pytest.mark.asyncio
+async def test_account_run_reads_revalidate_role_source_and_legacy_actor(
+    client, db_session, monkeypatch
+):
+    _workspace, user, source, _binding, account, revision = await _seed_account_binding(db_session)
+
+    async def resolve_identity(_request):
+        return RequestIdentity(subject=user.subject)
+
+    async def fake_dispatch(_dispatch, _match, *, node, actor_user_id):
+        return [{"title": node.id}], {"success": True, "actor": actor_user_id}
+
+    monkeypatch.setattr("backend.workflow.opencli_adapter_nodes._load_opencli_catalog", _catalog)
+    monkeypatch.setattr("backend.api.v1.workflows.get_request_identity", resolve_identity)
+    monkeypatch.setattr(tracer, "_dispatch_opencli_source_to_fleet", fake_dispatch)
+    response = await client.post(
+        "/api/v1/workflows/runs",
+        json={
+            "project": _workflow_project(account_id=account.id, revision_id=revision.id),
+            "runId": "actor-read-run",
+        },
+    )
+    assert response.status_code == 202, response.text
+
+    membership = await db_session.scalar(
+        select(WorkspaceMembership).where(
+            WorkspaceMembership.workspace_id == "actor-workspace",
+            WorkspaceMembership.user_id == user.id,
+        )
+    )
+    assert membership is not None
+    membership.role = WorkspaceRole.VIEWER
+    await db_session.commit()
+    denied_role = await client.get("/api/v1/workflows/runs/actor-read-run")
+    assert denied_role.status_code == 403
+
+    membership.role = WorkspaceRole.OPERATOR
+    source.status = SourceLifecycleStatus.DISABLED
+    await db_session.commit()
+    denied_source = await client.get("/api/v1/workflows/runs/actor-read-run")
+    assert denied_source.status_code == 403
+
+    source.status = SourceLifecycleStatus.ACTIVE
+    row = await db_session.get(WorkflowRun, "actor-read-run")
+    assert row is not None
+    row.requested_by_user_id = None
+    await db_session.commit()
+    denied_legacy = await client.get("/api/v1/workflows/runs/actor-read-run")
+    assert denied_legacy.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_studio_account_runs_revalidate_before_idempotent_reads(
+    client, db_session, monkeypatch
+):
+    _workspace, user, source, _binding, _account, _revision = await _seed_account_binding(
+        db_session
+    )
+    base_url = await _seed_studio_published_workflow(db_session, user_id=user.id)
+
+    async def resolve_identity(_request):
+        return RequestIdentity(subject=user.subject)
+
+    async def fake_dispatch(_dispatch, _match, *, node, actor_user_id):
+        return [{"title": node.id}], {"success": True, "actor": actor_user_id}
+
+    monkeypatch.setattr("backend.workflow.opencli_adapter_nodes._load_opencli_catalog", _catalog)
+    monkeypatch.setattr("backend.api.v1.workflows.get_request_identity", resolve_identity)
+    monkeypatch.setattr(tracer, "_dispatch_opencli_source_to_fleet", fake_dispatch)
+    headers = {"Idempotency-Key": "studio-actor-idempotency"}
+    payload = {"inputs": {"topic": "actor"}, "user": "server-worker"}
+    started = await client.post(f"{base_url}/runs", json=payload, headers=headers)
+    assert started.status_code == 202, started.text
+    run_id = started.json()["data"]["runId"]
+    row = await db_session.get(WorkflowRun, run_id)
+    assert row is not None
+    assert row.requested_by_user_id == user.id
+
+    source.status = SourceLifecycleStatus.DISABLED
+    await db_session.commit()
+    denied_replay = await client.post(f"{base_url}/runs", json=payload, headers=headers)
+    assert denied_replay.status_code == 403
+
+    source.status = SourceLifecycleStatus.ACTIVE
+    await db_session.commit()
+    visible = await client.get(f"{base_url}/runs/{run_id}")
+    assert visible.status_code == 200, visible.text
+
+    membership = await db_session.scalar(
+        select(WorkspaceMembership).where(
+            WorkspaceMembership.workspace_id == "actor-workspace",
+            WorkspaceMembership.user_id == user.id,
+        )
+    )
+    assert membership is not None
+    membership.role = WorkspaceRole.VIEWER
+    await db_session.commit()
+    denied_read = await client.get(f"{base_url}/runs/{run_id}")
+    denied_summary = await client.get(
+        "/api/v1/workspaces/actor-workspace/projects/actor-studio-project/runtime-summary"
+    )
+    assert denied_read.status_code == 403
+    assert denied_summary.status_code == 403
 
 
 @pytest.mark.asyncio

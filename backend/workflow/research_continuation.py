@@ -25,7 +25,10 @@ from backend.schemas.workflow import (
     WorkflowRunTrigger,
 )
 from backend.security.identity import RequestIdentity
-from backend.workflow.opencli_hda_tracer import start_workflow_run
+from backend.workflow.opencli_hda_tracer import (
+    authorize_workflow_project_actor,
+    start_workflow_run,
+)
 
 _MAX_CONTINUATION_ITEMS = 200
 _MAX_LEDGER_ITEMS = 1000
@@ -49,6 +52,14 @@ async def continue_research_workflow_run(
     parent = await _load_run(parent_run_id, session)
     if parent is None:
         return None
+    parent_row = await session.get(WorkflowRun, parent_run_id)
+    assert parent_row is not None
+    await authorize_workflow_project_actor(
+        session,
+        parent[0].project,
+        request_identity=request_identity,
+        requested_by_user_id=parent_row.requested_by_user_id,
+    )
     ledger = await get_research_ledger(parent_run_id, session=session)
     assert ledger is not None
     latest = ledger.entries[-1]
@@ -148,6 +159,21 @@ async def continue_research_workflow_run(
     )
     existing_child = await _load_run(child_run_id, session)
     if existing_child is not None:
+        existing_child_row = await session.get(WorkflowRun, child_run_id)
+        if (
+            existing_child_row is None
+            or existing_child_row.requested_by_user_id != parent_row.requested_by_user_id
+        ):
+            raise ResearchContinuationError(
+                "research_idempotency_conflict",
+                "idempotencyKey collides with another workflow actor.",
+            )
+        await authorize_workflow_project_actor(
+            session,
+            existing_child[0].project,
+            request_identity=request_identity,
+            requested_by_user_id=existing_child_row.requested_by_user_id,
+        )
         existing_context = _dict(existing_child[0].input.payload.get("researchLedger"))
         if existing_context.get("continuationInputHash") != continuation_input_hash:
             raise ResearchContinuationError(
@@ -213,8 +239,6 @@ async def continue_research_workflow_run(
         },
         deep=True,
     )
-    parent_row = await session.get(WorkflowRun, parent_run_id)
-    assert parent_row is not None
     await start_workflow_run(
         child_request,
         session=session,

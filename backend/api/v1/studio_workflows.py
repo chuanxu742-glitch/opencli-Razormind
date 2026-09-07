@@ -39,6 +39,7 @@ from backend.api.v1.studio_schemas import (
 from backend.api.v1.workflows import (
     _account_workflow_identity,
     _account_workflow_run_identity,
+    _account_workflow_runs_identity,
     build_evidence_projection,
     dispatch_materialized_image_jobs,
     get_evidence_batch,
@@ -57,11 +58,6 @@ from backend.models.workflow_run import WorkflowRun
 from backend.schemas import workflow as workflow_schemas
 from backend.schemas.common import ApiResponse, PaginationMeta
 from backend.security.identity import RequestIdentity
-from backend.security.workspace_rbac import (
-    WorkspacePermission,
-    get_workspace_access,
-    require_permission,
-)
 from backend.services.gaojixing_collection_service import (
     GaojixingCollectionConflictError,
     resume_collection,
@@ -76,6 +72,7 @@ from backend.workflow.managed_gaojixing_question_batches import (
     stage_managed_question_batch,
 )
 from backend.workflow.opencli_hda_tracer import (
+    authorize_workflow_project_actor,
     get_workflow_run_checkpoint,
     get_workflow_run_projection,
     list_workflow_run_events,
@@ -231,6 +228,7 @@ async def list_workflows(
 async def get_project_runtime_summary(
     workspace_id: str,
     project_id: str,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse:
     """Summarize persisted workflow runs for one Studio Project."""
@@ -256,14 +254,11 @@ async def get_project_runtime_summary(
     # ponytail: scan compact projection rows here; add maintained counters only
     # when project run volume makes this operator-page query measurable.
     aggregate_rows = list(
-        (
-            await db.execute(
-                select(WorkflowRun.status, WorkflowRun.projection).where(
-                    WorkflowRun.workflow_id.in_(workflow_names)
-                )
-            )
-        ).all()
+        (await db.execute(select(WorkflowRun).where(WorkflowRun.workflow_id.in_(workflow_names))))
+        .scalars()
+        .all()
     )
+    await _account_workflow_runs_identity(db, aggregate_rows, request)
     recent_rows = list(
         (
             await db.execute(
@@ -310,6 +305,7 @@ async def get_project_runtime_summary(
 async def list_project_runtime_logs(
     workspace_id: str,
     project_id: str,
+    request: Request,
     run_status: workflow_schemas.WorkflowRunStatus | None = Query(
         default=None,
         alias="status",
@@ -359,6 +355,7 @@ async def list_project_runtime_logs(
         .scalars()
         .all()
     )
+    await _account_workflow_runs_identity(db, rows, request)
     return ApiResponse.ok(
         [
             _runtime_log(
@@ -512,11 +509,12 @@ async def _start_published_version_run(
 ) -> ApiResponse:
     version_id = version.id
     project = workflow_schemas.WorkflowProject.model_validate(version.graph)
-    requested_by_user_id: str | None = None
-    if request_identity is not None:
-        access = await get_workspace_access(db, workspace_id, request_identity)
-        require_permission(access, WorkspacePermission.RUN_OPERATIONS_AGENTS)
-        requested_by_user_id = access.user_id
+    requested_by_user_id = await authorize_workflow_project_actor(
+        db,
+        project,
+        request_identity=request_identity,
+        expected_workspace_id=workspace_id,
+    )
     resolved_run_id = run_id or _published_run_id(
         workspace_id=workspace_id,
         project_id=project_id,
@@ -608,7 +606,12 @@ async def start_published_workflow_run(
         workflow_id=workflow_id,
     )
     project = workflow_schemas.WorkflowProject.model_validate(version.graph)
-    identity = await _account_workflow_identity(project, request)
+    identity = await _account_workflow_identity(
+        project,
+        request,
+        db,
+        expected_workspace_id=workspace_id,
+    )
     request_id = body.request_id or request_id_header or str(uuid.uuid4())
     idempotency_key = body.idempotency_key or idempotency_header
     return await _start_published_version_run(
@@ -657,7 +660,12 @@ async def start_published_workflow_run_from_question_bank(
         workflow_id=workflow_id,
     )
     project = workflow_schemas.WorkflowProject.model_validate(version.graph)
-    identity = await _account_workflow_identity(project, request_context)
+    identity = await _account_workflow_identity(
+        project,
+        request_context,
+        db,
+        expected_workspace_id=workspace_id,
+    )
     if not accepts_managed_question_batch(project):
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -758,13 +766,14 @@ async def replay_persisted_gaojixing_source_downstream(
         workflow_id=workflow_id,
         run_id=run_id,
     )
-    await _account_workflow_run_identity(db, run_id, request)
+    identity = await _account_workflow_run_identity(db, run_id, request)
     try:
         projection = await replay_downstream_from_persisted_gaojixing_source(
             run_id,
             expected_workflow_id=workflow_id,
             expected_studio_workflow_version_id=version.id,
             session=db,
+            request_identity=identity,
         )
     except ValueError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
@@ -783,6 +792,7 @@ async def get_project_runtime_trace(
     project_id: str,
     workflow_id: str,
     run_id: str,
+    request: Request,
     after_sequence: int | None = Query(default=None, ge=0, alias="afterSequence"),
     limit: int | None = Query(default=None, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
@@ -796,6 +806,7 @@ async def get_project_runtime_trace(
         workflow_id=workflow_id,
         run_id=run_id,
     )
+    await _account_workflow_run_identity(db, run_id, request)
     projection = await get_workflow_run_projection(run_id, session=db)
     checkpoint = await get_workflow_run_checkpoint(run_id, session=db)
     events = await list_workflow_run_events(
@@ -838,6 +849,7 @@ async def get_project_workflow_run_projection(
     project_id: str,
     workflow_id: str,
     run_id: str,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse:
     await _get_project_workflow_run(
@@ -847,6 +859,7 @@ async def get_project_workflow_run_projection(
         workflow_id=workflow_id,
         run_id=run_id,
     )
+    await _account_workflow_run_identity(db, run_id, request)
     projection = await get_workflow_run_projection(run_id, session=db)
     if projection is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Workflow run not found")
@@ -862,6 +875,7 @@ async def list_project_workflow_run_events(
     project_id: str,
     workflow_id: str,
     run_id: str,
+    request: Request,
     after_sequence: int | None = Query(default=None, ge=0, alias="afterSequence"),
     limit: int | None = Query(default=None, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
@@ -873,6 +887,7 @@ async def list_project_workflow_run_events(
         workflow_id=workflow_id,
         run_id=run_id,
     )
+    await _account_workflow_run_identity(db, run_id, request)
     events = await list_workflow_run_events(
         run_id, session=db, after_sequence=after_sequence, limit=limit
     )
@@ -890,6 +905,7 @@ async def list_project_workflow_evidence_batches(
     project_id: str,
     workflow_id: str,
     run_id: str,
+    request: Request,
     node_id: str | None = Query(default=None),
     source_group: str | None = Query(default=None),
     cursor: str | None = Query(default=None),
@@ -903,6 +919,7 @@ async def list_project_workflow_evidence_batches(
         workflow_id=workflow_id,
         run_id=run_id,
     )
+    await _account_workflow_run_identity(db, run_id, request)
     projection = await get_workflow_run_projection(run_id, session=db)
     if projection is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Workflow run not found")
@@ -928,6 +945,7 @@ async def get_project_workflow_evidence_batch(
     project_id: str,
     workflow_id: str,
     run_id: str,
+    request: Request,
     batch_id: str,
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse:
@@ -938,6 +956,7 @@ async def get_project_workflow_evidence_batch(
         workflow_id=workflow_id,
         run_id=run_id,
     )
+    await _account_workflow_run_identity(db, run_id, request)
     projection = await get_workflow_run_projection(run_id, session=db)
     if projection is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Workflow run not found")
@@ -956,6 +975,7 @@ async def get_project_workflow_evidence_projection(
     project_id: str,
     workflow_id: str,
     run_id: str,
+    request: Request,
     node_id: str | None = Query(default=None),
     source_group: str | None = Query(default=None),
     include: str | None = Query(default=None),
@@ -968,6 +988,7 @@ async def get_project_workflow_evidence_projection(
         workflow_id=workflow_id,
         run_id=run_id,
     )
+    await _account_workflow_run_identity(db, run_id, request)
     projection = await get_workflow_run_projection(run_id, session=db)
     if projection is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Workflow run not found")

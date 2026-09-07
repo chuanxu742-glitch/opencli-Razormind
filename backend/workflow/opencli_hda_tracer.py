@@ -397,26 +397,6 @@ class _WorkflowAccountBinding:
     source_binding_id: str | None
 
 
-def workflow_project_has_account_reference(project: WorkflowProject) -> bool:
-    """Return whether the authored graph asks to use a persisted browser account."""
-
-    pending: list[object] = [project.model_dump(mode="json", exclude_none=True)]
-    while pending:
-        value = pending.pop()
-        if isinstance(value, dict):
-            if _read_string(value.get("accountId", value.get("account_id"))) is not None:
-                return True
-            account_ref = value.get("accountRef", value.get("account_ref"))
-            if isinstance(account_ref, dict) and _read_string(
-                account_ref.get("accountId", account_ref.get("account_id"))
-            ):
-                return True
-            pending.extend(value.values())
-        elif isinstance(value, list):
-            pending.extend(value)
-    return False
-
-
 def _account_binding_from_mapping(
     value: dict[str, Any],
 ) -> _WorkflowAccountBinding | None:
@@ -443,6 +423,38 @@ def _account_binding_from_mapping(
     )
     source_binding_id = _read_string(value.get("sourceBindingId", value.get("source_binding_id")))
     return _WorkflowAccountBinding(account_id, revision_id, source_binding_id)
+
+
+def _account_bindings_from_value(value: object) -> list[_WorkflowAccountBinding]:
+    bindings: dict[tuple[str, str | None, str | None], _WorkflowAccountBinding] = {}
+    pending = [value]
+    while pending:
+        candidate = pending.pop()
+        if isinstance(candidate, dict):
+            binding = _account_binding_from_mapping(candidate)
+            if binding is not None:
+                key = (
+                    binding.account_id,
+                    binding.source_binding_revision_id,
+                    binding.source_binding_id,
+                )
+                bindings[key] = binding
+            pending.extend(candidate.values())
+        elif isinstance(candidate, list):
+            pending.extend(candidate)
+    return list(bindings.values())
+
+
+def _workflow_project_account_bindings(
+    project: WorkflowProject,
+) -> list[_WorkflowAccountBinding]:
+    return _account_bindings_from_value(project.model_dump(mode="json", exclude_none=True))
+
+
+def workflow_project_has_account_reference(project: WorkflowProject) -> bool:
+    """Return whether the authored graph asks to use a persisted browser account."""
+
+    return bool(_workflow_project_account_bindings(project))
 
 
 def _workflow_account_bindings(
@@ -541,15 +553,14 @@ async def _validated_account_ref(
     )
 
 
-async def _authorize_account_bound_workflow(
+async def _authorize_account_bindings(
     session: AsyncSession | None,
-    runtime_nodes: list[CompiledWorkflowNode],
+    bindings: list[_WorkflowAccountBinding],
     *,
     request_identity: RequestIdentity | None,
     requested_by_user_id: str | None,
     expected_workspace_id: str | None,
 ) -> str | None:
-    bindings = _workflow_account_bindings(runtime_nodes)
     if not bindings:
         return None
     if session is None:
@@ -573,6 +584,7 @@ async def _authorize_account_bound_workflow(
         WorkspacePermission,
         get_workspace_access,
         require_permission,
+        role_allows,
     )
 
     if request_identity is not None:
@@ -590,25 +602,63 @@ async def _authorize_account_bound_workflow(
             "Bearer token required for account workflow execution",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    authorized_actor = await session.scalar(
-        select(User.id)
-        .join(WorkspaceMembership, WorkspaceMembership.user_id == User.id)
+    actor_role = await session.scalar(
+        select(WorkspaceMembership.role)
+        .join(User, User.id == WorkspaceMembership.user_id)
         .join(Workspace, Workspace.id == WorkspaceMembership.workspace_id)
         .where(
             User.id == requested_by_user_id,
             User.disabled.is_(False),
             WorkspaceMembership.workspace_id == workspace_id,
-            WorkspaceMembership.role.in_(("admin", "maintainer", "operator")),
             Workspace.active.is_(True),
         )
         .limit(1)
     )
-    if authorized_actor is None:
+    if actor_role is None or not role_allows(
+        actor_role,
+        WorkspacePermission.RUN_OPERATIONS_AGENTS,
+    ):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             "Persisted workflow actor no longer has account execution permission",
         )
     return requested_by_user_id
+
+
+async def authorize_workflow_project_actor(
+    session: AsyncSession | None,
+    project: WorkflowProject,
+    *,
+    request_identity: RequestIdentity | None,
+    requested_by_user_id: str | None = None,
+    expected_workspace_id: str | None = None,
+) -> str | None:
+    """Authorize authored account references before compilation or idempotent returns."""
+
+    return await _authorize_account_bindings(
+        session,
+        _workflow_project_account_bindings(project),
+        request_identity=request_identity,
+        requested_by_user_id=requested_by_user_id,
+        expected_workspace_id=expected_workspace_id,
+    )
+
+
+async def _authorize_account_bound_workflow(
+    session: AsyncSession | None,
+    runtime_nodes: list[CompiledWorkflowNode],
+    *,
+    request_identity: RequestIdentity | None,
+    requested_by_user_id: str | None,
+    expected_workspace_id: str | None,
+) -> str | None:
+    return await _authorize_account_bindings(
+        session,
+        _workflow_account_bindings(runtime_nodes),
+        request_identity=request_identity,
+        requested_by_user_id=requested_by_user_id,
+        expected_workspace_id=expected_workspace_id,
+    )
 
 
 async def start_workflow_run(
@@ -631,6 +681,36 @@ async def start_workflow_run(
     started_at = _utcnow()
     replay_source_node_ids = replay_source_node_ids or set()
     prior_events = list(existing_events or [])
+    requested_by_user_id = await authorize_workflow_project_actor(
+        session,
+        body.project,
+        request_identity=request_identity,
+        requested_by_user_id=requested_by_user_id,
+        expected_workspace_id=expected_workspace_id,
+    )
+    if session is not None:
+        existing_run = await session.get(WorkflowRunRow, run_id)
+        if existing_run is not None:
+            if existing_run.requested_by_user_id != requested_by_user_id:
+                raise HTTPException(
+                    status.HTTP_403_FORBIDDEN,
+                    "Workflow actor does not match the persisted run actor",
+                )
+            stored_project = (
+                existing_run.request.get("project")
+                if isinstance(existing_run.request, dict)
+                else None
+            )
+            if stored_project != body.project.model_dump(mode="json"):
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "Workflow run id is already bound to another graph",
+                )
+            if existing_events is None:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "Workflow run id already exists",
+                )
     # Source-level trigger scope selection runs before authoritative compilation
     # so a disconnected, incomplete canvas node cannot block a valid
     # trigger-reachable component. The compiled-runtime selector remains as a
@@ -779,23 +859,15 @@ async def start_workflow_run(
         )
         return projection
 
-    requested_by_user_id = await _authorize_account_bound_workflow(
+    runtime_actor = await _authorize_account_bound_workflow(
         session,
         runtime_nodes,
         request_identity=request_identity,
         requested_by_user_id=requested_by_user_id,
         expected_workspace_id=expected_workspace_id,
     )
-    if session is not None:
-        existing_run = await session.get(WorkflowRunRow, run_id)
-        if (
-            existing_run is not None
-            and existing_run.requested_by_user_id != requested_by_user_id
-        ):
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN,
-                "Workflow actor does not match the persisted run actor",
-            )
+    if runtime_actor is not None:
+        requested_by_user_id = runtime_actor
     runtime_nodes_by_id = {node.id: node for node in runtime_nodes}
     if session is not None:
         queued_projection = _build_projection(
@@ -2458,11 +2530,18 @@ async def replay_downstream_from_persisted_gaojixing_source(
     expected_workflow_id: str,
     expected_studio_workflow_version_id: str,
     session: AsyncSession,
+    request_identity: RequestIdentity | None = None,
 ) -> WorkflowRunProjection:
     """Replay only a completed Gaojixing source's persisted downstream path."""
     source_run = await _load_workflow_run(source_run_id, session=session)
     if source_run is None:
         raise ValueError("Workflow run not found")
+    await authorize_workflow_project_actor(
+        session,
+        source_run.request.project,
+        request_identity=request_identity,
+        requested_by_user_id=source_run.requested_by_user_id,
+    )
     if (
         source_run.projection.status != "completed"
         or source_run.projection.workflowId != expected_workflow_id
@@ -2479,8 +2558,16 @@ async def replay_downstream_from_persisted_gaojixing_source(
             existing_replay.projection.workflowId != expected_workflow_id
             or existing_replay.studio_workflow_version_id != expected_studio_workflow_version_id
             or existing_replay.request.input.sourceId != source_run_id
+            or existing_replay.requested_by_user_id != source_run.requested_by_user_id
+            or existing_replay.request.project != source_run.request.project
         ):
             raise ValueError("Persisted replay identity conflicts with another workflow run")
+        await authorize_workflow_project_actor(
+            session,
+            existing_replay.request.project,
+            request_identity=request_identity,
+            requested_by_user_id=existing_replay.requested_by_user_id,
+        )
         return existing_replay.projection
 
     compiled = compile_workflow_project(source_run.request.project)
@@ -2627,6 +2714,12 @@ async def continue_workflow_run_with_source_outputs(
         )
         if stored is None:
             return None
+        await authorize_workflow_project_actor(
+            session,
+            stored.request.project,
+            request_identity=request_identity,
+            requested_by_user_id=stored.requested_by_user_id,
+        )
 
         if _project_has_governed_gaojixing(stored.request.project):
             return stored.projection
@@ -2702,6 +2795,12 @@ async def resume_gaojixing_workflow_run(
         stored = await _load_workflow_run(run_id, session=session, cache=False)
         if stored is None or not _project_has_governed_gaojixing(stored.request.project):
             return None
+        await authorize_workflow_project_actor(
+            session,
+            stored.request.project,
+            request_identity=None,
+            requested_by_user_id=stored.requested_by_user_id,
+        )
         job = await session.scalar(
             select(GaojixingCollectionRun)
             .where(GaojixingCollectionRun.workflow_run_id == run_id)
@@ -2765,6 +2864,12 @@ async def refresh_gaojixing_workflow_run(
         stored = await _load_workflow_run(run_id, session=session, cache=False)
         if stored is None or not _project_has_governed_gaojixing(stored.request.project):
             return None
+        await authorize_workflow_project_actor(
+            session,
+            stored.request.project,
+            request_identity=None,
+            requested_by_user_id=stored.requested_by_user_id,
+        )
         return await start_workflow_run(
             stored.request.model_copy(
                 update={"runId": run_id, "traceId": stored.projection.traceId},
@@ -2793,20 +2898,19 @@ async def _store_workflow_run(
     stored_events = list(events)
     if session is not None:
         row = await session.get(WorkflowRunRow, run_id)
-        row_exists = row is not None
         if row is None:
             row = WorkflowRunRow(id=run_id)
             session.add(row)
+        elif requested_by_user_id != row.requested_by_user_id:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "Workflow actor does not match the persisted run actor",
+            )
 
         row.workflow_id = projection.workflowId
         row.trace_id = projection.traceId
         row.status = projection.status
         row.valid = projection.valid
-        if row_exists and requested_by_user_id != row.requested_by_user_id:
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN,
-                "Workflow actor does not match the persisted run actor",
-            )
         row.requested_by_user_id = requested_by_user_id
         row.package_node_id = projection.packageNodeId
         row.workflow_version_id = workflow_version_id
@@ -3273,6 +3377,8 @@ async def _resolve_dispatch_account_session(
     revision_id = _read_string(payload.get("source_binding_revision_id"))
     if account_id is None:
         return None
+    if actor_user_id is None:
+        raise RuntimeError("account_execution_actor_required")
     if revision_id is None:
         raise RuntimeError("account_binding_revision_required")
     from backend.database import AsyncSessionLocal
