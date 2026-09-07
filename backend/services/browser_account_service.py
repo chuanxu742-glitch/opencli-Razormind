@@ -972,8 +972,6 @@ async def resolve_account_session(
             return waiting(str(exc))
         return blocked(BrowserAccountErrorCode(exc.code))
     return envelope.model_copy(update={"lease_expires_at": lease.expires_at})
-
-
 @dataclass(frozen=True)
 class PortalAuthorizationSnapshot:
     """One fresh DB-backed authorization row used by an active portal."""
@@ -982,25 +980,22 @@ class PortalAuthorizationSnapshot:
     account_paused: bool
     account_auth_required: bool
     session_purpose: str
+    owner_active: bool
 
 
 async def get_portal_authorization_batch(
     db: AsyncSession,
-    requests: list[tuple[str, str, str, str]],
-) -> dict[tuple[str, str, str, str], PortalAuthorizationSnapshot]:
-    """Read all active portal permissions from one bounded fresh DB snapshot.
-
-    ``requests`` contains ``(workspace_id, account_id, session_id, subject)``.
-    An empty request does no I/O.  Callers must discard the snapshot at its
-    freshness deadline; it is not a cache or a long-lived transaction.
-    """
+    requests: list[tuple[str, str, str, str, str | None]],
+) -> dict[tuple[str, str, str, str, str | None], PortalAuthorizationSnapshot]:
+    """Read all active portal permissions from one bounded fresh DB snapshot."""
 
     if not requests:
         return {}
     now = _now()
     unique_requests = list(dict.fromkeys(requests))
-    conditions = [
-        and_(
+    conditions = []
+    for workspace_id, account_id, session_id, subject, owner_digest in unique_requests:
+        predicates = [
             WorkspaceMembership.workspace_id == workspace_id,
             User.subject == subject,
             BrowserLoginSession.workspace_id == workspace_id,
@@ -1008,9 +1003,17 @@ async def get_portal_authorization_batch(
             BrowserLoginSession.id == session_id,
             BrowserAccount.workspace_id == workspace_id,
             BrowserAccount.id == account_id,
-        )
-        for workspace_id, account_id, session_id, subject in unique_requests
-    ]
+        ]
+        if owner_digest is not None:
+            predicates.extend(
+                (
+                    BrowserPortalOwner.owner_digest == owner_digest,
+                    BrowserPortalOwner.workspace_id == workspace_id,
+                    BrowserPortalOwner.account_id == account_id,
+                    BrowserPortalOwner.session_id == session_id,
+                )
+            )
+        conditions.append(and_(*predicates))
     try:
         async with asyncio.timeout(0.5):
             result = await db.execute(
@@ -1020,6 +1023,7 @@ async def get_portal_authorization_batch(
                     Workspace,
                     BrowserLoginSession,
                     BrowserAccount,
+                    BrowserPortalOwner,
                 )
                 .join(User, User.id == WorkspaceMembership.user_id)
                 .join(Workspace, Workspace.id == WorkspaceMembership.workspace_id)
@@ -1028,7 +1032,7 @@ async def get_portal_authorization_batch(
                     and_(
                         BrowserAccount.workspace_id == Workspace.id,
                         BrowserAccount.id.in_(
-                            [account_id for _, account_id, _, _ in unique_requests]
+                            [account_id for _, account_id, _, _, _ in unique_requests]
                         ),
                     ),
                 )
@@ -1037,6 +1041,14 @@ async def get_portal_authorization_batch(
                     and_(
                         BrowserLoginSession.workspace_id == Workspace.id,
                         BrowserLoginSession.account_id == BrowserAccount.id,
+                    ),
+                )
+                .outerjoin(
+                    BrowserPortalOwner,
+                    and_(
+                        BrowserPortalOwner.workspace_id == BrowserLoginSession.workspace_id,
+                        BrowserPortalOwner.account_id == BrowserLoginSession.account_id,
+                        BrowserPortalOwner.session_id == BrowserLoginSession.id,
                     ),
                 )
                 .where(or_(*conditions))
@@ -1049,9 +1061,17 @@ async def get_portal_authorization_batch(
             503,
         ) from exc
 
-    snapshots: dict[tuple[str, str, str, str], PortalAuthorizationSnapshot] = {}
-    for membership, user, workspace, session, account in rows:
-        key = (workspace.id, account.id, session.id, user.subject)
+    snapshots: dict[
+        tuple[str, str, str, str, str | None], PortalAuthorizationSnapshot
+    ] = {}
+    for membership, user, workspace, session, account, owner in rows:
+        key = (
+            workspace.id,
+            account.id,
+            session.id,
+            user.subject,
+            owner.owner_digest if owner else None,
+        )
         if key not in unique_requests:
             continue
         session_revoked = session.status in _PORTAL_TERMINAL_SESSION_STATUSES or (
@@ -1079,6 +1099,7 @@ async def get_portal_authorization_batch(
             account_paused=bool(account.paused),
             account_auth_required=bool(account.auth_required),
             session_purpose=session.purpose,
+            owner_active=bool(owner is not None and owner.active and owner.revoked_at is None),
         )
     return snapshots
 
@@ -1093,10 +1114,9 @@ async def get_portal_authorization_facts(
 ) -> PortalAuthorizationFactsV1:
     """Read one portal authorization fact through the same batch path."""
 
-    key = (workspace_id, account_id, session_id, subject)
+    key = (workspace_id, account_id, session_id, subject, None)
     snapshot = (await get_portal_authorization_batch(db, [key])).get(key)
     if snapshot is None:
-        # Preserve the historical 404/403-neutral behavior for missing scope.
         raise BrowserAccountError(
             BrowserAccountErrorCode.PERMISSION_DENIED,
             "portal authorization could not be confirmed",

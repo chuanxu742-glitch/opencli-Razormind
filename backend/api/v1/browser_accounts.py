@@ -608,14 +608,14 @@ def _as_utc(value: datetime) -> datetime:
 
 
 _ACTIVE_PORTAL_SOCKETS: dict[
-    tuple[str, str, str, str],
+    tuple[str, str, str, str, str],
     dict[str, object],
 ] = {}
 _PORTAL_AUTHORIZATION_TASK: asyncio.Task[None] | None = None
 
 
 async def _close_portal_socket(
-    key: tuple[str, str, str, str],
+    key: tuple[str, str, str, str, str],
     state: dict[str, object],
     *,
     reason: str,
@@ -635,9 +635,18 @@ async def _portal_authorization_monitor() -> None:
     global _PORTAL_AUTHORIZATION_TASK
     try:
         while _ACTIVE_PORTAL_SOCKETS:
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(0.1)
             entries = list(_ACTIVE_PORTAL_SOCKETS.items())
-            requests = [key for key, _ in entries]
+            requests = [
+                (
+                    key[0],
+                    key[1],
+                    key[2],
+                    str(state["subject"]),
+                    str(state["owner_digest"]),
+                )
+                for key, state in entries
+            ]
             try:
                 async with AsyncSessionLocal() as db:
                     snapshots = await browser_account_service.get_portal_authorization_batch(
@@ -654,14 +663,22 @@ async def _portal_authorization_monitor() -> None:
             for key, state in entries:
                 if _ACTIVE_PORTAL_SOCKETS.get(key) is not state:
                     continue
-                snapshot = snapshots.get(key)
+                snapshot = snapshots.get(
+                    (
+                        key[0],
+                        key[1],
+                        key[2],
+                        str(state["subject"]),
+                        str(state["owner_digest"]),
+                    )
+                )
                 owner_expires_at = state["owner_expires_at"]
                 owner_hard_expires_at = state["owner_hard_expires_at"]
                 if (
                     snapshot is None
                     or checked_at >= snapshot.facts.freshness_deadline
                     or not snapshot.facts.membership_exists
-                    or snapshot.facts.role not in {"admin", "maintainer", "operator"}
+                    or not snapshot.owner_active
                     or snapshot.facts.user_disabled
                     or not snapshot.facts.workspace_active
                     or snapshot.facts.session_revoked
@@ -815,9 +832,11 @@ async def account_portal_websocket(
         await websocket.close(code=4403, reason="Portal owner credential is invalid")
         return
     await websocket.accept()
-    key = (workspace_id, account_id, session_id, owner.subject)
+    key = (workspace_id, account_id, session_id, owner.subject, secrets.token_urlsafe(12))
     state: dict[str, object] = {
         "websocket": websocket,
+        "subject": owner.subject,
+        "owner_digest": digest,
         "owner_expires_at": _as_utc(owner.expires_at),
         "owner_hard_expires_at": _as_utc(owner.hard_expires_at),
         "session_revision": session.revision,
