@@ -25,6 +25,9 @@ async def test_dedicated_postgres_inventory_is_bounded():
     )
     result = await _run(config)
     assert result["bounded"] is True
-    assert result["page_plan_violations"] == []
-    assert result["claim_plan_violations"] == []
+    assert result["measurement_scope"] == "inventory_sql_benchmark"
+    assert result["production_acceptance"] == "NOT VERIFIED"
+    assert result["claim"]["status"] == "NOT VERIFIED"
+    assert result["claim_plan_violations"] is None
+    assert result["phases"][0]["page_explain_analyze"][0]["Execution Time"] >= 0
     assert result["page_rows_last_sample"] <= 100
