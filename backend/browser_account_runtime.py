@@ -3322,37 +3322,95 @@ def _read_cdp_browser_version(port: int) -> str | None:
 
 
 def _read_cdp_browser_websocket_url(port: int) -> str | None:
+    if not 1 <= port <= 65_535:
+        return None
+    version_url = f"http://127.0.0.1:{port}/json/version"
     try:
-        with urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1.0) as response:
-            if response.status != 200:
+        with urlopen(version_url, timeout=1.0) as response:
+            if response.status != 200 or response.geturl() != version_url:
                 return None
             payload = json.loads(response.read(65_536))
     except (OSError, ValueError):
         return None
     websocket_url = payload.get("webSocketDebuggerUrl") if isinstance(payload, dict) else None
-    if not isinstance(websocket_url, str) or not websocket_url.startswith(("ws://", "wss://")):
+    if not isinstance(websocket_url, str):
         return None
-    return websocket_url
+    try:
+        parsed = urlparse(websocket_url)
+        websocket_port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "ws"
+        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or websocket_port != port
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or not parsed.path.startswith("/devtools/browser/")
+        or parsed.path == "/devtools/browser/"
+    ):
+        return None
+    # Never retain authority supplied by the discovery document.  Chromium is
+    # owned only through the allocator's exact IPv4 loopback binding.
+    return f"ws://127.0.0.1:{port}{parsed.path}"
 
 
-async def _request_browser_shutdown(port: int) -> bool:
-    """Request Chromium's orderly shutdown before the process tree is terminated."""
-    websocket_url = await asyncio.to_thread(_read_cdp_browser_websocket_url, port)
+async def _request_browser_shutdown(port: int, *, timeout_seconds: float = 3.0) -> bool:
+    """Request Chromium's orderly shutdown within a bounded grace period."""
+
+    if timeout_seconds <= 0:
+        return False
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    try:
+        websocket_url = await asyncio.wait_for(
+            asyncio.to_thread(_read_cdp_browser_websocket_url, port),
+            timeout=min(1.0, timeout_seconds),
+        )
+    except TimeoutError:
+        return False
     if websocket_url is None:
         return False
+
     try:
         import websockets
-
-        async with websockets.connect(websocket_url, open_timeout=5, close_timeout=5) as websocket:
-            await websocket.send(json.dumps({"id": 1, "method": "Browser.close"}))
-            try:
-                await asyncio.wait_for(websocket.recv(), timeout=5)
-            except (asyncio.TimeoutError, EOFError, OSError):
-                # Browser.close commonly closes the socket before replying.
-                pass
-    except Exception:
+        from websockets.exceptions import WebSocketException
+    except ImportError:
         return False
-    return True
+
+    request_sent = False
+    try:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return False
+        async with asyncio.timeout(remaining):
+            async with websockets.connect(
+                websocket_url,
+                open_timeout=remaining,
+                close_timeout=min(1.0, remaining),
+                ping_interval=None,
+                max_size=65_536,
+                proxy=None,
+            ) as websocket:
+                peer = websocket.remote_address
+                if (
+                    not isinstance(peer, tuple)
+                    or len(peer) < 2
+                    or peer[0] != "127.0.0.1"
+                    or peer[1] != port
+                ):
+                    return False
+                await websocket.send(json.dumps({"id": 1, "method": "Browser.close"}))
+                request_sent = True
+                # A successful Browser.close normally closes the connection.
+                # If Chromium replies but remains up, retain the rest of the
+                # bounded grace period before the supervisor sends SIGTERM.
+                while True:
+                    await websocket.recv()
+    except (TimeoutError, EOFError, OSError, WebSocketException):
+        return request_sent
 
 
 _ACCOUNT_RUNTIME_ALLOCATOR: BrowserAccountRuntimeAllocator | None = None
