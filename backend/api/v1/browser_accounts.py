@@ -4,19 +4,36 @@ from __future__ import annotations
 
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    WebSocket,
+    status,
+)
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.database import get_db
 from backend.models.browser import BrowserAccountStatus
 from backend.schemas.browser_account import (
+    AccountRef,
     BrowserAccountCreate,
+    BrowserAccountListV1,
     BrowserAccountRead,
+    BrowserAccountRevisionPreconditionV1,
     BrowserAccountUpdate,
     BrowserLoginSessionRead,
     ExternalIdentityV1,
     PortalAuthorizationFactsV1,
+    PortalEntryResponseV1,
+    PortalTicketIssueRequestV1,
+    PortalTicketIssuedV1,
+    PortalTicketRedeemRequestV1,
 )
 from backend.schemas.common import ApiResponse
 from backend.security.identity import RequestIdentity, get_request_identity
@@ -61,7 +78,7 @@ class LoginSessionConfirm(BaseModel):
 class LoginSessionClose(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    reason: Literal["completed", "cancelled", "expired", "error"] = "cancelled"
+    expected_revision: int | None = Field(default=None, ge=0)
 
 
 class AccountControlRequest(BaseModel):
@@ -93,10 +110,29 @@ def _session_read(session: object) -> BrowserLoginSessionRead:
 def _require_operator_or_manager(access: WorkspaceAccess) -> None:
     role = getattr(access.role, "value", access.role)
     if role not in {"admin", "maintainer", "operator"}:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Browser account operation permission required")
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Browser account operation permission required",
+        )
 
 
-@router.get("", response_model=ApiResponse[list[BrowserAccountRead]])
+def _effective_revision(
+    if_match: str | None,
+    body_revision: int | None,
+) -> int | None:
+    try:
+        return BrowserAccountRevisionPreconditionV1(
+            if_match=if_match,
+            body_revision=body_revision,
+        ).effective_revision
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, "revision precondition is invalid") from exc
+
+
+def _account_ref(workspace_id: str, account_id: str) -> AccountRef:
+    return AccountRef(workspace_id=workspace_id, account_id=account_id)
+
+@router.get("", response_model=ApiResponse[BrowserAccountListV1])
 async def list_browser_accounts(
     workspace_id: str,
     response: Response,
@@ -121,7 +157,12 @@ async def list_browser_accounts(
         raise _http_error(exc) from exc
     if next_cursor:
         response.headers["X-Next-Cursor"] = next_cursor
-    return ApiResponse.ok([_account_read(account) for account in accounts])
+    return ApiResponse.ok(
+        BrowserAccountListV1(
+            items=[_account_read(account) for account in accounts],
+            next_cursor=next_cursor,
+        )
+    )
 
 
 @router.post("", response_model=ApiResponse[BrowserAccountRead], status_code=status.HTTP_201_CREATED)
@@ -161,14 +202,20 @@ async def update_browser_account(
     workspace_id: str,
     account_id: str,
     body: BrowserAccountUpdate,
+    if_match: str | None = Header(default=None, alias="If-Match"),
     identity: RequestIdentity = Depends(get_request_identity),
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse:
     access = await get_workspace_access(db, workspace_id, identity)
     require_permission(access, WorkspacePermission.MANAGE_CONFIGURATION)
+    revision = _effective_revision(if_match, body.expected_revision)
+    assert revision is not None
     try:
         account = await browser_account_service.update_browser_account(
-            db, workspace_id, account_id, body, confirmed_by=access.user_id
+            db,
+            workspace_id,
+            account_id,
+            body.model_copy(update={"expected_revision": revision}),
         )
     except browser_account_service.BrowserAccountError as exc:
         raise _http_error(exc) from exc
@@ -180,14 +227,17 @@ async def set_browser_account_auth_required(
     workspace_id: str,
     account_id: str,
     body: AccountControlRequest,
+    if_match: str | None = Header(default=None, alias="If-Match"),
     identity: RequestIdentity = Depends(get_request_identity),
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse:
     access = await get_workspace_access(db, workspace_id, identity)
     require_permission(access, WorkspacePermission.MANAGE_CONFIGURATION)
+    revision = _effective_revision(if_match, body.expected_revision)
+    assert revision is not None
     try:
         account = await browser_account_service.mark_auth_required(
-            db, workspace_id, account_id, body.expected_revision
+            db, workspace_id, account_id, revision
         )
     except browser_account_service.BrowserAccountError as exc:
         raise _http_error(exc) from exc
@@ -199,14 +249,17 @@ async def suspend_browser_account(
     workspace_id: str,
     account_id: str,
     body: AccountControlRequest,
+    if_match: str | None = Header(default=None, alias="If-Match"),
     identity: RequestIdentity = Depends(get_request_identity),
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse:
     access = await get_workspace_access(db, workspace_id, identity)
     require_permission(access, WorkspacePermission.MANAGE_CONFIGURATION)
+    revision = _effective_revision(if_match, body.expected_revision)
+    assert revision is not None
     try:
         account = await browser_account_service.suspend_browser_account(
-            db, workspace_id, account_id, body.expected_revision
+            db, workspace_id, account_id, revision
         )
     except browser_account_service.BrowserAccountError as exc:
         raise _http_error(exc) from exc
@@ -218,25 +271,30 @@ async def resume_browser_account(
     workspace_id: str,
     account_id: str,
     body: AccountControlRequest,
+    if_match: str | None = Header(default=None, alias="If-Match"),
     identity: RequestIdentity = Depends(get_request_identity),
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse:
     access = await get_workspace_access(db, workspace_id, identity)
     require_permission(access, WorkspacePermission.MANAGE_CONFIGURATION)
+    revision = _effective_revision(if_match, body.expected_revision)
+    assert revision is not None
     try:
         account = await browser_account_service.resume_browser_account(
-            db, workspace_id, account_id, body.expected_revision
+            db, workspace_id, account_id, revision
         )
     except browser_account_service.BrowserAccountError as exc:
         raise _http_error(exc) from exc
     return ApiResponse.ok(_account_read(account))
 
 
-@router.post("/{account_id}/migrate", response_model=ApiResponse[BrowserAccountRead])
+@router.post("/{account_id}/migration", response_model=ApiResponse[BrowserAccountRead])
+@router.post("/{account_id}/migrate", response_model=ApiResponse[BrowserAccountRead], include_in_schema=False)
 async def migrate_browser_account(
     workspace_id: str,
     account_id: str,
     body: AccountMigrationRequest,
+    if_match: str | None = Header(default=None, alias="If-Match"),
     identity: RequestIdentity = Depends(get_request_identity),
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse:
@@ -244,6 +302,8 @@ async def migrate_browser_account(
 
     access = await get_workspace_access(db, workspace_id, identity)
     require_permission(access, WorkspacePermission.MANAGE_CONFIGURATION)
+    revision = _effective_revision(if_match, body.expected_revision)
+    assert revision is not None
     try:
         account = await browser_account_service.queue_account_migration(
             db,
@@ -251,7 +311,7 @@ async def migrate_browser_account(
             account_id,
             target_node_id=body.target_node_id,
             snapshot_ref=body.snapshot_ref,
-            expected_revision=body.expected_revision,
+            expected_revision=revision,
         )
     except browser_account_service.BrowserAccountError as exc:
         raise _http_error(exc) from exc
@@ -322,8 +382,11 @@ async def get_account_login_session(
     return ApiResponse.ok(_session_read(session))
 
 
-@router.post("/{account_id}/login-sessions/{session_id}/takeover", response_model=ApiResponse[BrowserLoginSessionRead])
-async def takeover_account_login_session(
+@router.post(
+    "/{account_id}/login-sessions/{session_id}/view",
+    response_model=ApiResponse[BrowserLoginSessionRead],
+)
+async def view_account_login_session(
     workspace_id: str,
     account_id: str,
     session_id: str,
@@ -333,8 +396,32 @@ async def takeover_account_login_session(
     access = await get_workspace_access(db, workspace_id, identity)
     _require_operator_or_manager(access)
     try:
-        session = await browser_account_service.takeover_login_session(
+        session = await browser_account_service.get_login_session(
             db, workspace_id, account_id, session_id
+        )
+    except browser_account_service.BrowserAccountError as exc:
+        raise _http_error(exc) from exc
+    return ApiResponse.ok(_session_read(session))
+
+
+@router.post(
+    "/{account_id}/login-sessions/{session_id}/takeover",
+    response_model=ApiResponse[BrowserLoginSessionRead],
+)
+async def takeover_account_login_session(
+    workspace_id: str,
+    account_id: str,
+    session_id: str,
+    if_match: str | None = Header(default=None, alias="If-Match"),
+    identity: RequestIdentity = Depends(get_request_identity),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse:
+    access = await get_workspace_access(db, workspace_id, identity)
+    _require_operator_or_manager(access)
+    expected_revision = _effective_revision(if_match, None)
+    try:
+        session = await browser_account_service.takeover_login_session(
+            db, workspace_id, account_id, session_id, expected_revision=expected_revision
         )
     except browser_account_service.BrowserAccountError as exc:
         raise _http_error(exc) from exc
@@ -365,17 +452,28 @@ async def refresh_account_login_session(
     return ApiResponse.ok(_session_read(session))
 
 
-@router.post("/{account_id}/login-sessions/{session_id}/confirm", response_model=ApiResponse[BrowserLoginSessionRead])
+@router.post(
+    "/{account_id}/login-sessions/{session_id}/confirm",
+    response_model=ApiResponse[BrowserLoginSessionRead],
+)
 async def confirm_account_login_session(
     workspace_id: str,
     account_id: str,
     session_id: str,
-    body: LoginSessionConfirm,
+    body: LoginSessionConfirm | None = None,
+    if_match: str | None = Header(default=None, alias="If-Match"),
+    expected_view_generation: int | None = Query(default=None, ge=0),
     identity: RequestIdentity = Depends(get_request_identity),
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse:
     access = await get_workspace_access(db, workspace_id, identity)
     _require_operator_or_manager(access)
+    revision = _effective_revision(if_match, body.expected_revision if body else None)
+    view_generation = (
+        expected_view_generation
+        if expected_view_generation is not None
+        else body.expected_view_generation if body else None
+    )
     try:
         session = await browser_account_service.confirm_login_session(
             db,
@@ -383,29 +481,45 @@ async def confirm_account_login_session(
             account_id,
             session_id,
             confirmed_by=access.user_id,
-            expected_revision=body.expected_revision,
-            expected_view_generation=body.expected_view_generation,
-            platform_identity=body.platform_identity,
+            expected_revision=revision,
+            expected_view_generation=view_generation,
+            platform_identity=body.platform_identity if body else None,
         )
     except browser_account_service.BrowserAccountError as exc:
         raise _http_error(exc) from exc
     return ApiResponse.ok(_session_read(session))
 
 
-@router.post("/{account_id}/login-sessions/{session_id}/close", response_model=ApiResponse[BrowserLoginSessionRead])
+@router.post(
+    "/{account_id}/login-sessions/{session_id}/close",
+    response_model=ApiResponse[BrowserLoginSessionRead],
+)
 async def close_account_login_session(
     workspace_id: str,
     account_id: str,
     session_id: str,
-    body: LoginSessionClose,
+    body: LoginSessionClose | None = None,
+    if_match: str | None = Header(default=None, alias="If-Match"),
+    reason: Literal["completed", "cancelled", "expired", "error"] = Query(
+        default="cancelled"
+    ),
     identity: RequestIdentity = Depends(get_request_identity),
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse:
     access = await get_workspace_access(db, workspace_id, identity)
     _require_operator_or_manager(access)
+    expected_revision = _effective_revision(
+        if_match,
+        body.expected_revision if body else None,
+    )
     try:
         session = await browser_account_service.close_login_session(
-            db, workspace_id, account_id, session_id, reason=body.reason
+            db,
+            workspace_id,
+            account_id,
+            session_id,
+            reason=body.reason if body else reason,
+            expected_revision=expected_revision,
         )
     except browser_account_service.BrowserAccountError as exc:
         raise _http_error(exc) from exc
@@ -432,6 +546,90 @@ async def get_login_authorization_facts(
     except browser_account_service.BrowserAccountError as exc:
         raise _http_error(exc) from exc
     return ApiResponse.ok(facts)
+
+
+def _require_same_origin(request: Request) -> None:
+    origin = request.headers.get("origin")
+    if not origin:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Origin header required")
+    expected = f"{request.url.scheme}://{request.url.netloc}"
+    if origin.rstrip("/") != expected.rstrip("/"):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Origin is not allowed")
+
+
+@router.post(
+    "/{account_id}/login-sessions/{session_id}/portal-ticket/issue",
+    response_model=ApiResponse[PortalTicketIssuedV1],
+)
+async def issue_account_portal_ticket(
+    workspace_id: str,
+    account_id: str,
+    session_id: str,
+    body: PortalTicketIssueRequestV1,
+    request: Request,
+    identity: RequestIdentity = Depends(get_request_identity),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse:
+    _require_same_origin(request)
+    access = await get_workspace_access(db, workspace_id, identity)
+    _require_operator_or_manager(access)
+    if body.account_ref != _account_ref(workspace_id, account_id) or body.session_id != session_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Portal session not found")
+    try:
+        issued = await browser_account_service.issue_portal_ticket(
+            db, body, subject=identity.subject
+        )
+    except browser_account_service.BrowserAccountError as exc:
+        raise _http_error(exc) from exc
+    return ApiResponse.ok(issued)
+
+
+@router.post(
+    "/{account_id}/login-sessions/{session_id}/portal-ticket/redeem",
+    response_model=ApiResponse[PortalEntryResponseV1],
+)
+async def redeem_account_portal_ticket(
+    workspace_id: str,
+    account_id: str,
+    session_id: str,
+    body: PortalTicketRedeemRequestV1,
+    request: Request,
+    identity: RequestIdentity = Depends(get_request_identity),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse:
+    _require_same_origin(request)
+    access = await get_workspace_access(db, workspace_id, identity)
+    _require_operator_or_manager(access)
+    if body.account_ref != _account_ref(workspace_id, account_id) or body.session_id != session_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Portal session not found")
+    try:
+        outcome = await browser_account_service.redeem_portal_ticket(
+            db, body, subject=identity.subject
+        )
+    except browser_account_service.BrowserAccountError as exc:
+        raise _http_error(exc) from exc
+    return ApiResponse.ok(outcome)
+
+
+@router.websocket("/{account_id}/login-sessions/{session_id}/portal")
+async def account_portal_websocket(
+    websocket: WebSocket,
+    workspace_id: str,
+    account_id: str,
+    session_id: str,
+) -> None:
+    """A-owned WS auth gate; R owns the actual transient frame transport."""
+
+    origin = websocket.headers.get("origin")
+    expected = f"{websocket.url.scheme}://{websocket.url.netloc}"
+    cookie = websocket.cookies.get("qrac2_portal")
+    if not cookie or not origin or origin.rstrip("/") != expected.rstrip("/"):
+        await websocket.close(code=4403, reason="Portal origin or cookie authentication failed")
+        return
+    # A persistence-backed cookie verifier must be installed by C/R before
+    # accepting this socket; accepting here would create an unauthenticated
+    # multi-replica transport.
+    await websocket.close(code=4503, reason="Portal persistence verifier unavailable")
 
 
 __all__ = ["router"]
