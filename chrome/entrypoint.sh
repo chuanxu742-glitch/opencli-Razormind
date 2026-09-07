@@ -55,9 +55,18 @@ verify_chromium_policy() {
 
 verify_profile_ready
 verify_chromium_policy
-rm -f /tmp/.X99-lock
-Xvfb :99 -screen 0 1280x900x24 -nolisten tcp &
-export DISPLAY=:99
+RUNTIME_DISPLAY="${DISPLAY:-:99}"
+if [[ ! "$RUNTIME_DISPLAY" =~ ^:[0-9]+$ ]]; then
+  echo "[entrypoint] DISPLAY must be a numeric X display" >&2
+  exit 1
+fi
+DISPLAY_NUMBER="${RUNTIME_DISPLAY#:}"
+if [ -e "/tmp/.X${DISPLAY_NUMBER}-lock" ] || [ -e "/tmp/.X11-unix/X${DISPLAY_NUMBER}" ]; then
+  echo "[entrypoint] requested X display is already owned" >&2
+  exit 1
+fi
+Xvfb "$RUNTIME_DISPLAY" -screen 0 1280x900x24 -nolisten tcp &
+export DISPLAY="$RUNTIME_DISPLAY"
 sleep 1
 
 export CHROME_HOSTNAME="${CHROME_HOSTNAME:-${HOSTNAME:-chrome}}"
@@ -116,15 +125,20 @@ CHROME_BIN="$(node /usr/local/bin/resolve-browser-executable.mjs "$BROWSER_ENGIN
   echo "[entrypoint] Browser engine resolution failed for $BROWSER_ENGINE" >&2
   exit 1
 }
+CDP_PORT="${OPENCLI_CDP_PORT:-9222}"
+if [[ ! "$CDP_PORT" =~ ^[0-9]+$ ]] || [ "$CDP_PORT" -lt 1024 ] || [ "$CDP_PORT" -gt 65535 ]; then
+  echo "[entrypoint] OPENCLI_CDP_PORT is invalid" >&2
+  exit 1
+fi
 echo "[entrypoint] Browser engine: $BROWSER_ENGINE"
 CHROME_SESSION_MODE=false
 if command -v setsid >/dev/null 2>&1; then CHROME_SESSION_MODE=true; fi
 start_chrome() {
   verify_profile_ready
   if [ "$CHROME_SESSION_MODE" = "true" ]; then
-    exec setsid "$CHROME_BIN" --remote-debugging-port=9222 --remote-debugging-address=0.0.0.0 --remote-allow-origins='*' --no-sandbox --disable-dev-shm-usage --disable-save-password-bubble --user-data-dir="$PROFILE_DIR" --window-size=1280,900 "${CHROME_EXTRA_FLAGS[@]}" "$@"
+    exec setsid "$CHROME_BIN" --remote-debugging-port="$CDP_PORT" --remote-debugging-address=127.0.0.1 --remote-allow-origins='*' --no-sandbox --disable-dev-shm-usage --disable-save-password-bubble --user-data-dir="$PROFILE_DIR" --window-size=1280,900 "${CHROME_EXTRA_FLAGS[@]}" "$@"
   else
-    exec "$CHROME_BIN" --remote-debugging-port=9222 --remote-debugging-address=0.0.0.0 --remote-allow-origins='*' --no-sandbox --disable-dev-shm-usage --disable-save-password-bubble --user-data-dir="$PROFILE_DIR" --window-size=1280,900 "${CHROME_EXTRA_FLAGS[@]}" "$@"
+    exec "$CHROME_BIN" --remote-debugging-port="$CDP_PORT" --remote-debugging-address=127.0.0.1 --remote-allow-origins='*' --no-sandbox --disable-dev-shm-usage --disable-save-password-bubble --user-data-dir="$PROFILE_DIR" --window-size=1280,900 "${CHROME_EXTRA_FLAGS[@]}" "$@"
   fi
 }
 stop_chrome_tree() {
@@ -146,12 +160,12 @@ stop_chrome_tree() {
 
 run_runtime_self_check() {
   for _ in $(seq 1 30); do
-    if curl -sf http://localhost:9222/json/version >/dev/null 2>&1; then
-      EXTENSION_WORKERS="$(curl -sf http://localhost:9222/json/list | node -e 'let data=""; process.stdin.on("data",(chunk)=>data+=chunk); process.stdin.on("end",()=>{const targets=JSON.parse(data); process.stdout.write(String(targets.filter((target)=>target.type==="service_worker"&&target.url.startsWith("chrome-extension://")).length));});')"
-      if [ "$EXTENSION_WORKERS" -ge "${#BUNDLE_EXTENSION_DIRS[@]}" ] && { [ -z "$SCRIPT_HOST_VERSION" ] || node /usr/local/bin/ensure-script-host.mjs http://localhost:9222 >/dev/null; }; then
+    if curl -sf "http://127.0.0.1:${CDP_PORT}/json/version" >/dev/null 2>&1; then
+      EXTENSION_WORKERS="$(curl -sf "http://127.0.0.1:${CDP_PORT}/json/list" | node -e 'let data=""; process.stdin.on("data",(chunk)=>data+=chunk); process.stdin.on("end",()=>{const targets=JSON.parse(data); process.stdout.write(String(targets.filter((target)=>target.type==="service_worker"&&target.url.startsWith("chrome-extension://")).length));});')"
+      if [ "$EXTENSION_WORKERS" -ge "${#BUNDLE_EXTENSION_DIRS[@]}" ] && { [ -z "$SCRIPT_HOST_VERSION" ] || node /usr/local/bin/ensure-script-host.mjs "http://127.0.0.1:${CDP_PORT}" >/dev/null; }; then
         READY_RUNTIME_REPORT="$BUNDLE_RUNTIME_REPORT"
         if [ -n "$VIOLENTMONKEY_VERSION" ]; then
-          USER_SCRIPTS_ACCESS_CHECK="$(node /usr/local/bin/ensure-violentmonkey-userscripts-access.mjs http://localhost:9222 "$VIOLENTMONKEY_VERSION")" || { sleep 1; continue; }
+          USER_SCRIPTS_ACCESS_CHECK="$(node /usr/local/bin/ensure-violentmonkey-userscripts-access.mjs "http://127.0.0.1:${CDP_PORT}" "$VIOLENTMONKEY_VERSION")" || { sleep 1; continue; }
           READY_RUNTIME_REPORT="$(node -e 'const report=JSON.parse(process.argv[1]); const check=JSON.parse(process.argv[2]); report.self_check={...report.self_check,violentmonkey_user_scripts_access:check}; process.stdout.write(JSON.stringify(report));' "$BUNDLE_RUNTIME_REPORT" "$USER_SCRIPTS_ACCESS_CHECK")"
         fi
         printf '%s\n' "$READY_RUNTIME_REPORT" > /tmp/browser-runtime-report.json

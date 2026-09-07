@@ -28,6 +28,7 @@ from backend.browser_account_runtime import (
 from backend.schemas.browser_account import (
     CommandExecutionGuardV1,
     DurableCommandV1,
+    LoginObservationV1,
     NodeClaimV1,
     NodeIdentityV1,
     PortalControlMessageV1,
@@ -120,7 +121,9 @@ def resolve_account_runtime_context(req: RuntimeInvokeRequest) -> AccountRuntime
         req.node_identity.node_id != guard.claim.node_id
         or req.node_identity.boot_id != guard.claim.boot_id
     ):
-        raise HTTPException(status_code=401, detail="authenticated node identity does not own claim")
+        raise HTTPException(
+            status_code=401, detail="authenticated node identity does not own claim"
+        )
     forbidden = {
         "remote",
         "binary",
@@ -134,6 +137,7 @@ def resolve_account_runtime_context(req: RuntimeInvokeRequest) -> AccountRuntime
     }
     if forbidden.intersection(req.config):
         raise HTTPException(status_code=400, detail="client runtime routing override is forbidden")
+    return AccountRuntimeContext(guard=guard, binding=binding)
 
 
 async def prepare_portal_route(
@@ -145,7 +149,11 @@ async def prepare_portal_route(
 ) -> PortalOwnerRouteV1:
     """Resolve one live edge page, RecordSession and L-approved focus into a route."""
 
-    if isinstance(session_revision, bool) or not isinstance(session_revision, int) or session_revision < 0:
+    if (
+        isinstance(session_revision, bool)
+        or not isinstance(session_revision, int)
+        or session_revision < 0
+    ):
         raise ValueError("portal route requires an authorized session revision")
     if not 0 < timeout <= 30:
         raise ValueError("portal route timeout must be between zero and thirty seconds")
@@ -178,9 +186,8 @@ async def prepare_portal_route(
         input={
             "session_id": session_envelope.session_id,
             "epoch": session_envelope.epoch,
-            "target": target.model_dump(mode="json") | {
-                "view_generation": session_envelope.view_generation
-            },
+            "target": target.model_dump(mode="json")
+            | {"view_generation": session_envelope.view_generation},
         },
         config={
             "pack": "account-login",
@@ -189,9 +196,16 @@ async def prepare_portal_route(
         },
     )
     try:
-        observation_response = await asyncio.wait_for(
+        observation_outer = await asyncio.wait_for(
             invoke_script_host(request, cdp_endpoint=runtime.cdp_endpoint),
             timeout=timeout,
+        )
+        observation_response = (
+            observation_outer.get("result")
+            if isinstance(observation_outer, dict)
+            and isinstance(observation_outer.get("result"), dict)
+            and "ok" in observation_outer["result"]
+            else observation_outer
         )
     except TimeoutError as exc:
         raise RuntimeError("login observe timed out") from exc
@@ -213,10 +227,7 @@ async def prepare_portal_route(
         focus = PortalRegionFocusV1.model_validate(observation.get("region_focus"))
     except ValueError as exc:
         raise RuntimeError("login observe returned no approved portal focus") from exc
-    if (
-        focus.target != target
-        or focus.view_generation != session_envelope.view_generation
-    ):
+    if focus.target != target or focus.view_generation != session_envelope.view_generation:
         raise RuntimeError("login observe focus lineage changed")
 
     binding = SensitiveSessionBindingV1(
@@ -252,6 +263,7 @@ async def prepare_portal_route(
         max_frame_bytes=4_000_000,
         max_input_bytes=4_096,
     )
+
 
 async def snapshot_tab_ids(cdp_endpoint: str) -> set[str]:
     """Return the set of tab IDs currently open in Chrome."""
@@ -309,6 +321,8 @@ def parse_output(raw: str, fmt: str) -> list[dict]:
     if fmt == "csv":
         return list(csv.DictReader(io.StringIO(raw.strip())))
     return [{"content": raw}]
+
+
 async def _cdp_command(
     websocket_url: str,
     method: str,
@@ -318,9 +332,7 @@ async def _cdp_command(
     import websockets
 
     async with websockets.connect(websocket_url, open_timeout=5) as websocket:
-        await websocket.send(
-            json.dumps({"id": 1, "method": method, "params": params or {}})
-        )
+        await websocket.send(json.dumps({"id": 1, "method": method, "params": params or {}}))
         while True:
             message = json.loads(await asyncio.wait_for(websocket.recv(), timeout=30))
             if message.get("id") != 1:
@@ -413,6 +425,203 @@ async def invoke_script_host(req: RuntimeInvokeRequest, *, cdp_endpoint: str) ->
     raise HTTPException(status_code=503, detail="OpenCLI Script Host target is unavailable")
 
 
+async def observe_login_runtime(
+    *,
+    cdp_endpoint: str,
+    session: SessionEnvelopeV1,
+    claim: NodeClaimV1,
+    node_identity: NodeIdentityV1,
+    expected_origin: str,
+) -> LoginObservationV1:
+    """Read one fixed-rule observation from the actual isolated login tab."""
+
+    if session.purpose != "login":
+        raise BrowserRuntimeError(
+            "runtime_command_invalid",
+            "login observation requires a login session",
+        )
+    if session.login_rule_id is None or session.login_rule_version is None:
+        raise BrowserRuntimeError(
+            "login_rule_unknown",
+            "login session has no fixed rule",
+        )
+    target = await _discover_login_target(
+        cdp_endpoint=cdp_endpoint,
+        expected_origin=expected_origin,
+    )
+    invocation_target = {
+        "tab_id": target["tab_id"],
+        "frame_id": target["frame_id"],
+        "document_id": target["document_id"],
+        "origin": target["origin"],
+        "view_generation": target["view_generation"],
+    }
+    request = RuntimeInvokeRequest(
+        runtime="script-host",
+        workflow="login.observe",
+        input={
+            "session_id": session.session_id,
+            "epoch": session.epoch,
+            "target": invocation_target,
+            "expected_qr_generation": target["qr_generation"],
+        },
+        config={
+            "pack": "account-login",
+            "action": "login.observe",
+            "tab_id": target["tab_id"],
+        },
+    )
+    outer = await invoke_script_host(request, cdp_endpoint=cdp_endpoint)
+    response = outer.get("result") if isinstance(outer, dict) else None
+    if not isinstance(response, dict) or response.get("ok") is not True:
+        raise BrowserRuntimeError(
+            "login_observation_unavailable",
+            "fixed login rule did not produce an observation",
+        )
+    observed = response.get("result")
+    if not isinstance(observed, dict):
+        raise BrowserRuntimeError(
+            "login_observation_unavailable",
+            "fixed login rule observation is missing",
+        )
+    if (
+        observed.get("session_id") != session.session_id
+        or observed.get("epoch") != session.epoch
+        or observed.get("rule_id") != session.login_rule_id
+        or observed.get("rule_version") != session.login_rule_version
+        or observed.get("target")
+        != {key: invocation_target[key] for key in ("tab_id", "frame_id", "document_id", "origin")}
+        or observed.get("view_generation") != target["view_generation"]
+    ):
+        raise BrowserRuntimeError(
+            "stale_generation",
+            "login observation lineage changed",
+        )
+    try:
+        return LoginObservationV1(
+            claim=claim,
+            node_identity=node_identity,
+            account_ref={
+                "workspace_id": session.workspace_id,
+                "account_id": session.account_id,
+            },
+            session_id=session.session_id,
+            epoch=session.epoch,
+            rule_id=session.login_rule_id,
+            rule_version=session.login_rule_version,
+            target=observed["target"],
+            view_generation=observed["view_generation"],
+            state=observed["state"],
+            evidence_kind=observed["evidence_kind"],
+            external_identity=observed.get("external_identity"),
+            observed_at=observed["observed_at"],
+            error_code=observed.get("error_code"),
+        )
+    except (KeyError, ValueError) as exc:
+        raise BrowserRuntimeError(
+            "login_observation_unavailable",
+            "login observation failed its typed contract",
+        ) from exc
+
+
+async def _discover_login_target(
+    *,
+    cdp_endpoint: str,
+    expected_origin: str,
+) -> dict[str, Any]:
+    """Ask the installed Script Host for one exact tab/document generation."""
+
+    try:
+        parsed_origin = urlparse(expected_origin)
+        if (
+            parsed_origin.scheme not in {"http", "https"}
+            or parsed_origin.path not in {"", "/"}
+            or parsed_origin.query
+            or parsed_origin.fragment
+        ):
+            raise ValueError
+        async with httpx.AsyncClient(timeout=5) as client:
+            response = await client.get(f"{cdp_endpoint.rstrip('/')}/json/list")
+            response.raise_for_status()
+            targets = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise BrowserRuntimeError(
+            "login_observation_unavailable",
+            "isolated Chrome target list is unavailable",
+        ) from exc
+    workers = [
+        item
+        for item in targets
+        if isinstance(item, dict)
+        and item.get("type") in {"service_worker", "page"}
+        and isinstance(item.get("url"), str)
+        and item["url"].startswith("chrome-extension://")
+        and isinstance(item.get("webSocketDebuggerUrl"), str)
+    ]
+    for worker in workers:
+        websocket_url = worker["webSocketDebuggerUrl"]
+        try:
+            manifest_name = await _evaluate_cdp_target(
+                websocket_url,
+                "chrome.runtime.getManifest().name",
+            )
+            if manifest_name != "OpenCLI Script Host":
+                continue
+            expression = f"""
+                (async () => {{
+                  const pack = packs.get("account-login");
+                  if (!pack?.ruleManifest) throw new Error("login rule unavailable");
+                  const tabs = await chrome.tabs.query({{}});
+                  const matches = tabs.filter((tab) => {{
+                    try {{
+                      return new URL(tab.url || "").origin === {json.dumps(expected_origin)};
+                    }} catch {{
+                      return false;
+                    }}
+                  }});
+                  if (matches.length !== 1 || !Number.isInteger(matches[0].id)) {{
+                    throw new Error("login target is ambiguous");
+                  }}
+                  const probe = await chrome.tabs.sendMessage(
+                    matches[0].id,
+                    {{
+                      type: "opencli-script-host.login-target",
+                      pack: pack.id,
+                      version: pack.version,
+                      rule: pack.ruleManifest,
+                    }},
+                    {{ frameId: 0 }},
+                  );
+                  if (!probe?.ok) throw new Error("login target probe failed");
+                  return {{
+                    tab_id: matches[0].id,
+                    frame_id: 0,
+                    document_id: probe.target.documentId,
+                    origin: probe.target.origin,
+                    view_generation: probe.target.viewGeneration,
+                    qr_generation: probe.target.qrGeneration,
+                  }};
+                }})()
+            """
+            result = await _evaluate_cdp_target(websocket_url, expression)
+        except Exception:
+            continue
+        if (
+            isinstance(result, dict)
+            and result.get("origin") == expected_origin
+            and isinstance(result.get("tab_id"), int)
+            and isinstance(result.get("frame_id"), int)
+            and isinstance(result.get("view_generation"), int)
+            and isinstance(result.get("qr_generation"), int)
+            and isinstance(result.get("document_id"), (int, str))
+        ):
+            return result
+    raise BrowserRuntimeError(
+        "login_observation_unavailable",
+        "one exact login tab generation could not be resolved",
+    )
+
+
 async def resolve_portal_target(cdp_endpoint: str, route: PortalOwnerRouteV1) -> str:
     """Resolve the exact live page target; never accept a caller endpoint."""
     target = route.binding.target
@@ -467,7 +676,12 @@ async def _portal_masked_regions(
         websocket_url,
         """(() => [...document.querySelectorAll('[data-sensitive-field]')].map((node) => {
           const rect = node.getBoundingClientRect();
-          return {x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height)};
+          return {
+            x: Math.round(rect.x),
+            y: Math.round(rect.y),
+            width: Math.round(rect.width),
+            height: Math.round(rect.height),
+          };
         }))()""",
     )
     if not isinstance(regions, list):
@@ -518,6 +732,10 @@ async def _apply_guarded_field_input(
         "field": field,
         "value": payload.value.get_secret_value(),
     }
+    allowed_regions = json.dumps(
+        [region.model_dump() for region in route.region_focus.approved_regions],
+        separators=(",", ":"),
+    )
     expression = f"""(async (expected) => {{
       if (window.location.origin !== expected.origin) return false;
       const [identityResponse, statusResponse] = await Promise.all([
@@ -525,7 +743,10 @@ async def _apply_guarded_field_input(
         fetch('/auth-status', {{credentials: 'same-origin', cache: 'no-store'}}),
       ]);
       if (!identityResponse.ok || !statusResponse.ok) return false;
-      const [identity, status] = await Promise.all([identityResponse.json(), statusResponse.json()]);
+      const [identity, status] = await Promise.all([
+        identityResponse.json(),
+        statusResponse.json(),
+      ]);
       const evidence = status && status.evidence;
       if (!evidence ||
           String(identity.document_generation) !== String(expected.documentId) ||
@@ -537,7 +758,7 @@ async def _apply_guarded_field_input(
       );
       if (matches.length !== 1 || document.activeElement !== matches[0]) return false;
       const rect = matches[0].getBoundingClientRect();
-      const allowed = {json.dumps([region.model_dump() for region in route.region_focus.approved_regions], separators=(",", ":"))};
+      const allowed = {allowed_regions};
       if (!allowed.some((region) => rect.x >= region.x && rect.y >= region.y &&
           rect.x + rect.width <= region.x + region.width &&
           rect.y + rect.height <= region.y + region.height)) return false;
@@ -641,8 +862,7 @@ async def capture_portal_frame(
 
 def _point_in_regions(route: PortalOwnerRouteV1, x: int, y: int) -> bool:
     return any(
-        region.x <= x < region.x + region.width
-        and region.y <= y < region.y + region.height
+        region.x <= x < region.x + region.width and region.y <= y < region.y + region.height
         for region in route.region_focus.approved_regions
     )
 
@@ -665,13 +885,23 @@ async def apply_portal_control(
     if payload is None:
         raise ValueError("portal control requires transient payload")
     if control.kind == "pointer":
-        if payload.x is None or payload.y is None or not _point_in_regions(route, payload.x, payload.y):
+        if (
+            payload.x is None
+            or payload.y is None
+            or not _point_in_regions(route, payload.x, payload.y)
+        ):
             raise ValueError("portal pointer is outside approved regions")
         for event_type in ("mousePressed", "mouseReleased"):
             await _cdp_command(
                 websocket_url,
                 "Input.dispatchMouseEvent",
-                {"type": event_type, "x": payload.x, "y": payload.y, "button": "left", "clickCount": 1},
+                {
+                    "type": event_type,
+                    "x": payload.x,
+                    "y": payload.y,
+                    "button": "left",
+                    "clickCount": 1,
+                },
             )
         return True
     if control.kind == "key":
@@ -705,20 +935,29 @@ async def invoke_runtime(
         # client request can carry action arguments but never endpoint/binary
         # selection or BBX remote targets.
         merged_config = dict(server_config)
-        merged_config.update({key: value for key, value in req.config.items() if key not in {
-            "remote",
-            "binary",
-            "cdp_endpoint",
-            "endpoint",
-            "daemon_endpoint",
-            "profile_dir",
-            "home_dir",
-            "cache_dir",
-            "display",
-        }})
+        merged_config.update(
+            {
+                key: value
+                for key, value in req.config.items()
+                if key
+                not in {
+                    "remote",
+                    "binary",
+                    "cdp_endpoint",
+                    "endpoint",
+                    "daemon_endpoint",
+                    "profile_dir",
+                    "home_dir",
+                    "cache_dir",
+                    "display",
+                }
+            }
+        )
         req = req.model_copy(update={"config": merged_config})
     if not cdp_endpoint:
-        raise HTTPException(status_code=503, detail="runtime session has no server-resolved CDP binding")
+        raise HTTPException(
+            status_code=503, detail="runtime session has no server-resolved CDP binding"
+        )
     if req.runtime == "script-host":
         return await invoke_script_host(req, cdp_endpoint=cdp_endpoint)
     try:

@@ -74,6 +74,7 @@ from backend.services.browser_portal_contract import (
     encode_portal_wire_frame,
     validate_portal_frame_binding,
 )
+
 logger = logging.getLogger(__name__)
 
 # agent_url → active WebSocket connection
@@ -81,6 +82,9 @@ _connections: dict[str, WebSocket] = {}
 
 # agent_url → authenticated node identity observed at registration
 _connection_identities: dict[str, NodeIdentityV1] = {}
+
+# agent_url → per-connection tunnel handle and digest issued after node auth
+_connection_tunnels: dict[str, tuple[str, str]] = {}
 
 # request_id → Future awaiting agent result (collect/result path)
 _pending: dict[str, asyncio.Future] = {}
@@ -143,17 +147,14 @@ class PortalTransport:
             pass
 
     async def receive(self, *, timeout: float | None = None) -> PortalWireFrameV1 | None:
-        """Await one validated pixel frame; None means closed or timed out."""
+        """Await one validated frame; timeout raises, None is transport EOF."""
         if self._closed and self._frames.empty():
             return None
-        try:
-            item = (
-                await asyncio.wait_for(self._frames.get(), timeout=timeout)
-                if timeout is not None
-                else await self._frames.get()
-            )
-        except TimeoutError:
-            return None
+        item = (
+            await asyncio.wait_for(self._frames.get(), timeout=timeout)
+            if timeout is not None
+            else await self._frames.get()
+        )
         if item is None:
             return None
         return item
@@ -176,6 +177,7 @@ class PortalTransport:
         else:
             await self.websocket.send(encoded)
         self._sequence = frame.sequence
+
     async def close(self, *, reason: str = "closed") -> None:
         """Explicitly close the transient route and release its buffers."""
         if self._closed:
@@ -199,13 +201,23 @@ def register_connection(
     agent_url: str,
     ws: WebSocket,
     node_identity: NodeIdentityV1 | None = None,
+    *,
+    tunnel_handle: str | None = None,
+    tunnel_auth_digest: str | None = None,
 ) -> None:
     """Record a newly-established WS connection and its node identity."""
+    if bool(tunnel_handle) != bool(tunnel_auth_digest):
+        raise ValueError("portal tunnel binding must include handle and digest")
     _connections[agent_url] = ws
     if node_identity is not None:
         _connection_identities[agent_url] = node_identity
+        if tunnel_handle and tunnel_auth_digest:
+            _connection_tunnels[agent_url] = (tunnel_handle, tunnel_auth_digest)
+        else:
+            _connection_tunnels.pop(agent_url, None)
     else:
         _connection_identities.pop(agent_url, None)
+        _connection_tunnels.pop(agent_url, None)
     logger.info("WS agent connected: %s (total=%d)", agent_url, len(_connections))
 
 
@@ -213,6 +225,7 @@ def unregister_connection(agent_url: str) -> None:
     """Remove a WS connection and fail all its pending futures."""
     _connections.pop(agent_url, None)
     _connection_identities.pop(agent_url, None)
+    _connection_tunnels.pop(agent_url, None)
     for portal_id, transport in tuple(_portal_transports.items()):
         if transport.agent_url == agent_url:
             transport._finish()
@@ -220,21 +233,20 @@ def unregister_connection(agent_url: str) -> None:
             _portal_ready.pop(portal_id, None)
     logger.info("WS agent disconnected: %s (remaining=%d)", agent_url, len(_connections))
 
-
     dead_request_ids = [
-        request_id
-        for request_id, (_, owner) in _agent_task_callbacks.items()
-        if owner == agent_url
+        request_id for request_id, (_, owner) in _agent_task_callbacks.items() if owner == agent_url
     ]
     for request_id in dead_request_ids:
         fut = _pending_agent_tasks.get(request_id)
         if fut is not None and not fut.done():
-            fut.set_result({
-                "type": "error",
-                "task_id": request_id,
-                "message": f"WS agent {agent_url!r} disconnected before task completed",
-                "error_type": "AgentDisconnected",
-            })
+            fut.set_result(
+                {
+                    "type": "error",
+                    "task_id": request_id,
+                    "message": f"WS agent {agent_url!r} disconnected before task completed",
+                    "error_type": "AgentDisconnected",
+                }
+            )
         _agent_task_callbacks.pop(request_id, None)
     for request_id, owner in tuple(_portal_prepare_owners.items()):
         if owner != agent_url:
@@ -254,7 +266,11 @@ async def prepare_portal_route(
 ) -> PortalOwnerRouteV1:
     """Ask the authenticated edge owner to resolve its real portal session."""
 
-    if isinstance(session_revision, bool) or not isinstance(session_revision, int) or session_revision < 0:
+    if (
+        isinstance(session_revision, bool)
+        or not isinstance(session_revision, int)
+        or session_revision < 0
+    ):
         raise ValueError("portal route requires an authorized session revision")
     if not 0 < timeout <= 30:
         raise ValueError("portal route timeout must be between zero and thirty seconds")
@@ -267,6 +283,8 @@ async def prepare_portal_route(
         identity.node_id != session.node_id or identity.boot_id != session.node_boot_id
     ):
         raise RuntimeError("portal node identity is not authorized for this session")
+    if agent_url not in _connection_tunnels:
+        raise RuntimeError("portal connection has no authenticated tunnel binding")
     request_id = str(uuid.uuid4())
     future: asyncio.Future[PortalOwnerRouteV1] = asyncio.get_running_loop().create_future()
     _pending_portal_prepares[request_id] = future
@@ -288,6 +306,8 @@ async def prepare_portal_route(
     finally:
         _pending_portal_prepares.pop(request_id, None)
         _portal_prepare_owners.pop(request_id, None)
+
+
 async def open_portal_route(
     agent_url: str,
     owner_route: PortalOwnerRouteV1,
@@ -307,6 +327,9 @@ async def open_portal_route(
     identity = _connection_identities.get(agent_url)
     if identity is None or identity != route.node_identity:
         raise RuntimeError("portal node identity is not authenticated on this connection")
+    expected_tunnel = _connection_tunnels.get(agent_url)
+    if expected_tunnel != (route.tunnel_handle, route.tunnel_auth_digest):
+        raise RuntimeError("portal route is not bound to the authenticated connection")
     portal_id = route.binding.session_id
     existing = _portal_transports.get(portal_id)
     if existing is not None:
@@ -365,6 +388,7 @@ def _abort_portals_for_agent(agent_url: str) -> None:
         _portal_transports.pop(portal_id, None)
         _portal_ready.pop(portal_id, None)
 
+
 async def resolve_portal_binary(agent_url: str, data: bytes) -> None:
     """Decode, route-check, and enqueue one transient binary portal frame."""
     if len(data) > _PORTAL_MAX_WIRE_BYTES:
@@ -398,7 +422,6 @@ async def resolve_portal_binary(agent_url: str, data: bytes) -> None:
             ready.set_exception(exc)
 
 
-
 def is_connected(agent_url: str) -> bool:
     return agent_url in _connections
 
@@ -427,6 +450,7 @@ async def dispatch_collect(
     """
     if timeout is None:
         from backend.config import get_settings
+
         timeout = float(get_settings().agent_ws_timeout)
 
     ws = _connections.get(agent_url)
@@ -441,26 +465,32 @@ async def dispatch_collect(
             raise RuntimeError("account collection session is not owned by this node")
         account_session = session.to_wire()
 
-
     request_id = request_id or str(uuid.uuid4())
     loop = asyncio.get_running_loop()
     fut: asyncio.Future[dict] = loop.create_future()
     _pending[request_id] = fut
 
     try:
-        await ws.send_json({
-            "type": "collect",
-            "request_id": request_id,
-            "site": site,
-            "command": command,
-            "args": args,
-            "positional_args": positional_args,
-            "format": output_format,
-            "mode": mode,
-            **({"account_session": account_session} if account_session is not None else {}),
-        })
-        logger.debug("WS dispatch | agent=%s request_id=%s site=%s cmd=%s",
-                     agent_url, request_id, site, command)
+        await ws.send_json(
+            {
+                "type": "collect",
+                "request_id": request_id,
+                "site": site,
+                "command": command,
+                "args": args,
+                "positional_args": positional_args,
+                "format": output_format,
+                "mode": mode,
+                **({"account_session": account_session} if account_session is not None else {}),
+            }
+        )
+        logger.debug(
+            "WS dispatch | agent=%s request_id=%s site=%s cmd=%s",
+            agent_url,
+            request_id,
+            site,
+            command,
+        )
         return await asyncio.wait_for(fut, timeout=timeout)
     except TimeoutError:
         raise TimeoutError(f"WS agent {agent_url!r} did not respond in {timeout}s")
@@ -478,6 +508,7 @@ def resolve_response(request_id: str, result: dict[str, Any]) -> None:
         logger.warning("WS: unexpected result for request_id=%s (no waiting future)", request_id)
         return
     fut.set_result(result)
+
 
 async def send_agent_task(
     agent_url: str,
@@ -586,6 +617,7 @@ async def resolve_agent_event(request_id: str, msg: dict[str, Any]) -> None:
         if fut is not None and not fut.done():
             fut.set_exception(exc)
 
+
 def resolve_agent_result(request_id: str, msg: dict[str, Any]) -> None:
     """Called from the WS receive loop when an agent sends the terminal 'agent_result' frame."""
     fut = _pending_agent_tasks.get(request_id)
@@ -615,6 +647,9 @@ def resolve_portal_prepared(agent_url: str, msg: dict[str, Any]) -> None:
         identity = _connection_identities.get(agent_url)
         if identity is None or route.node_identity != identity:
             raise ValueError("portal route identity does not match authenticated node")
+        expected_tunnel = _connection_tunnels.get(agent_url)
+        if expected_tunnel != (route.tunnel_handle, route.tunnel_auth_digest):
+            raise ValueError("portal route tunnel does not match authenticated connection")
         future.set_result(route)
     except (ValueError, RuntimeError) as exc:
         future.set_exception(exc)

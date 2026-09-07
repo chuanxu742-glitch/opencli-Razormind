@@ -182,7 +182,7 @@ ENV PYTHONPATH=/app \
     AGENT_NODE_CREDENTIAL_ID="" \
     AGENT_NODE_CREDENTIAL="" \
     PROFILE_DIR=/home/agent/.config/chromium \
-    RUNTIME_STATE_DIR=/home/agent/.local/state/opencli-account-runtime \
+    RUNTIME_STATE_DIR=/var/lib/opencli/account-runtime \
     CHROMIUM_POLICY_FILE=/etc/chromium/policies/managed/opencli-account-runtime.json \
     CLOAKBROWSER_CACHE_DIR=/opt/cloakbrowser/cache
 USER agent

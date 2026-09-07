@@ -48,9 +48,10 @@ Environment variables:
 """
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
-import hmac
 import os
 import re
 import shutil
@@ -74,32 +75,13 @@ from backend.agent_runtime_dispatch import (
     capture_portal_frame,
     cleanup_cdp_tabs,
     invoke_runtime,
+    observe_login_runtime,
     parse_output,
     prepare_portal_route,
-    resolve_portal_target,
     resolve_account_runtime_context,
+    resolve_portal_target,
     snapshot_tab_ids,
 )
-from backend.browser_account_runtime import (
-    BrowserRuntimeError,
-    EpochStore,
-    PortalRuntimeRegistration,
-    ProfileRuntimePaths,
-    RuntimeLeaseAdmission,
-    runtime_lease_book,
-    session_portal_registry,
-    session_runtime_registry,
-)
-from backend.schemas.browser_account import (
-    DurableCommandV1,
-    NodeClaimV1,
-    NodeIdentityV1,
-    NodeResultV1,
-    PortalOwnerRouteV1,
-    PortalWireFrameV1,
-    SessionEnvelopeV1,
-)
-from backend.services.browser_portal_contract import decode_portal_wire_frame, encode_portal_wire_frame
 
 # Imported directly from the registry submodule (not the `backend.agent_runtimes`
 # package __init__) so this module's import graph is pinned to what registry.py
@@ -113,6 +95,32 @@ from backend.agent_runtimes.registry import (
     available_runtimes,
     get_runtime,
 )
+from backend.browser_account_runtime import (
+    BrowserRuntimeError,
+    EpochStore,
+    PortalRuntimeRegistration,
+    ProfileRuntimePaths,
+    RuntimeLeaseAdmission,
+    account_runtime_allocator,
+    close_account_runtime_allocator,
+    runtime_lease_book,
+    session_portal_registry,
+    session_runtime_registry,
+)
+from backend.schemas.browser_account import (
+    DurableCommandV1,
+    NodeClaimV1,
+    NodeIdentityV1,
+    NodeResultV1,
+    PortalOwnerRouteV1,
+    PortalWireFrameV1,
+    SessionEnvelopeV1,
+)
+from backend.services.browser_portal_contract import (
+    decode_portal_wire_frame,
+    encode_portal_wire_frame,
+)
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger("agent_server")
 
@@ -204,7 +212,6 @@ _EDGE_RUNTIME_TASK_CONFIG_KEYS = frozenset(
 )
 
 
-
 _AGENT_LABEL = os.environ.get("AGENT_LABEL", socket.gethostname())
 # Registration mode:
 #   http — LAN mode: agent POSTs its URL to center, center calls back via HTTP (default)
@@ -234,9 +241,13 @@ def _node_identity(*, required: bool = True) -> NodeIdentityV1 | None:
             raise HTTPException(status_code=503, detail="node identity is not configured")
         return None
     try:
+        identity_root = os.environ.get(
+            "ACCOUNT_RUNTIME_STATE_ROOT",
+            "/var/lib/opencli-account-runtime/state",
+        )
         paths = ProfileRuntimePaths.from_profile_dir(
-            os.environ.get("PROFILE_DIR", "/var/lib/opencli/account-runtime/profile"),
-            os.environ.get("RUNTIME_STATE_DIR"),
+            os.path.join(identity_root, "node-identity-profile"),
+            os.path.join(identity_root, "node-identity"),
         )
         boot_id = _AGENT_BOOT_ID or EpochStore(paths).begin_boot()
         _NODE_IDENTITY = NodeIdentityV1(node_id=_AGENT_NODE_ID, boot_id=boot_id)
@@ -245,6 +256,28 @@ def _node_identity(*, required: bool = True) -> NodeIdentityV1 | None:
             raise HTTPException(status_code=503, detail="node identity is unavailable") from exc
         return None
     return _NODE_IDENTITY
+
+
+def _account_runtime_prerequisite(
+    agent_url: str | None = None,
+) -> tuple[bool, str | None]:
+    if not (
+        _AGENT_HAS_CHROME
+        and _BROWSER_PROFILE_KIND == "authenticated"
+        and _AGENT_NODE_ID
+        and _AGENT_NODE_CREDENTIAL_ID
+        and _AGENT_NODE_CREDENTIAL
+    ):
+        return False, "capability_missing"
+    if not _CENTRAL_API_URL.startswith("https://") or (
+        agent_url is not None and not agent_url.startswith("https://")
+    ):
+        return False, "portal_tls_required"
+    try:
+        account_runtime_allocator().configuration.validate()
+    except BrowserRuntimeError as exc:
+        return False, exc.code
+    return True, None
 
 
 def _require_node_auth(
@@ -269,6 +302,8 @@ def _require_node_auth(
     # Global fleet auth remains an independent center-to-node admission gate.
     _require_collect_auth(authorization)
     return identity
+
+
 _HTTPS_PROXY = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or ""
 # Fleet auth token (ADR-0005): AGENT_API_TOKEN preferred, API_AUTH_TOKEN accepted
 # as a fallback for nodes that share the center's environment.
@@ -286,6 +321,8 @@ def _auth_headers() -> dict[str, str]:
     if not _AGENT_API_TOKEN:
         return {}
     return {"Authorization": f"Bearer {_AGENT_API_TOKEN}"}
+
+
 def _node_headers() -> dict[str, str]:
     identity = _node_identity(required=False)
     if identity is None or not _AGENT_NODE_CREDENTIAL:
@@ -293,10 +330,9 @@ def _node_headers() -> dict[str, str]:
     return {
         "X-Node-ID": identity.node_id,
         "X-Node-Boot-ID": identity.boot_id,
+        "X-Node-Credential-ID": _AGENT_NODE_CREDENTIAL_ID,
         "X-Node-Credential": _AGENT_NODE_CREDENTIAL,
     }
-
-
 
 
 def _require_collect_auth(authorization: str | None) -> None:
@@ -409,15 +445,11 @@ async def _register_with_center(advertise_url: str) -> None:
         "runtime_capabilities": available_runtime_capabilities(),
         "profile_kind": _BROWSER_PROFILE_KIND,
         "node_id": _AGENT_NODE_ID or None,
-        "boot_id": (_node_identity(required=False).boot_id if _node_identity(required=False) else None),
-        "credential_id": _AGENT_NODE_CREDENTIAL_ID or None,
-        "account_capable": bool(
-            _AGENT_HAS_CHROME
-            and _BROWSER_PROFILE_KIND == "authenticated"
-            and _AGENT_NODE_ID
-            and _AGENT_NODE_CREDENTIAL_ID
-            and _AGENT_NODE_CREDENTIAL
+        "boot_id": (
+            _node_identity(required=False).boot_id if _node_identity(required=False) else None
         ),
+        "credential_id": _AGENT_NODE_CREDENTIAL_ID or None,
+        "account_capable": _account_runtime_prerequisite(advertise_url)[0],
     }
     proxies = _build_proxies()
 
@@ -510,18 +542,24 @@ async def _register_login_portal_runtime(
     session: SessionEnvelopeV1,
     *,
     agent_url: str,
+    tunnel_handle: str,
+    tunnel_auth_digest: str,
 ) -> None:
     """Bind the login session to the real page RecordSession before portal use."""
 
     if session.purpose != "login" or session.session_id in _ACTIVE_PORTAL_RECORDS:
         return
     owner_endpoint = _CENTRAL_API_URL
-    tunnel_handle = os.environ.get("OPENCLI_PORTAL_TUNNEL_HANDLE", "")
-    tunnel_auth_digest = os.environ.get("OPENCLI_PORTAL_TUNNEL_AUTH_DIGEST", "")
     if not agent_url.startswith("https://") or not owner_endpoint.startswith("https://"):
-        raise BrowserRuntimeError("portal_registration_invalid", "portal relay endpoints must use TLS")
-    if not tunnel_handle or not tunnel_auth_digest:
-        raise BrowserRuntimeError("portal_registration_invalid", "portal relay registration is unavailable")
+        raise BrowserRuntimeError(
+            "portal_tls_required",
+            "portal relay requires real TLS endpoints",
+        )
+    if not tunnel_handle or not re.fullmatch(r"[0-9a-f]{64}", tunnel_auth_digest):
+        raise BrowserRuntimeError(
+            "portal_connection_required",
+            "portal relay is not bound to the authenticated node connection",
+        )
     binding = session_runtime_registry().resolve(
         session_id=session.session_id,
         node_id=session.node_id,
@@ -552,6 +590,8 @@ async def _register_login_portal_runtime(
         await record_session.stop(status="failed", note="portal registration failed")
         raise
     _ACTIVE_PORTAL_RECORDS[session.session_id] = record_session
+
+
 _ACTIVE_PORTALS: dict[str, _PortalRuntime] = {}
 _PORTAL_MAX_WIRE_BYTES = 4_200_000
 
@@ -618,9 +658,7 @@ async def _handle_ws_portal(ws, msg: dict, authenticated_identity: NodeIdentityV
             websocket_url=websocket_url,
         )
         _ACTIVE_PORTALS[portal_id] = runtime
-        await ws.send(
-            json.dumps({"type": "portal_ready", "portal_id": portal_id})
-        )
+        await ws.send(json.dumps({"type": "portal_ready", "portal_id": portal_id}))
         await _send_portal_pixel(ws, runtime)
     except Exception as exc:
         _ACTIVE_PORTALS.pop(portal_id, None)
@@ -678,13 +716,19 @@ async def _handle_ws_portal_binary(ws, data: bytes) -> None:
             await _send_portal_pixel(ws, runtime)
         else:
             await ws.send(
-                json.dumps({"type": "portal_applied", "portal_id": portal_id, "sequence": frame.sequence})
+                json.dumps(
+                    {"type": "portal_applied", "portal_id": portal_id, "sequence": frame.sequence}
+                )
             )
     except Exception:
         logger.warning("WS: portal control rejected for session=%s", portal_id, exc_info=True)
         _ACTIVE_PORTALS.pop(portal_id, None)
         try:
-            await ws.send(json.dumps({"type": "portal_error", "portal_id": portal_id, "error": "control rejected"}))
+            await ws.send(
+                json.dumps(
+                    {"type": "portal_error", "portal_id": portal_id, "error": "control rejected"}
+                )
+            )
         except Exception:
             logger.debug("WS: failed to report portal control error", exc_info=True)
 
@@ -752,6 +796,10 @@ async def _handle_ws_agent_task(
     ws,
     msg: dict,
     authenticated_identity: NodeIdentityV1 | None = None,
+    *,
+    agent_url: str = "",
+    tunnel_handle: str = "",
+    tunnel_auth_digest: str = "",
 ) -> None:
     """Execute an authenticated account task over the reverse channel.
 
@@ -806,11 +854,24 @@ async def _handle_ws_agent_task(
             )
             if runtime_request.node_identity != authenticated_identity:
                 raise ValueError("WS node identity is not authenticated")
+            assert runtime_request.command is not None
+            assert runtime_request.claim is not None
+            assert runtime_request.session is not None
+            await _admit_claim(
+                RuntimeClaimRequest(
+                    command=runtime_request.command,
+                    claim=runtime_request.claim,
+                    session=runtime_request.session,
+                    node_identity=authenticated_identity,
+                ),
+                authenticated_identity=authenticated_identity,
+            )
             account_context = resolve_account_runtime_context(runtime_request)
             task_config = account_context.server_config | {
                 key: value
                 for key, value in task_config.items()
-                if key not in {
+                if key
+                not in {
                     "remote",
                     "binary",
                     "cdp_endpoint",
@@ -822,29 +883,116 @@ async def _handle_ws_agent_task(
                     "display",
                 }
             }
-            if (
-                runtime_request.command is not None
-                and runtime_request.command.kind.value == "start_login"
-                and runtime_request.session is not None
-            ):
+            command_kind = runtime_request.command.kind.value
+            if command_kind in {"stop_and_save", "close_session"}:
+                try:
+                    registration = session_portal_registry().resolve(
+                        session_id=runtime_request.session.session_id,
+                        node_id=runtime_request.claim.node_id,
+                        boot_id=runtime_request.claim.boot_id,
+                        epoch=runtime_request.claim.epoch,
+                        agent_url=agent_url,
+                    )
+                    await registration.record_session.stop(status="success")
+                except BrowserRuntimeError as exc:
+                    if exc.code != "portal_record_missing":
+                        raise
+                except Exception:
+                    logger.warning(
+                        "Portal capture shutdown failed before process stop session_id=%s",
+                        runtime_request.session.session_id,
+                        exc_info=True,
+                    )
+                manifest = await account_runtime_allocator().stop(
+                    session_id=runtime_request.session.session_id,
+                    node_id=runtime_request.claim.node_id,
+                    boot_id=runtime_request.claim.boot_id,
+                    epoch=runtime_request.claim.epoch,
+                    save=command_kind == "stop_and_save",
+                    workspace_id=runtime_request.command.workspace_id,
+                    account_id=runtime_request.command.account_id,
+                    command_id=runtime_request.command.command_id,
+                )
+                session_portal_registry().revoke(
+                    session_id=runtime_request.session.session_id,
+                    node_id=runtime_request.claim.node_id,
+                    boot_id=runtime_request.claim.boot_id,
+                    epoch=runtime_request.claim.epoch,
+                )
+                runtime_lease_book().revoke(runtime_request.command.command_id)
+                await _send_result(
+                    {
+                        "type": "done",
+                        "task_id": request_id,
+                        "result": {
+                            "runtime_status": "stopped",
+                            "session_id": runtime_request.session.session_id,
+                            "profile_manifest": manifest,
+                        },
+                    }
+                )
+                return
+            if command_kind == "start_login":
+                running = account_runtime_allocator().get(runtime_request.session.session_id)
+                if running is None:
+                    raise BrowserRuntimeError(
+                        "capability_missing",
+                        "started account runtime is unavailable",
+                    )
                 await _register_login_portal_runtime(
                     runtime_request.session,
-                    agent_url=_detect_advertise_url(),
+                    agent_url=agent_url,
+                    tunnel_handle=tunnel_handle,
+                    tunnel_auth_digest=tunnel_auth_digest,
                 )
-        except (ValueError, HTTPException) as exc:
+                observation = await observe_login_runtime(
+                    cdp_endpoint=running.binding.cdp_endpoint,
+                    session=runtime_request.session,
+                    claim=runtime_request.claim,
+                    node_identity=authenticated_identity,
+                    expected_origin=running.bundle.login_origin,
+                )
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "login_observation",
+                            "observation": observation.model_dump(mode="json"),
+                        }
+                    )
+                )
+                await _send_result(
+                    {
+                        "type": "done",
+                        "task_id": request_id,
+                        "result": {
+                            "runtime_status": "healthy",
+                            "session_id": running.binding.session_id,
+                            "profile_id": running.profile_id,
+                        },
+                    }
+                )
+                return
+        except (ValueError, HTTPException, BrowserRuntimeError) as exc:
+            if isinstance(exc, BrowserRuntimeError):
+                error_code = exc.code
+            elif isinstance(exc, HTTPException) and isinstance(exc.detail, str):
+                error_code = exc.detail
+            else:
+                error_code = "runtime_context_invalid"
             await _send_result(
                 {
                     "type": "error",
                     "task_id": request_id,
                     "message": str(exc),
                     "error_type": "RuntimeContextInvalid",
+                    "error_code": error_code,
                 }
             )
             return
     try:
-    # Fires this coroutine via asyncio.create_task, so an uncaught exception
-    # here would otherwise vanish into an unretrieved task exception and the
-    # center would hang until its own send_agent_task timeout.
+        # Fires this coroutine via asyncio.create_task, so an uncaught exception
+        # here would otherwise vanish into an unretrieved task exception and the
+        # center would hang until its own send_agent_task timeout.
         try:
             adapter = get_runtime(runtime_type)
         except ValueError as exc:
@@ -961,17 +1109,26 @@ def _start_ws_agent_task(
     ws,
     msg: dict,
     authenticated_identity: NodeIdentityV1 | None = None,
+    *,
+    agent_url: str = "",
+    tunnel_handle: str = "",
+    tunnel_auth_digest: str = "",
 ) -> None:
     request_id = msg.get("request_id", "")
-    task = (
-        asyncio.create_task(_handle_ws_agent_task(ws, msg))
-        if authenticated_identity is None
-        else asyncio.create_task(_handle_ws_agent_task(ws, msg, authenticated_identity))
-    )
+    if authenticated_identity is None and not (agent_url or tunnel_handle or tunnel_auth_digest):
+        coroutine = _handle_ws_agent_task(ws, msg)
+    else:
+        coroutine = _handle_ws_agent_task(
+            ws,
+            msg,
+            authenticated_identity,
+            agent_url=agent_url,
+            tunnel_handle=tunnel_handle,
+            tunnel_auth_digest=tunnel_auth_digest,
+        )
+    task = asyncio.create_task(coroutine)
     _ACTIVE_AGENT_TASKS[request_id] = task
     task.add_done_callback(lambda completed: _forget_ws_agent_task(request_id, completed))
-
-
 
 
 async def _register_via_ws(advertise_url: str) -> None:
@@ -1000,18 +1157,16 @@ async def _register_via_ws(advertise_url: str) -> None:
             "mode": _AGENT_MODE,
             "node_type": _AGENT_DEPLOY_TYPE,
             "label": _AGENT_LABEL,
-            "node_id": (_node_identity(required=False).node_id if _node_identity(required=False) else None),
+            "node_id": (
+                _node_identity(required=False).node_id if _node_identity(required=False) else None
+            ),
             "runtimes": runtimes,
             "runtime_capabilities": runtime_capabilities,
             "profile_kind": _BROWSER_PROFILE_KIND,
-            "account_capable": bool(
-                _AGENT_HAS_CHROME
-                and _BROWSER_PROFILE_KIND == "authenticated"
-                and _AGENT_NODE_ID
-                and _AGENT_NODE_CREDENTIAL_ID
-                and _AGENT_NODE_CREDENTIAL
+            "account_capable": _account_runtime_prerequisite(advertise_url)[0],
+            "boot_id": (
+                _node_identity(required=False).boot_id if _node_identity(required=False) else None
             ),
-            "boot_id": (_node_identity(required=False).boot_id if _node_identity(required=False) else None),
             "credential_id": _AGENT_NODE_CREDENTIAL_ID or None,
         }
     )
@@ -1043,6 +1198,28 @@ async def _register_via_ws(advertise_url: str) -> None:
                 ack = json.loads(ack_raw)
                 if ack.get("type") != "registered":
                     raise RuntimeError(f"Unexpected handshake response: {ack}")
+                connection_tunnel_handle = ack.get("tunnel_handle")
+                connection_tunnel_nonce = ack.get("tunnel_nonce")
+                identity = _node_identity(required=False)
+                if identity is not None:
+                    if (
+                        not isinstance(connection_tunnel_handle, str)
+                        or not re.fullmatch(r"[0-9a-f]{32}", connection_tunnel_handle)
+                        or not isinstance(connection_tunnel_nonce, str)
+                        or not 32 <= len(connection_tunnel_nonce) <= 128
+                    ):
+                        raise RuntimeError(
+                            "authenticated center did not issue a portal tunnel binding"
+                        )
+                    connection_tunnel_digest = hashlib.sha256(
+                        (
+                            f"{connection_tunnel_handle}:{connection_tunnel_nonce}:"
+                            f"{identity.node_id}:{identity.boot_id}:{advertise_url}"
+                        ).encode()
+                    ).hexdigest()
+                else:
+                    connection_tunnel_handle = ""
+                    connection_tunnel_digest = ""
                 logger.info("WS registered with center as %s", advertise_url)
 
                 # Main receive loop
@@ -1069,7 +1246,14 @@ async def _register_via_ws(advertise_url: str) -> None:
                     elif msg_type == "portal_close":
                         _ACTIVE_PORTALS.pop(msg.get("portal_id", ""), None)
                     elif msg_type == "agent_task":
-                        _start_ws_agent_task(ws, msg, _node_identity(required=False))
+                        _start_ws_agent_task(
+                            ws,
+                            msg,
+                            _node_identity(required=False),
+                            agent_url=advertise_url,
+                            tunnel_handle=connection_tunnel_handle,
+                            tunnel_auth_digest=connection_tunnel_digest,
+                        )
                     elif msg_type == "cancel":
                         request_id = msg.get("request_id", "")
                         proc = _ACTIVE_COLLECTS.get(request_id)
@@ -1128,13 +1312,16 @@ async def lifespan(app: FastAPI):
             _CENTRAL_API_URL,
         )
         _ws_task = asyncio.get_event_loop().create_task(_register_via_ws(advertise_url))
-    yield
-    if _ws_task and not _ws_task.done():
-        _ws_task.cancel()
-        try:
-            await _ws_task
-        except asyncio.CancelledError:
-            pass
+    try:
+        yield
+    finally:
+        if _ws_task and not _ws_task.done():
+            _ws_task.cancel()
+            try:
+                await _ws_task
+            except asyncio.CancelledError:
+                pass
+        await close_account_runtime_allocator()
 
 
 app = FastAPI(title="OpenCLI Agent Server", version="0.4.1", lifespan=lifespan)
@@ -1151,6 +1338,8 @@ class CollectRequest(BaseModel):
     cdp_endpoint: str = ""
     execution_id: str = ""
     account_session: dict[str, Any] | None = None
+
+
 class RuntimeClaimRequest(BaseModel):
     command: DurableCommandV1
     claim: NodeClaimV1
@@ -1168,13 +1357,14 @@ class RuntimeResultRequest(BaseModel):
     node_identity: NodeIdentityV1
 
 
-def _admit_claim(
+async def _admit_claim(
     body: RuntimeClaimRequest,
     *,
     authenticated_identity: NodeIdentityV1,
 ) -> RuntimeLeaseAdmission:
     if body.node_identity != authenticated_identity:
         raise HTTPException(status_code=401, detail="claim node identity is not authenticated")
+    admitted = False
     try:
         from backend.schemas.browser_account import CommandExecutionGuardV1
 
@@ -1183,18 +1373,35 @@ def _admit_claim(
             claim=body.claim,
             session=body.session,
         )
-        session_runtime_registry().resolve(
-            session_id=guard.session.session_id,
-            node_id=guard.claim.node_id,
-            boot_id=guard.claim.boot_id,
-            epoch=guard.claim.epoch,
-        )
-        return runtime_lease_book().claim(
+        admission = runtime_lease_book().claim(
             claim=guard.claim,
             session=guard.session,
             node_identity=authenticated_identity,
         )
+        admitted = True
+        if guard.command.kind.value == "start_login":
+            await account_runtime_allocator().start(
+                command=guard.command,
+                claim=guard.claim,
+                session=guard.session,
+                node_identity=authenticated_identity,
+            )
+        else:
+            await account_runtime_allocator().renew(
+                claim=guard.claim,
+                session=guard.session,
+                node_identity=authenticated_identity,
+            )
+            session_runtime_registry().resolve(
+                session_id=guard.session.session_id,
+                node_id=guard.claim.node_id,
+                boot_id=guard.claim.boot_id,
+                epoch=guard.claim.epoch,
+            )
+        return admission
     except (ValueError, BrowserRuntimeError) as exc:
+        if admitted:
+            runtime_lease_book().revoke(body.claim.command_id)
         code = exc.code if isinstance(exc, BrowserRuntimeError) else "runtime_context_invalid"
         raise HTTPException(status_code=409, detail=code) from exc
 
@@ -1202,22 +1409,15 @@ def _admit_claim(
 @app.get("/health")
 def health() -> dict:
     bin_path = _resolve_bin(_AGENT_MODE)
+    account_capable, prerequisite = _account_runtime_prerequisite(_AGENT_ADVERTISE_URL or None)
+    identity = _node_identity(required=False)
     return {
         "status": "ok",
         "opencli_bin": bin_path,
         "opencli_bin_exists": shutil.which(bin_path) is not None or os.path.isfile(bin_path),
-        "account_capable": bool(
-            _AGENT_HAS_CHROME
-            and _BROWSER_PROFILE_KIND == "authenticated"
-            and _AGENT_NODE_ID
-            and _AGENT_NODE_CREDENTIAL_ID
-            and _AGENT_NODE_CREDENTIAL
-        ),
-        "node_identity": (
-            _node_identity(required=False).model_dump(mode="json")
-            if _node_identity(required=False)
-            else None
-        ),
+        "account_capable": account_capable,
+        "account_runtime_prerequisite": prerequisite,
+        "node_identity": identity.model_dump(mode="json") if identity else None,
     }
 
 
@@ -1230,14 +1430,15 @@ async def invoke_runtime_http(
     node_credential: str | None = Header(default=None, alias="X-Node-Credential"),
 ) -> dict:
     account_dispatch = any(
-        value is not None
-        for value in (req.command, req.claim, req.session, req.node_identity)
+        value is not None for value in (req.command, req.claim, req.session, req.node_identity)
     )
     context: AccountRuntimeContext | None = None
     if account_dispatch:
         identity = _require_node_auth(authorization, node_id, boot_id, node_credential)
         if req.node_identity != identity:
-            raise HTTPException(status_code=401, detail="runtime node identity is not authenticated")
+            raise HTTPException(
+                status_code=401, detail="runtime node identity is not authenticated"
+            )
         context = resolve_account_runtime_context(req)
     else:
         _require_collect_auth(authorization)
@@ -1276,7 +1477,7 @@ async def claim_runtime(
     node_credential: str | None = Header(default=None, alias="X-Node-Credential"),
 ) -> dict[str, Any]:
     identity = _require_node_auth(authorization, node_id, boot_id, node_credential)
-    admission = _admit_claim(body, authenticated_identity=identity)
+    admission = await _admit_claim(body, authenticated_identity=identity)
     return {
         "accepted": True,
         "node_identity": identity.model_dump(mode="json"),
@@ -1301,6 +1502,11 @@ async def renew_runtime(
             claim=body.claim,
             node_identity=identity,
             now=datetime.now(UTC),
+        )
+        await account_runtime_allocator().renew(
+            claim=body.claim,
+            session=admission.session,
+            node_identity=identity,
         )
     except BrowserRuntimeError as exc:
         raise HTTPException(status_code=409, detail=exc.code) from exc
@@ -1348,12 +1554,16 @@ async def collect(req: CollectRequest) -> dict:
                 or account_session.node_boot_id != identity.boot_id
             ):
                 raise ValueError("account session belongs to another node")
-            cdp_ep = session_runtime_registry().resolve(
-                session_id=account_session.session_id,
-                node_id=account_session.node_id,
-                boot_id=account_session.node_boot_id,
-                epoch=account_session.epoch,
-            ).cdp_endpoint
+            cdp_ep = (
+                session_runtime_registry()
+                .resolve(
+                    session_id=account_session.session_id,
+                    node_id=account_session.node_id,
+                    boot_id=account_session.node_boot_id,
+                    epoch=account_session.epoch,
+                )
+                .cdp_endpoint
+            )
         except (ValueError, BrowserRuntimeError) as exc:
             return {
                 "success": False,

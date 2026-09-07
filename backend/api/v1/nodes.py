@@ -4,10 +4,13 @@ Handles registration, lifecycle events, and management of remote agent nodes.
 Both HTTP-mode agents (center calls agent) and WS-mode agents (agent initiates
 reverse channel) register here and have their online/offline history tracked.
 """
-import json
+
+import hashlib
 import io
+import json
 import logging
 import re
+import secrets
 import shlex
 import tarfile
 from datetime import UTC, datetime
@@ -29,8 +32,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.database import get_db
-from backend.schemas.common import ApiResponse
 from backend.schemas.browser_account import NodeIdentityV1
+from backend.schemas.common import ApiResponse
 from backend.schemas.edge_node import EdgeNodeEventRead, EdgeNodeRead
 
 if TYPE_CHECKING:
@@ -69,7 +72,9 @@ async def _upsert_node(
     now = _utcnow()
     if node:
         if node_id is not None and node.id != node_id:
-            raise HTTPException(status_code=409, detail="node identity does not match registered URL")
+            raise HTTPException(
+                status_code=409, detail="node identity does not match registered URL"
+            )
         node.status = "online"
         node.last_seen_at = now
         node.protocol = protocol
@@ -213,9 +218,7 @@ async def register_node(
             status_code=400,
             detail="profile_kind must be 'anonymous' or 'authenticated'",
         )
-    if body.account_capable and (
-        not body.node_id or not body.boot_id or not body.credential_id
-    ):
+    if body.account_capable and (not body.node_id or not body.boot_id or not body.credential_id):
         raise HTTPException(
             status_code=400,
             detail="account-capable registration requires node_id, boot_id, and credential_id",
@@ -435,6 +438,7 @@ async def get_opencli_runtime_patch() -> PlainTextResponse:
             )
     raise HTTPException(status_code=404, detail="OpenCLI runtime patch not packaged")
 
+
 @router.get("/install/agent-runtime.tar.gz")
 async def get_agent_runtime_bundle() -> Response:
     """Serve the Python packages required by non-Docker Agents."""
@@ -443,11 +447,7 @@ async def get_agent_runtime_bundle() -> Response:
         Path("/app"),
     ]
     source_root = next(
-        (
-            root
-            for root in source_roots
-            if (root / "backend" / "agent_runtimes").is_dir()
-        ),
+        (root for root in source_roots if (root / "backend" / "agent_runtimes").is_dir()),
         None,
     )
     if source_root is None:
@@ -885,6 +885,26 @@ async def node_ws_endpoint(ws: WebSocket) -> None:
                 reason="account-capable registration requires node identity",
             )
             return
+        if account_capable:
+            header_identity = (
+                ws.headers.get("x-node-id"),
+                ws.headers.get("x-node-boot-id"),
+                ws.headers.get("x-node-credential-id"),
+            )
+            if header_identity != (node_id, boot_id, credential_id) or not ws.headers.get(
+                "x-node-credential"
+            ):
+                await ws.close(
+                    code=1008,
+                    reason="account-capable registration requires authenticated node headers",
+                )
+                return
+            if not agent_url.startswith("https://"):
+                await ws.close(
+                    code=1008,
+                    reason="account-capable registration requires a TLS agent URL",
+                )
+                return
 
         # ── 2. Upsert node + write event ──────────────────────────────────
         try:
@@ -949,8 +969,33 @@ async def node_ws_endpoint(ws: WebSocket) -> None:
             if account_capable and node_id and boot_id
             else None
         )
-        ws_agent_manager.register_connection(agent_url, ws, node_identity)
-        await ws.send_json({"type": "registered", "agent_url": agent_url})
+        tunnel_handle: str | None = None
+        tunnel_nonce: str | None = None
+        tunnel_auth_digest: str | None = None
+        if node_identity is not None:
+            tunnel_handle = secrets.token_hex(16)
+            tunnel_nonce = secrets.token_urlsafe(32)
+            tunnel_auth_digest = hashlib.sha256(
+                (
+                    f"{tunnel_handle}:{tunnel_nonce}:"
+                    f"{node_identity.node_id}:{node_identity.boot_id}:{agent_url}"
+                ).encode()
+            ).hexdigest()
+        ws_agent_manager.register_connection(
+            agent_url,
+            ws,
+            node_identity,
+            tunnel_handle=tunnel_handle,
+            tunnel_auth_digest=tunnel_auth_digest,
+        )
+        await ws.send_json(
+            {
+                "type": "registered",
+                "agent_url": agent_url,
+                "tunnel_handle": tunnel_handle,
+                "tunnel_nonce": tunnel_nonce,
+            }
+        )
         logger.info(
             "WS node registered: %s (node_type=%s mode=%s label=%r)",
             agent_url,

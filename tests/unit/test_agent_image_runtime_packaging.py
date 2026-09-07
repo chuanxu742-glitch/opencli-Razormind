@@ -1,5 +1,4 @@
 import subprocess
-
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -131,7 +130,9 @@ def test_browser_images_fail_closed_until_userscripts_access_is_verified():
     for entrypoint in (chrome_entrypoint, agent_entrypoint):
         assert "ensure-violentmonkey-userscripts-access.mjs" in entrypoint
         assert "violentmonkey_user_scripts_access" in entrypoint
-        assert 'VIOLENTMONKEY_VERSION="$(read_manifest_component_version violentmonkey)"' in entrypoint
+        assert (
+            'VIOLENTMONKEY_VERSION="$(read_manifest_component_version violentmonkey)"'
+        ) in entrypoint
         assert "rm -f /tmp/browser-runtime-report.json" in entrypoint
 
 
@@ -164,6 +165,35 @@ def test_anonymous_agent_profiles_are_fresh_per_agent_start():
     assert "mktemp -d /tmp/opencli-anonymous-profile.XXXXXX" in installer
 
 
+def test_legacy_agent_daemon_unsets_inherited_opencli_port():
+    entrypoint = (ROOT / "agent" / "entrypoint.sh").read_text(encoding="utf-8")
+
+    daemon_launch = (
+        "env -u OPENCLI_DAEMON_PORT OPENCLI_DAEMON_LISTEN=127.0.0.1 "
+        'node "$DAEMON_JS"'
+    )
+    assert daemon_launch in entrypoint
+
+
+def test_account_allocator_uses_the_existing_persistent_runtime_volume():
+    dockerfile = (ROOT / "agent/Dockerfile").read_text(encoding="utf-8")
+    entrypoint = (ROOT / "agent/entrypoint.sh").read_text(encoding="utf-8")
+    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "RUNTIME_STATE_DIR=/var/lib/opencli/account-runtime" in dockerfile
+    assert (
+        "agent_runtime_state:${AGENT_RUNTIME_STATE_DIR:-/var/lib/opencli/account-runtime}"
+    ) in compose
+    assert (
+        'ACCOUNT_RUNTIME_ROOT="${ACCOUNT_RUNTIME_ROOT:-$RUNTIME_STATE_DIR/sessions}"'
+    ) in entrypoint
+    assert (
+        'ACCOUNT_PROFILE_ROOT="${ACCOUNT_PROFILE_ROOT:-$RUNTIME_STATE_DIR/profiles}"'
+    ) in entrypoint
+    assert (
+        'ACCOUNT_RUNTIME_STATE_ROOT="${ACCOUNT_RUNTIME_STATE_ROOT:-$RUNTIME_STATE_DIR/state}"'
+    ) in entrypoint
+
+
 def test_vnc_agent_image_is_the_registered_browser_bridge_runtime():
     dockerfile = (ROOT / "agent" / "Dockerfile").read_text(encoding="utf-8")
     entrypoint = (ROOT / "agent" / "entrypoint.sh").read_text(encoding="utf-8")
@@ -181,7 +211,6 @@ def test_vnc_agent_image_is_the_registered_browser_bridge_runtime():
     assert "COPY backend/agent_server.py ./backend/agent_server.py" in dockerfile
     assert "bbx install" in entrypoint
     assert "bbx-daemon" in entrypoint
-    assert "env -u OPENCLI_DAEMON_PORT" in entrypoint
     assert "--profile-directory=Default" in entrypoint
     assert "--no-first-run" in entrypoint
     assert "patch-browser-bridge-autostart.mjs" in dockerfile
@@ -198,6 +227,7 @@ def test_vnc_agent_image_is_the_registered_browser_bridge_runtime():
     assert "AGENT_MODE: ${AGENT_MODE:-bridge}" in compose
     assert "AGENT_REGISTER: ${AGENT_REGISTER:-ws}" in compose
     assert "AGENT_ADVERTISE_URL: ${AGENT_ADVERTISE_URL:-http://agent-1:19823}" in compose
-    assert "agent_profile_1:/home/agent/.config/chromium" in compose
+    assert "agent_profile_1:${CHROME_PROFILE_DIR:-/home/chrome/.config/chromium}" in compose
+    assert "agent_profile:${AGENT_PROFILE_DIR:-/home/agent/.config/chromium}" in compose
     assert "${AGENT_PORT:-19823}:19823" in compose
     assert "agent-1:\n    <<: *agent-build" in build

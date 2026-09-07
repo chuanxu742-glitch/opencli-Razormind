@@ -72,6 +72,7 @@ class Settings(BaseSettings):
         if len(normalized) < 32 or normalized in public_defaults:
             raise ValueError("SECRET_KEY must be at least 32 characters and not a public default")
         return normalized
+
     # Fernet key used to encrypt provider credentials at rest. Keep this
     # stable after providers have been saved, or their stored API keys cannot
     # be decrypted on the next process start.
@@ -239,6 +240,29 @@ class Settings(BaseSettings):
     agent_node_id: str = ""
     agent_node_credential_id: str = ""
     agent_node_credential: str = ""
+    # Trusted edge-side account runtime configuration. These values are
+    # deployment-owned and are never accepted from browser/account payloads.
+    account_runtime_root: str = "/var/lib/opencli-account-runtime/sessions"
+    account_profile_root: str = "/var/lib/opencli-account-runtime/profiles"
+    account_runtime_state_root: str = "/var/lib/opencli-account-runtime/state"
+    browser_runtime_bundle_root: str = "/opt/browser-runtime-bundles"
+    browser_runtime_bundle_manifest: str = (
+        "/opt/browser-runtime-bundles/opencli-default/2/manifest.json"
+    )
+    browser_runtime_bundle_id: str = ""
+    chromium_policy_file: str = "/etc/chromium/policies/managed/opencli-account-runtime.json"
+    account_runtime_xvfb_bin: str = "Xvfb"
+    account_runtime_browser_bin: str = "chromium"
+    account_runtime_bbx_daemon_bin: str = "bbx-daemon"
+    account_runtime_bbx_bin: str = "bbx"
+    account_runtime_bbx_extension_id_file: str = "/etc/browser-bridge-extension-id"
+    account_runtime_node_bin: str = "node"
+    account_runtime_opencli_daemon_js: str = ""
+    account_runtime_display_min: int = Field(default=100, ge=1, le=65_535)
+    account_runtime_display_max: int = Field(default=199, ge=1, le=65_535)
+    account_runtime_port_min: int = Field(default=20_000, ge=1_024, le=65_535)
+    account_runtime_port_max: int = Field(default=29_999, ge=1_024, le=65_535)
+    account_runtime_startup_timeout: float = Field(default=30.0, gt=0, le=120)
     # noVNC base port for the first agent instance (agent-1). Additional
     # instances use base+1, base+2, …  Matches docker-compose NOVNC_PORT.
     novnc_base_port: int = 6080
