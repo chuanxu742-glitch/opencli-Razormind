@@ -11,6 +11,10 @@ export interface BrowserSpace {
   workspace_id: string
   browser_instance_id: string
   binding_id: string | null
+  account_id: string | null
+  session_id: string | null
+  lease_id: string | null
+  epoch: number
   owner_type: BrowserSpaceOwnerType
   owner_id: string
   status: BrowserSpaceStatus
@@ -61,6 +65,9 @@ export interface BrowserSpaceTaskRequest {
 export interface BrowserSpaceCreateRequest {
   browser_instance_id: string
   binding_id?: string
+  account_id?: string
+  session_id?: string
+  lease_id?: string
   owner_type: BrowserSpaceOwnerType
   owner_id: string
   granted_capabilities: string[]

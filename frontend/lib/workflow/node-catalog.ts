@@ -669,6 +669,8 @@ export type OpenCLISourceSlot = {
   sessionPolicy?: string
   workerTags?: string[]
   resourceTags?: string[]
+  /** Workspace browser account owning this source session. */
+  accountId?: string
   sourceBindingId?: string
   sourceBindingRevisionId?: string
   sourceBindingRevisionNumber?: number
@@ -690,6 +692,7 @@ export function isOpenCLISourceSlotArray(value: unknown): value is OpenCLISource
       !!slot.args &&
       typeof slot.args === "object" &&
       !Array.isArray(slot.args) &&
+      (slot.accountId === undefined || typeof slot.accountId === "string") &&
       (slot.sourceBindingId === undefined || typeof slot.sourceBindingId === "string") &&
       (slot.sourceBindingRevisionId === undefined || typeof slot.sourceBindingRevisionId === "string") &&
       (
@@ -789,6 +792,7 @@ export function buildOpenCLIMultiSourceHDAInternals(
       ...(source.sessionPolicy ? { sessionPolicy: source.sessionPolicy } : {}),
       ...(source.workerTags ? { workerTags: source.workerTags } : {}),
       ...(source.resourceTags ? { resourceTags: source.resourceTags } : {}),
+      ...(source.accountId ? { accountId: source.accountId } : {}),
       ...(source.sourceBindingId ? { sourceBindingId: source.sourceBindingId } : {}),
       ...(source.sourceBindingRevisionId ? { sourceBindingRevisionId: source.sourceBindingRevisionId } : {}),
       ...(source.sourceBindingRevisionNumber
@@ -944,7 +948,8 @@ function opencliAdapterId(site: string): string {
 }
 
 function opencliSourceNodeId(source: OpenCLISourceSlot): string {
-  return `source-${safeIdPart(source.id || source.sourceGroup || source.site)}`
+  const identity = source.accountId ?? source.sourceBindingRevisionId
+  return `source-${safeIdPart(source.id || source.sourceGroup || source.site)}${identity ? `-${safeIdPart(identity)}` : ""}`
 }
 
 function safeIdPart(value: string): string {

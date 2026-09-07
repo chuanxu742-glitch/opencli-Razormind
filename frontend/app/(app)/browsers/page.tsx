@@ -1,7 +1,6 @@
 "use client";
 
 import { BrowserActPacksPanel } from "@/components/browsers/browser-act-packs-panel";
-import { BrowserBindingsPanel } from "@/components/browsers/browser-bindings-panel";
 import { BrowserRuntimeBundlesPanel } from "@/components/browsers/browser-runtime-bundles-panel";
 import { BrowserSpacesPanel } from "@/components/browsers/browser-spaces-panel";
 import { ChromeInstancesPanel } from "@/components/browsers/chrome-instances-panel";
@@ -17,7 +16,6 @@ export default function BrowsersPage() {
     >
       <BrowserRuntimeBundlesPanel />
       <ChromeInstancesPanel />
-      <BrowserBindingsPanel />
       <BrowserSpacesPanel />
       <BrowserActPacksPanel />
     </PageContainer>
