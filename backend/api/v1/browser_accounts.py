@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import secrets
 from datetime import UTC, datetime
 from typing import Literal
-import secrets
+
 from fastapi import (
     APIRouter,
     Depends,
@@ -18,10 +20,11 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
-from sqlalchemy import select
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+
 from backend.database import AsyncSessionLocal, get_db
 from backend.models.browser import BrowserAccount, BrowserAccountStatus, BrowserLoginSession
 from backend.models.browser_portal import BrowserPortalOwner
@@ -39,8 +42,8 @@ from backend.schemas.browser_account import (
     ExternalIdentityV1,
     PortalAuthorizationFactsV1,
     PortalEntryResponseV1,
-    PortalTicketIssueRequestV1,
     PortalTicketIssuedV1,
+    PortalTicketIssueRequestV1,
     PortalTicketRedeemRequestV1,
 )
 from backend.schemas.common import ApiResponse
@@ -53,7 +56,6 @@ from backend.security.workspace_rbac import (
 )
 from backend.services import browser_account_service
 
-
 router = APIRouter(
     prefix="/workspaces/{workspace_id}/browser-accounts",
     tags=["browser-accounts"],
@@ -65,13 +67,13 @@ class LoginSessionRefresh(BaseModel):
 
     expected_view_generation: int = Field(ge=0)
 
+
 class LoginSessionConfirm(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     expected_revision: int = Field(ge=0)
     expected_view_generation: int = Field(ge=0)
     platform_identity: ExternalIdentityV1 | None = None
-
 
 
 class LoginSessionClose(BaseModel):
@@ -102,8 +104,7 @@ def _validate_operation_ref(
     operation: Literal["auth_required", "suspend", "resume", "migrate"],
 ) -> None:
     if body.operation != operation or (
-        body.account_ref.workspace_id != workspace_id
-        or body.account_ref.account_id != account_id
+        body.account_ref.workspace_id != workspace_id or body.account_ref.account_id != account_id
     ):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Browser account operation target not found")
 
@@ -148,6 +149,7 @@ def _effective_revision(
 def _account_ref(workspace_id: str, account_id: str) -> AccountRef:
     return AccountRef(workspace_id=workspace_id, account_id=account_id)
 
+
 @router.get("", response_model=ApiResponse[BrowserAccountListV1])
 async def list_browser_accounts(
     workspace_id: str,
@@ -181,7 +183,9 @@ async def list_browser_accounts(
     )
 
 
-@router.post("", response_model=ApiResponse[BrowserAccountRead], status_code=status.HTTP_201_CREATED)
+@router.post(
+    "", response_model=ApiResponse[BrowserAccountRead], status_code=status.HTTP_201_CREATED
+)
 async def create_browser_account(
     workspace_id: str,
     body: BrowserAccountCreate,
@@ -424,6 +428,8 @@ async def get_account_login_session(
     except browser_account_service.BrowserAccountError as exc:
         raise _http_error(exc) from exc
     return ApiResponse.ok(_session_read(session))
+
+
 @router.post(
     "/{account_id}/login-sessions/{session_id}/view",
     response_model=ApiResponse[BrowserLoginSessionRead],
@@ -470,7 +476,10 @@ async def takeover_account_login_session(
     return ApiResponse.ok(_session_read(session))
 
 
-@router.post("/{account_id}/login-sessions/{session_id}/refresh", response_model=ApiResponse[BrowserLoginSessionRead])
+@router.post(
+    "/{account_id}/login-sessions/{session_id}/refresh",
+    response_model=ApiResponse[BrowserLoginSessionRead],
+)
 async def refresh_account_login_session(
     workspace_id: str,
     account_id: str,
@@ -514,7 +523,9 @@ async def confirm_account_login_session(
     view_generation = (
         expected_view_generation
         if expected_view_generation is not None
-        else body.expected_view_generation if body else None
+        else body.expected_view_generation
+        if body
+        else None
     )
     try:
         session = await browser_account_service.confirm_login_session(
@@ -542,9 +553,7 @@ async def close_account_login_session(
     session_id: str,
     body: LoginSessionClose | None = None,
     if_match: str | None = Header(default=None, alias="If-Match"),
-    reason: Literal["completed", "cancelled", "expired", "error"] = Query(
-        default="cancelled"
-    ),
+    reason: Literal["completed", "cancelled", "expired", "error"] = Query(default="cancelled"),
     identity: RequestIdentity = Depends(get_request_identity),
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse:
@@ -588,6 +597,7 @@ async def get_login_authorization_facts(
     except browser_account_service.BrowserAccountError as exc:
         raise _http_error(exc) from exc
     return ApiResponse.ok(facts)
+
 
 def _http_origin(scheme: str, netloc: str) -> str:
     scheme = {"ws": "http", "wss": "https"}.get(scheme, scheme)
@@ -684,10 +694,7 @@ async def _portal_authorization_monitor() -> None:
                     or snapshot.facts.role not in {"admin", "maintainer", "operator"}
                     or snapshot.facts.session_revoked
                     or snapshot.account_paused
-                    or (
-                        snapshot.account_auth_required
-                        and snapshot.session_purpose != "login"
-                    )
+                    or (snapshot.account_auth_required and snapshot.session_purpose != "login")
                     or snapshot.facts.session_revision != state["session_revision"]
                     or checked_at >= owner_expires_at
                     or checked_at >= owner_hard_expires_at
@@ -703,6 +710,7 @@ def _ensure_portal_authorization_monitor() -> None:
     global _PORTAL_AUTHORIZATION_TASK
     if _PORTAL_AUTHORIZATION_TASK is None or _PORTAL_AUTHORIZATION_TASK.done():
         _PORTAL_AUTHORIZATION_TASK = asyncio.create_task(_portal_authorization_monitor())
+
 
 @router.post(
     "/{account_id}/login-sessions/{session_id}/portal-ticket/issue",
@@ -819,12 +827,18 @@ async def account_portal_websocket(
                 BrowserAccount.id == account_id,
             )
         )
-        authorization = await browser_account_service.get_portal_authorization_batch(
-            db, [(workspace_id, account_id, session_id, owner.subject, digest)]
-        ) if owner is not None else {}
-        authorized = authorization.get(
-            (workspace_id, account_id, session_id, owner.subject, digest)
-        ) if owner is not None else None
+        authorization = (
+            await browser_account_service.get_portal_authorization_batch(
+                db, [(workspace_id, account_id, session_id, owner.subject, digest)]
+            )
+            if owner is not None
+            else {}
+        )
+        authorized = (
+            authorization.get((workspace_id, account_id, session_id, owner.subject, digest))
+            if owner is not None
+            else None
+        )
     if (
         owner is None
         or session is None
@@ -867,10 +881,12 @@ async def account_portal_websocket(
         )
 
         async with AsyncSessionLocal() as db:
-            endpoint, envelope, revision = (
-                await browser_account_service.get_portal_session_envelope(
-                    db, workspace_id, account_id, session_id
-                )
+            (
+                endpoint,
+                envelope,
+                revision,
+            ) = await browser_account_service.get_portal_session_envelope(
+                db, workspace_id, account_id, session_id
             )
         route = await ws_agent_manager.prepare_portal_route(
             endpoint, envelope, session_revision=revision, timeout=15
