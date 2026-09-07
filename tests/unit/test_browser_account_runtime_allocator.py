@@ -103,7 +103,12 @@ if role == "browser":
     server.server_close()
     raise SystemExit(0)
 
-port = int(os.environ["BBX_TCP_PORT"] if role == "bbx" else os.environ["OPENCLI_DAEMON_PORT"])
+if role == "daemon":
+    if "OPENCLI_DAEMON_PORT" in os.environ:
+        raise SystemExit(23)
+    port = 19825
+else:
+    port = int(os.environ["BBX_TCP_PORT"])
 listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 listener.bind(("127.0.0.1", port))
@@ -201,29 +206,29 @@ def _configuration(tmp_path: Path, *, browser_role: str = "browser") -> AccountR
 
 
 def _contracts(
-    *, expires_in: float = 30
+    *, expires_in: float = 30, suffix: str = "1"
 ) -> tuple[DurableCommandV1, NodeClaimV1, SessionEnvelopeV1, NodeIdentityV1]:
     now = datetime.now(UTC)
     command = DurableCommandV1(
-        command_id="command-1",
+        command_id=f"command-{suffix}",
         workspace_id="workspace-1",
-        account_id="account-1",
+        account_id=f"account-{suffix}",
         node_id="node-1",
         kind=BrowserCommandKind.START_LOGIN,
-        idempotency_scope="session:session-1",
+        idempotency_scope=f"session:session-{suffix}",
         idempotency_key="start",
         epoch=1,
         expected_revision=2,
         available_at=now - timedelta(seconds=1),
         expires_at=now + timedelta(minutes=1),
-        session_id="session-1",
+        session_id=f"session-{suffix}",
         payload=EmptyCommandPayloadV1(),
     )
     claim = NodeClaimV1(
         workspace_id="workspace-1",
-        account_id="account-1",
+        account_id=f"account-{suffix}",
         command_id=command.command_id,
-        session_id="session-1",
+        session_id=f"session-{suffix}",
         node_id="node-1",
         boot_id="boot-1",
         epoch=1,
@@ -233,11 +238,11 @@ def _contracts(
     )
     session = SessionEnvelopeV1(
         workspace_id="workspace-1",
-        account_id="account-1",
-        session_id="session-1",
+        account_id=f"account-{suffix}",
+        session_id=f"session-{suffix}",
         node_id="node-1",
         node_boot_id="boot-1",
-        lease_id="lease-1",
+        lease_id=f"lease-{suffix}",
         epoch=1,
         lease_expires_at=claim.expires_at,
         runtime_bundle_id="bundle-2",
@@ -282,7 +287,8 @@ async def test_start_login_allocates_one_real_isolated_stack_and_is_idempotent(
 
     assert second is first
     assert allocator.active_count() == 1
-    assert len({first.binding.cdp_port, first.binding.bbx_port, first.binding.daemon_port}) == 3
+    assert first.binding.daemon_port == 19_825
+    assert len({first.binding.cdp_port, first.binding.bbx_port}) == 2
     assert first.binding.display != ":99"
     assert first.binding.profile_dir != first.binding.home_dir
     assert first.binding.profile_dir != first.binding.cache_dir
@@ -321,6 +327,42 @@ async def test_start_login_allocates_one_real_isolated_stack_and_is_idempotent(
             node_id=identity.node_id,
             boot_id=identity.boot_id,
             epoch=claim.epoch,
+        )
+
+
+@pytest.mark.asyncio
+async def test_second_account_stack_fails_closed_on_fixed_opencli_transport(
+    tmp_path: Path,
+) -> None:
+    allocator = BrowserAccountRuntimeAllocator(_configuration(tmp_path))
+    first_command, first_claim, first_session, identity = _contracts()
+    second_command, second_claim, second_session, _ = _contracts(suffix="2")
+    first = await allocator.start(
+        command=first_command,
+        claim=first_claim,
+        session=first_session,
+        node_identity=identity,
+    )
+
+    try:
+        with pytest.raises(
+            BrowserRuntimeError,
+            match="fixed OpenCLI daemon transport is already in use",
+        ):
+            await allocator.start(
+                command=second_command,
+                claim=second_claim,
+                session=second_session,
+                node_identity=identity,
+            )
+        assert allocator.active_count() == 1
+        assert _accepts(first.binding.daemon_port)
+    finally:
+        await allocator.stop(
+            session_id=first_session.session_id,
+            node_id=identity.node_id,
+            boot_id=identity.boot_id,
+            epoch=first_claim.epoch,
         )
 
 

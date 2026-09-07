@@ -173,7 +173,7 @@ elif [ "$HAVE_CHROME" = "true" ]; then
   DAEMON_JS="$(npm root -g)/@jackwener/opencli/dist/src/daemon.js"
   if [ -f "$DAEMON_JS" ]; then
     (while true; do
-      OPENCLI_DAEMON_LISTEN=127.0.0.1 node "$DAEMON_JS"
+      env -u OPENCLI_DAEMON_PORT OPENCLI_DAEMON_LISTEN=127.0.0.1 node "$DAEMON_JS"
       echo "[agent] Bridge daemon exited, restarting in 1s..."
       sleep 1
     done) &

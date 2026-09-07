@@ -164,6 +164,16 @@ def test_anonymous_agent_profiles_are_fresh_per_agent_start():
     assert "mktemp -d /tmp/opencli-anonymous-profile.XXXXXX" in installer
 
 
+def test_legacy_agent_daemon_unsets_inherited_opencli_port():
+    entrypoint = (ROOT / "agent" / "entrypoint.sh").read_text(encoding="utf-8")
+
+    daemon_launch = (
+        "env -u OPENCLI_DAEMON_PORT OPENCLI_DAEMON_LISTEN=127.0.0.1 "
+        'node "$DAEMON_JS"'
+    )
+    assert daemon_launch in entrypoint
+
+
 def test_vnc_agent_image_is_the_registered_browser_bridge_runtime():
     dockerfile = (ROOT / "agent" / "Dockerfile").read_text(encoding="utf-8")
     entrypoint = (ROOT / "agent" / "entrypoint.sh").read_text(encoding="utf-8")
@@ -181,7 +191,6 @@ def test_vnc_agent_image_is_the_registered_browser_bridge_runtime():
     assert "COPY backend/agent_server.py ./backend/agent_server.py" in dockerfile
     assert "bbx install" in entrypoint
     assert "bbx-daemon" in entrypoint
-    assert "env -u OPENCLI_DAEMON_PORT" in entrypoint
     assert "--profile-directory=Default" in entrypoint
     assert "--no-first-run" in entrypoint
     assert "patch-browser-bridge-autostart.mjs" in dockerfile

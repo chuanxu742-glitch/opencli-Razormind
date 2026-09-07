@@ -52,6 +52,9 @@ _PASSWORD_DATABASE_SIDECARS = {
     "Login Data For Account-journal",
 }
 _MAX_PASSWORD_SCAN_ENTRIES = 100_000
+# OpenCLI 1.8.7 and its Chrome extension intentionally share this fixed port.
+# Per-session daemon ports split the extension from its daemon and are unsupported.
+_OPENCLI_DAEMON_PORT = 19_825
 
 
 class BrowserRuntimeError(RuntimeError):
@@ -511,6 +514,7 @@ class StackIsolation:
     def environment(self, base: Mapping[str, str] | None = None) -> dict[str, str]:
         self.validate()
         env = dict(base or os.environ)
+        env.pop("OPENCLI_DAEMON_PORT", None)
         env.update(
             {
                 "DISPLAY": self.display,
@@ -520,7 +524,6 @@ class StackIsolation:
                 "CLOAKBROWSER_CACHE_DIR": str(self.cache_dir),
                 "OPENCLI_CDP_ENDPOINT": f"http://127.0.0.1:{self.cdp_port}",
                 "OPENCLI_DAEMON_HOST": "127.0.0.1",
-                "OPENCLI_DAEMON_PORT": str(self.daemon_port),
                 "BBX_TCP_HOST": "127.0.0.1",
                 "BBX_TCP_BIND_HOST": "127.0.0.1",
                 "BBX_TCP_PORT": str(self.bbx_port),
@@ -2325,10 +2328,10 @@ class AccountRuntimeConfiguration:
                 "runtime_configuration_invalid",
                 "account runtime port range is invalid",
             )
-        if self.port_max - self.port_min < 2:
+        if self.port_max - self.port_min < 1:
             raise BrowserRuntimeError(
                 "runtime_configuration_invalid",
-                "account runtime port range must contain at least three ports",
+                "account runtime port range must contain at least two ports",
             )
         if not 0 < self.startup_timeout <= 120:
             raise BrowserRuntimeError(
@@ -3068,23 +3071,34 @@ class BrowserAccountRuntimeAllocator:
                     "capacity_missing",
                     "no isolated X display is available",
                 )
+            if _OPENCLI_DAEMON_PORT in self._ports or not _local_port_available(
+                _OPENCLI_DAEMON_PORT
+            ):
+                raise BrowserRuntimeError(
+                    "capacity_missing",
+                    "the fixed OpenCLI daemon transport is already in use on this node",
+                )
             ports: list[int] = []
             for candidate in range(
                 self.configuration.port_min,
                 self.configuration.port_max + 1,
             ):
-                if candidate in self._ports or not _local_port_available(candidate):
+                if (
+                    candidate == _OPENCLI_DAEMON_PORT
+                    or candidate in self._ports
+                    or not _local_port_available(candidate)
+                ):
                     continue
                 ports.append(candidate)
-                if len(ports) == 3:
+                if len(ports) == 2:
                     break
-            if len(ports) != 3:
+            if len(ports) != 2:
                 raise BrowserRuntimeError(
                     "capacity_missing",
-                    "three isolated runtime ports are unavailable",
+                    "two isolated runtime ports are unavailable",
                 )
             self._displays.add(display_number)
-            self._ports.update(ports)
+            self._ports.update((*ports, _OPENCLI_DAEMON_PORT))
         try:
             session_root = self.configuration.runtime_root / workspace_id / session_id
             home_dir = session_root / "home"
@@ -3096,7 +3110,7 @@ class BrowserAccountRuntimeAllocator:
                 display=f":{display_number}",
                 cdp_port=ports[0],
                 bbx_port=ports[1],
-                daemon_port=ports[2],
+                daemon_port=_OPENCLI_DAEMON_PORT,
                 home_dir=home_dir,
                 cache_dir=cache_dir,
                 profile_dir=profile_dir,
@@ -3106,7 +3120,7 @@ class BrowserAccountRuntimeAllocator:
         except BaseException:
             with self._state_lock:
                 self._displays.discard(display_number)
-                self._ports.difference_update(ports)
+                self._ports.difference_update((*ports, _OPENCLI_DAEMON_PORT))
             raise
 
     async def _wait_until_ready(
