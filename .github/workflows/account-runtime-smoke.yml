@@ -1,0 +1,97 @@
+name: account-runtime-smoke
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - codex/**
+    paths:
+      - agent/Dockerfile
+      - agent/entrypoint.sh
+      - backend/browser_account_runtime.py
+      - tests/unit/test_process_tree_supervisor.py
+      - chrome/runtime-bundles/**
+      - chrome/script-host/**
+      - scripts/verify_account_runtime_container.py
+      - .github/workflows/account-runtime-smoke.yml
+
+permissions:
+  contents: read
+
+jobs:
+  managed-account-runtime:
+    name: Linux managed account runtime
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Build the current agent image
+        env:
+          IMAGE: account-runtime-smoke:${{ github.sha }}
+        run: timeout 900 docker build --file agent/Dockerfile --tag "$IMAGE" .
+
+      - name: Run POSIX process-tree regression
+        env:
+          IMAGE: account-runtime-smoke:${{ github.sha }}
+        run: |
+          set -euo pipefail
+          timeout 60 docker run --rm --init \
+            --mount "type=bind,src=$PWD/tests/unit/test_process_tree_supervisor.py,dst=/verification/test_process_tree_supervisor.py,readonly" \
+            --entrypoint python "$IMAGE" /verification/test_process_tree_supervisor.py
+
+      - name: Run isolated managed account runtimes
+        env:
+          IMAGE: account-runtime-smoke:${{ github.sha }}
+          NETWORK: account-runtime-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          FIRST: account-runtime-smoke-first-${{ github.run_id }}-${{ github.run_attempt }}
+          SECOND: account-runtime-smoke-second-${{ github.run_id }}-${{ github.run_attempt }}
+          COORDINATION: ${{ runner.temp }}/account-runtime-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          timeout 30 install -d -m 0777 "$COORDINATION"
+          timeout 30 docker network create "$NETWORK"
+          timeout 60 docker run --detach --init --name "$FIRST" --network "$NETWORK" \
+            --mount "type=bind,src=$PWD/scripts,dst=/verification,readonly" \
+            --mount "type=bind,src=$COORDINATION,dst=/coordination" \
+            --entrypoint python "$IMAGE" /verification/verify_account_runtime_container.py \
+            --barrier-dir /coordination --participant first
+          timeout 60 docker run --detach --init --name "$SECOND" --network "$NETWORK" \
+            --mount "type=bind,src=$PWD/scripts,dst=/verification,readonly" \
+            --mount "type=bind,src=$COORDINATION,dst=/coordination" \
+            --entrypoint python "$IMAGE" /verification/verify_account_runtime_container.py \
+            --barrier-dir /coordination --participant second
+          first_status="$(timeout 720 docker wait "$FIRST")"
+          second_status="$(timeout 720 docker wait "$SECOND")"
+          test "$first_status" = 0
+          test "$second_status" = 0
+
+      - name: Show bounded verification reports
+        if: always()
+        env:
+          FIRST: account-runtime-smoke-first-${{ github.run_id }}-${{ github.run_attempt }}
+          SECOND: account-runtime-smoke-second-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          timeout 30 docker logs "$FIRST" 2>/dev/null || true
+          timeout 30 docker logs "$SECOND" 2>/dev/null || true
+
+      - name: Remove ephemeral runtime containers and image
+        if: always()
+        env:
+          IMAGE: account-runtime-smoke:${{ github.sha }}
+          NETWORK: account-runtime-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          FIRST: account-runtime-smoke-first-${{ github.run_id }}-${{ github.run_attempt }}
+          SECOND: account-runtime-smoke-second-${{ github.run_id }}-${{ github.run_attempt }}
+          COORDINATION: ${{ runner.temp }}/account-runtime-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          timeout 60 docker rm --force "$FIRST" 2>/dev/null || true
+          timeout 60 docker rm --force "$SECOND" 2>/dev/null || true
+          timeout 30 docker network rm "$NETWORK" 2>/dev/null || true
+          timeout 60 docker image rm --force "$IMAGE" 2>/dev/null || true
+          timeout 30 rm -rf -- "$COORDINATION" || true
