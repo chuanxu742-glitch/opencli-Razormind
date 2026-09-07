@@ -13,6 +13,7 @@ import json
 import os
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Iterator
@@ -44,6 +45,10 @@ _BARRIER_TIMEOUT_SECONDS = 120.0
 
 class VerificationError(RuntimeError):
     """The container did not prove the managed runtime contract."""
+
+
+def _phase(participant: str, phase: str) -> None:
+    print(json.dumps({"namespace_participant": participant, "phase": phase}), flush=True)
 
 
 class _LoginHandler(BaseHTTPRequestHandler):
@@ -257,9 +262,11 @@ async def verify(*, barrier_dir: Path, participant: str) -> dict[str, Any]:
         command, claim, session, identity = _contracts()
         allocator = BrowserAccountRuntimeAllocator.from_environment()
         with controlled_login_site():
+            _phase(participant, "starting_runtime")
             first = await allocator.start(
                 command=command, claim=claim, session=session, node_identity=identity
             )
+            _phase(participant, "runtime_started")
             try:
                 if allocator.active_count() != 1:
                     raise VerificationError("allocator did not retain exactly one live stack")
@@ -277,7 +284,9 @@ async def verify(*, barrier_dir: Path, participant: str) -> dict[str, Any]:
                         "CDP, Browser Bridge, or OpenCLI daemon is not reachable"
                     )
                 _require_connected_opencli_extension(first.binding.daemon_port)
+                _phase(participant, "extension_connected")
                 _prove_simultaneous_namespaces(barrier_dir, participant)
+                _phase(participant, "both_namespaces_live")
                 second_command, second_claim, second_session, _ = _contracts()
                 second_command = second_command.model_copy(
                     update={"command_id": "smoke-command-2", "session_id": "smoke-session-2"}
@@ -308,6 +317,7 @@ async def verify(*, barrier_dir: Path, participant: str) -> dict[str, Any]:
                     raise VerificationError("second fixed-port stack unexpectedly started")
                 if allocator.active_count() != 1 or not _accepts(first.binding.daemon_port):
                     raise VerificationError("rejected second stack harmed the first stack")
+                _phase(participant, "same_namespace_capacity_rejected")
                 await allocator.stop(
                     session_id=session.session_id,
                     node_id=identity.node_id,
@@ -330,8 +340,18 @@ async def verify(*, barrier_dir: Path, participant: str) -> dict[str, Any]:
                     raise VerificationError("confirmed stop left an account-runtime port open")
                 if allocator.active_count() != 0:
                     raise VerificationError("allocator retained a stopped stack")
+                _phase(participant, "processes_and_ports_released")
             finally:
-                await allocator.close_all()
+                original_error = sys.exception()
+                try:
+                    await allocator.close_all()
+                except Exception as cleanup_error:
+                    if original_error is None:
+                        raise
+                    print(
+                        json.dumps({"cleanup_error": str(cleanup_error)}),
+                        flush=True,
+                    )
     return {
         "ready": True,
         "evidence_scope": (
