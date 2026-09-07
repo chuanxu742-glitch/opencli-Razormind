@@ -20,8 +20,9 @@ from backend.models.browser import (
     BrowserRuntimeBundle,
 )
 from backend.models.edge_node import EdgeNode
-from backend.models.identity import Workspace
+from backend.models.identity import User, Workspace, WorkspaceMembership, WorkspaceRole
 from backend.models.source import DataSource
+from backend.models.task import CollectionTask
 from backend.pipeline.pipeline import _resolve_account_execution
 from backend.schemas.browser_account import SessionEnvelopeV1
 from backend.services.browser_service import inspect_legacy_binding_migration
@@ -170,15 +171,30 @@ async def test_pipeline_account_resolution_preserves_node_generation(
         channel_type="opencli",
         channel_config={"workspace_id": workspace.id, "account_id": account.id},
     )
+    actor = User(id="caller-1", subject="execution-fixture-actor", disabled=False)
+    task = CollectionTask(
+        id="execution-1",
+        source_id=source.id,
+        requested_by_user_id=actor.id,
+        trigger_type="manual",
+        parameters={},
+    )
+    db_session.add_all([
+        actor, source, task,
+        WorkspaceMembership(
+            workspace_id=workspace.id, user_id=actor.id, role=WorkspaceRole.OPERATOR
+        ),
+    ])
+    await db_session.commit()
     with patch("backend.database.AsyncSessionLocal", _sessionmaker(db_engine)):
         if session_boot == "boot-stale":
             with pytest.raises(RuntimeError, match="lease_waiting"):
                 await _resolve_account_execution(
-                    source, {"execution_id": "execution-1", "caller_id": "caller-1"}
+                    task.id, source, {}
                 )
         else:
             ref, envelope = await _resolve_account_execution(
-                source, {"execution_id": "execution-1", "caller_id": "caller-1"}
+                task.id, source, {}
             )
             assert ref.account_id == account.id
             assert envelope.session_id == session.id
