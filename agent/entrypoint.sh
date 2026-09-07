@@ -130,46 +130,22 @@ signal_group() {
   group_alive "$pid" && kill "-$signal" -- "-$pid" 2>/dev/null || true
 }
 
-signal_runtime_children() {
+signal_aux_children() {
   local signal="$1"
-  signal_pid "$signal" "$UVICORN_PID"
-  signal_pid "$signal" "$CHROME_SUPERVISOR_PID"
   local pid
   for pid in "${AUX_GROUP_PIDS[@]}"; do signal_group "$signal" "$pid"; done
   for pid in "${AUX_DIRECT_PIDS[@]}"; do signal_pid "$signal" "$pid"; done
 }
 
-runtime_children_alive() {
-  if pid_alive "$UVICORN_PID" || pid_alive "$CHROME_SUPERVISOR_PID"; then
-    return 0
-  fi
+primary_children_alive() {
+  pid_alive "$UVICORN_PID" || pid_alive "$CHROME_SUPERVISOR_PID"
+}
+
+aux_children_alive() {
   local pid
   for pid in "${AUX_GROUP_PIDS[@]}"; do group_alive "$pid" && return 0; done
   for pid in "${AUX_DIRECT_PIDS[@]}"; do pid_alive "$pid" && return 0; done
   return 1
-}
-
-force_stop_runtime_children() {
-  local pid
-  signal_runtime_children KILL
-  for pid in "${AUX_GROUP_PIDS[@]}"; do
-    group_alive "$pid" && kill -KILL -- "-$pid" 2>/dev/null || true
-  done
-}
-
-request_shutdown() {
-  [ "$SHUTDOWN_REQUESTED" = true ] && return 0
-  SHUTDOWN_REQUESTED=true
-  local signal="${1:-TERM}"
-  case "$signal" in TERM|INT|HUP) ;; *) signal=TERM ;; esac
-  echo "[agent] Shutdown requested ($signal); stopping supervised children" >&2
-  signal_runtime_children "$signal"
-  for _ in $(seq 1 40); do
-    runtime_children_alive || return 0
-    sleep 0.1
-  done
-  echo "[agent] Supervised children did not exit within 4s; forcing shutdown" >&2
-  force_stop_runtime_children
 }
 
 reap_pid() {
@@ -178,9 +154,56 @@ reap_pid() {
   wait "$pid" 2>/dev/null || true
 }
 
-trap 'request_shutdown TERM' TERM
-trap 'request_shutdown INT' INT
-trap 'request_shutdown HUP' HUP
+request_shutdown() {
+  [ "$SHUTDOWN_REQUESTED" = true ] && return 0
+  SHUTDOWN_REQUESTED=true
+  local signal="${1:-TERM}"
+  case "$signal" in TERM|INT|HUP) ;; *) signal=TERM ;; esac
+  echo "[agent] Shutdown requested ($signal); stopping API and browser" >&2
+
+  # Let Uvicorn run its lifespan cleanup while the Chrome supervisor closes
+  # Chromium through CDP. Display and bridge helpers must remain available
+  # until Chromium has released its profile.
+  signal_pid "$signal" "$UVICORN_PID"
+  signal_pid TERM "$CHROME_SUPERVISOR_PID"
+  for _ in $(seq 1 60); do
+    primary_children_alive || break
+    sleep 0.1
+  done
+  if primary_children_alive; then
+    echo "[agent] API or browser supervisor exceeded its 6s shutdown budget; forcing owned processes" >&2
+    signal_pid KILL "$UVICORN_PID"
+    signal_pid KILL "$CHROME_SUPERVISOR_PID"
+  fi
+  reap_pid "$UVICORN_PID"
+  reap_pid "$CHROME_SUPERVISOR_PID"
+
+  signal_aux_children TERM
+  for _ in $(seq 1 15); do
+    aux_children_alive || break
+    sleep 0.1
+  done
+  if aux_children_alive; then
+    echo "[agent] Auxiliary processes exceeded their 1.5s shutdown budget; forcing owned process groups" >&2
+    signal_aux_children KILL
+  fi
+
+  local pid
+  for pid in "${AUX_GROUP_PIDS[@]}"; do reap_pid "$pid"; done
+  for pid in "${AUX_DIRECT_PIDS[@]}"; do reap_pid "$pid"; done
+}
+
+handle_signal() {
+  local signal="$1"
+  local status="$2"
+  request_shutdown "$signal"
+  trap - EXIT
+  exit "$status"
+}
+
+trap 'handle_signal TERM 143' TERM
+trap 'handle_signal INT 130' INT
+trap 'handle_signal HUP 129' HUP
 trap 'request_shutdown TERM' EXIT
 
 start_aux_process() {
@@ -307,31 +330,90 @@ elif [ "$HAVE_CHROME" = "true" ]; then
       exec "$CHROME_BIN" --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --remote-allow-origins='*' --no-sandbox --disable-dev-shm-usage --no-first-run --no-default-browser-check --disable-session-crashed-bubble --disable-save-password-bubble --user-data-dir="$CHROME_PROFILE" --profile-directory=Default "${CHROME_EXTRA_FLAGS[@]}" --window-size=1280,900 "$@"
     fi
   }
+  request_chrome_close() {
+    local pid="${1:-}"
+    pid_alive "$pid" || return 0
+    node -e '
+const endpoint = process.argv[1].replace(/\/+$/, "");
+const deadline = setTimeout(() => process.exit(1), 1000);
+let socket;
+let sent = false;
+let settled = false;
+const finish = (status) => {
+  if (settled) return;
+  settled = true;
+  clearTimeout(deadline);
+  try { socket?.close(); } catch {}
+  process.exit(status);
+};
+(async () => {
+  const response = await fetch(`${endpoint}/json/version`, {
+    signal: AbortSignal.timeout(500),
+  });
+  if (!response.ok) throw new Error(`CDP returned ${response.status}`);
+  const metadata = await response.json();
+  if (typeof metadata.webSocketDebuggerUrl !== "string") {
+    throw new Error("CDP browser WebSocket is unavailable");
+  }
+  socket = new WebSocket(metadata.webSocketDebuggerUrl);
+  socket.addEventListener("open", () => {
+    sent = true;
+    socket.send(JSON.stringify({id: 1, method: "Browser.close"}));
+  });
+  socket.addEventListener("message", (event) => {
+    const message = JSON.parse(String(event.data));
+    if (message.id === 1) finish(message.error ? 1 : 0);
+  });
+  socket.addEventListener("close", () => finish(sent ? 0 : 1));
+  socket.addEventListener("error", () => finish(1));
+})().catch(() => finish(1));
+' "$OPENCLI_CDP_ENDPOINT" >/dev/null 2>&1
+  }
   stop_chrome_tree() {
     local pid="${1:-}"
     [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+    if pid_alive "$pid"; then
+      if request_chrome_close "$pid"; then
+        echo "[agent] Chromium Browser.close requested through CDP" >&2
+      else
+        echo "[agent] Chromium CDP close unavailable; falling back to TERM" >&2
+      fi
+    fi
     if [ "$CHROME_SESSION_MODE" = "true" ]; then
+      for _ in $(seq 1 20); do
+        group_alive "$pid" || break
+        sleep 0.1
+      done
       signal_group TERM "$pid"
-      for _ in $(seq 1 40); do
+      for _ in $(seq 1 10); do
         group_alive "$pid" || break
         sleep 0.1
       done
       signal_group KILL "$pid"
     else
+      for _ in $(seq 1 20); do
+        pid_alive "$pid" || break
+        sleep 0.1
+      done
       signal_pid TERM "$pid"
-      sleep 1
+      for _ in $(seq 1 10); do
+        pid_alive "$pid" || break
+        sleep 0.1
+      done
       signal_pid KILL "$pid"
     fi
+    reap_pid "$pid"
   }
   stop_runtime_check() {
     local pid="${1:-}"
     [[ "$pid" =~ ^[0-9]+$ ]] || return 0
     signal_pid TERM "$pid"
-    for _ in $(seq 1 20); do
+    for _ in $(seq 1 5); do
       pid_alive "$pid" || break
       sleep 0.1
     done
     signal_pid KILL "$pid"
+    reap_pid "$pid"
   }
 
 
@@ -355,18 +437,27 @@ elif [ "$HAVE_CHROME" = "true" ]; then
     return 1
   }
   (
-    trap 'stop_runtime_check "${CHECK_PID:-}"; stop_chrome_tree "${CHROME_PID:-}"; exit 143' TERM INT
-    trap 'stop_runtime_check "${CHECK_PID:-}"; stop_chrome_tree "${CHROME_PID:-}"' EXIT
+    CHROME_SUPERVISOR_STOPPED=false
+    shutdown_chrome_supervisor() {
+      [ "$CHROME_SUPERVISOR_STOPPED" = true ] && return 0
+      CHROME_SUPERVISOR_STOPPED=true
+      stop_runtime_check "${CHECK_PID:-}"
+      stop_chrome_tree "${CHROME_PID:-}"
+      rm -f "$BROWSER_RUNTIME_REPORT_FILE"
+    }
+    trap 'shutdown_chrome_supervisor; exit 143' TERM INT HUP
+    trap 'shutdown_chrome_supervisor' EXIT
     while true; do
       rm -f "$BROWSER_RUNTIME_REPORT_FILE"
-      stop_chrome_tree "${CHROME_PID:-}"
       start_chrome "${STARTUP_PAGES[@]}" &
       CHROME_PID=$!
       run_runtime_self_check &
       CHECK_PID=$!
       wait "$CHROME_PID" || true
-      kill "$CHECK_PID" 2>/dev/null || true
-      wait "$CHECK_PID" 2>/dev/null || true
+      stop_runtime_check "$CHECK_PID"
+      stop_chrome_tree "$CHROME_PID"
+      CHECK_PID=
+      CHROME_PID=
       rm -f "$BROWSER_RUNTIME_REPORT_FILE"
       echo "[agent] Chrome exited, restarting in 2s..."
       sleep 2
@@ -395,22 +486,14 @@ fi
 
 uvicorn backend.agent_server:app --host 0.0.0.0 --port "${AGENT_PORT:-19823}" --log-level info &
 UVICORN_PID=$!
-UVICORN_STATUS=0
-while :; do
-  if wait "$UVICORN_PID"; then
-    UVICORN_STATUS=$?
-    break
-  fi
+if wait "$UVICORN_PID"; then
+  UVICORN_STATUS=0
+else
   UVICORN_STATUS=$?
-  if [ "$SHUTDOWN_REQUESTED" != true ] || ! pid_alive "$UVICORN_PID"; then
-    break
-  fi
-done
+fi
 
 if [ "$SHUTDOWN_REQUESTED" != true ]; then
   request_shutdown TERM
 fi
-reap_pid "$UVICORN_PID"
-reap_pid "$CHROME_SUPERVISOR_PID"
-for _pid in "${AUX_GROUP_PIDS[@]}"; do reap_pid "$_pid"; done
-for _pid in "${AUX_DIRECT_PIDS[@]}"; do reap_pid "$_pid"; done
+trap - EXIT
+exit "$UVICORN_STATUS"

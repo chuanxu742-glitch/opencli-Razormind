@@ -38,6 +38,7 @@ class AgentEntrypointLifecycleTests(unittest.TestCase):
 set -e
 if [ "$1" = "-e" ]; then
   case "$2" in
+    *Browser.close*) printf 'requested\n' > "$FAKE_STATE/browser-close.requested" ;;
     *direct*restricted*) printf 'direct' ;;
     *'filter((target)=>target.type') printf '0' ;;
   esac
@@ -52,10 +53,11 @@ case "$1" in
     ;;
   */daemon.js)
     printf '%s\n' "$$" > "$FAKE_STATE/daemon.pid"
-    trap 'printf term > "$FAKE_STATE/daemon.term"; exit 0' TERM INT
+    printf '%s\n' "$PPID" > "$FAKE_STATE/daemon-supervisor.pid"
+    trap '[ -f "$FAKE_STATE/chromium.exited" ] || printf early > "$FAKE_STATE/daemon.before-chromium"; printf term > "$FAKE_STATE/daemon.term"; exit 0' TERM INT
     while :; do sleep 0.05; done
-    ;;
 esac
+exit 0
 ''',
         )
         self._write_executable(
@@ -76,7 +78,8 @@ exit 0
                 fake_bin / name,
                 f'''#!/bin/bash
 printf '%s\\n' "$$" > "$FAKE_STATE/{name}.pid"
-trap 'printf term > "$FAKE_STATE/{name}.term"; exit 0' TERM INT
+printf '%s\\n' "$PPID" > "$FAKE_STATE/{name}-supervisor.pid"
+trap '[ -f "$FAKE_STATE/chromium.exited" ] || printf early > "$FAKE_STATE/{name}.before-chromium"; printf term > "$FAKE_STATE/{name}.term"; exit 0' TERM INT
 while :; do sleep 0.05; done
 ''',
             )
@@ -85,8 +88,11 @@ while :; do sleep 0.05; done
             r'''#!/bin/bash
 printf '%s\n' "$$" >> "$FAKE_STATE/chromium.starts"
 printf '%s\n' "$$" > "$FAKE_STATE/chromium.pid"
-trap 'printf term > "$FAKE_STATE/chromium.term"; exit 0' TERM INT
-while :; do sleep 0.05; done
+printf '%s\n' "$PPID" > "$FAKE_STATE/chrome-supervisor.pid"
+trap 'printf term > "$FAKE_STATE/chromium.term"; printf exited > "$FAKE_STATE/chromium.exited"; exit 0' TERM INT
+while [ ! -f "$FAKE_STATE/browser-close.requested" ]; do sleep 0.05; done
+printf graceful > "$FAKE_STATE/chromium.graceful"
+printf exited > "$FAKE_STATE/chromium.exited"
 ''',
         )
         self._write_executable(
@@ -167,6 +173,12 @@ while :; do sleep 0.05; done
                 time.sleep(0.05)
             self.fail(f"process {pid} survived coordinated shutdown")
 
+    def _assert_all_recorded_processes_dead(self, state: Path) -> None:
+        pid_files = sorted(state.glob("*.pid"))
+        self.assertTrue(pid_files, "fixture recorded no process IDs")
+        for path in pid_files:
+            self._assert_dead(int(path.read_text()))
+
     def test_embedded_stack_forwards_term_and_does_not_restart_chromium(self) -> None:
         with TemporaryDirectory(prefix="agent-entrypoint-lifecycle-") as temp:
             env, state = self._fixture(Path(temp), embedded=True)
@@ -187,13 +199,16 @@ while :; do sleep 0.05; done
                 if process.poll() is None:
                     process.kill()
                     process.wait(timeout=3)
-            self.assertEqual(process.returncode, 0, output)
+            self.assertEqual(process.returncode, 143, output)
             self.assertTrue((state / "uvicorn.term").exists(), output)
-            self.assertTrue((state / "chromium.term").exists(), output)
+            self.assertTrue((state / "browser-close.requested").exists(), output)
+            self.assertTrue((state / "chromium.graceful").exists(), output)
+            self.assertFalse((state / "chromium.term").exists(), output)
             for name in ("xvfb", "nginx", "x11vnc", "websockify", "bbx-daemon", "daemon"):
                 self.assertTrue((state / f"{name}.term").exists(), output)
+                self.assertFalse((state / f"{name}.before-chromium").exists(), output)
             self.assertEqual(len((state / "chromium.starts").read_text().splitlines()), 1, output)
-            self._assert_dead(int((state / "chromium.pid").read_text()))
+            self._assert_all_recorded_processes_dead(state)
 
     def test_host_mode_preserves_uvicorn_exit_status_and_cleans_children(self) -> None:
         with TemporaryDirectory(prefix="agent-entrypoint-host-") as temp:
@@ -210,6 +225,7 @@ while :; do sleep 0.05; done
             self.assertEqual(process.returncode, 7, process.stdout + process.stderr)
             self.assertTrue((state / "uvicorn.pid").exists())
             self.assertFalse((state / "chromium.starts").exists())
+            self._assert_all_recorded_processes_dead(state)
 
 
 if __name__ == "__main__":
