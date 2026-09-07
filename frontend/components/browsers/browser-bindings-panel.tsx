@@ -136,7 +136,7 @@ function AddBindingDialog() {
   )
 }
 
-export function BrowserBindingsPanel() {
+function LegacyBrowserBindingsPanel() {
   const { data, isLoading, isError, error } = useBrowserBindings()
   const bindings = data ?? []
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
@@ -215,6 +215,27 @@ export function BrowserBindingsPanel() {
           </Table>
         )}
       </CardContent>
+    </Card>
+  )
+}
+
+/**
+ * The old site → endpoint binding editor is intentionally no longer mounted.
+ * Account ownership and verified sessions are managed from the account route;
+ * this compatibility surface keeps a clear migration path for old imports.
+ */
+export function BrowserBindingsPanel() {
+  return (
+    <Card className="overflow-hidden py-0">
+      <CardHeader className="border-b bg-muted/20 py-4">
+        <CardTitle className="text-base">Browser account bindings</CardTitle>
+        <CardDescription>
+          Legacy site bindings no longer assign browser identities. Select a workspace account and its pinned session from the account manager.
+        </CardDescription>
+        <CardAction>
+          <Button render={<a href="/browser-accounts" />} variant="outline" size="sm">Open account manager</Button>
+        </CardAction>
+      </CardHeader>
     </Card>
   )
 }

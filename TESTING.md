@@ -634,11 +634,39 @@ uv run pytest --no-cov --confcutdir=tests/integration `
 ```
 
 The proof upgrades through `add_browser_accounts` and then `head` (the recovered
-`refine_browser_account_contract` revision), verifies the source-only legacy
+`add_browser_portal_security` revision), verifies the source-only legacy
 binding remains readable with its workspace backfilled, and rejects a
 cross-workspace account reference through the composite foreign key. A passing
 test is migration/constraint evidence only; it does not claim scheduler,
 node-fencing, browser, Docker, Redis, or real-platform acceptance.
+
+### 真实账号 API happy-path
+
+在专用 workspace 和已认证 API 会话上运行真实 HTTP 客户端；脚本不使用 ASGI
+mock、内部函数回声或源码字符串断言。`OPENCLI_BEARER_TOKEN` 使用工作区操作员
+或管理员 token，`OPENCLI_API_TOKEN` 仅在部署启用 fleet token 时设置：
+
+```powershell
+$env:OPENCLI_ADMIN_API = "http://127.0.0.1:8031/api/v1"
+$env:OPENCLI_BEARER_TOKEN = "<workspace-operator-token>"
+$env:QRAC2_WORKSPACE_ID = "<dedicated-test-workspace>"
+uv run python scripts/smoke_browser_account_api.py
+```
+
+该流程实际验证账号 POST/GET/list/PATCH 修订 CAS、login-session 创建/列表/GET/
+view、portal ticket issue/redeem 的 body-only secret、同源校验、一次兑换后的
+`qrac2_portal` HttpOnly cookie，以及带 `If-Match` 的 close。账号 API 没有 DELETE，
+所以脚本必须只在可丢弃 workspace 运行，输出不会打印 ticket、CSRF 或 Cookie。
+
+前后端二进制往返仍需在实际前端/WS 部署槽执行；后端固定 16-byte header 的定向
+回归为：
+
+```bash
+uv run pytest --no-cov tests/unit/test_qrac2_g_contract_repairs.py
+```
+
+该定向回归不是前端、双中心、节点 fencing、真实平台或 10M 容量证明；这些项目
+必须由 I 使用各自真实环境证据单列。
 
 ### 分布式与浏览器前置
 

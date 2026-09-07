@@ -331,6 +331,12 @@ async def create_space(
         )
         if session is None or session.status in {"closed", "expired", "error"}:
             raise BrowserSpaceError("not_found", "login session not found", 404)
+        if session.instance_id != instance_id:
+            raise BrowserSpaceError(
+                "instance_mismatch",
+                "browser space must bind the session's actual instance",
+                409,
+            )
         lease = await db.scalar(
             select(BrowserAccountLease).where(
                 BrowserAccountLease.workspace_id == workspace_id,
@@ -340,7 +346,12 @@ async def create_space(
                 BrowserAccountLease.expires_at > datetime.now(UTC),
             )
         )
-        if lease is None or session.lease_id != lease_id or session.epoch != lease.epoch:
+        if (
+            lease is None
+            or session.lease_id != lease_id
+            or session.epoch != lease.epoch
+            or session.node_id != lease.node_id
+        ):
             raise BrowserSpaceError("lease_lost", "account lease is not active", 409)
     active = await db.scalar(
         select(BrowserSpace.id)

@@ -1,6 +1,7 @@
 'use client'
 
 import { useEffect, useMemo, useState } from 'react'
+import Link from 'next/link'
 import { useSearchParams } from 'next/navigation'
 import { Loader2, Pause, Plus, X } from 'lucide-react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
@@ -21,6 +22,7 @@ import {
   type BrowserSpaceEvent,
   type BrowserSpaceOwnerType,
 } from '@/lib/api/browser-spaces'
+import { listBrowserAccounts } from '@/lib/api/browser-accounts'
 import { BACKEND_HINT, EmptyState, ErrorState, LoadingState } from '@/components/shell/data-states'
 import { StatusBadge } from '@/components/shell/status-badge'
 import { Badge } from '@/components/ui/badge'
@@ -78,9 +80,16 @@ export function BrowserSpacesPanel() {
     enabled: Boolean(workspaceId),
     refetchInterval: 5_000,
   })
+  const accountsQuery = useQuery({
+    queryKey: ['browser-accounts', workspaceId],
+    queryFn: () => listBrowserAccounts(workspaceId as string),
+    enabled: Boolean(workspaceId),
+    refetchInterval: 5_000,
+  })
   const [selectedSpaceId, setSelectedSpaceId] = useState<string | null>(null)
   const [browserInstanceId, setBrowserInstanceId] = useState('')
   const [bindingId, setBindingId] = useState('')
+  const [accountId, setAccountId] = useState('')
   const [ownerType, setOwnerType] = useState<BrowserSpaceOwnerType>('operator')
   const [ownerId, setOwnerId] = useState('')
   const [grantedCapabilities, setGrantedCapabilities] = useState('page.metadata')
@@ -128,6 +137,7 @@ export function BrowserSpacesPanel() {
     void queryClient.invalidateQueries({ queryKey: ['browser-spaces', workspaceId] })
     void queryClient.invalidateQueries({ queryKey: ['browser-space', workspaceId] })
     void queryClient.invalidateQueries({ queryKey: ['browser-space-events', workspaceId] })
+    void queryClient.invalidateQueries({ queryKey: ['browser-accounts', workspaceId] })
   }
 
   const createMutation = useMutation({
@@ -193,6 +203,7 @@ export function BrowserSpacesPanel() {
     createMutation.mutate({
       browser_instance_id: instanceId,
       binding_id: bindingId.trim() || undefined,
+      account_id: accountId || undefined,
       owner_type: ownerType,
       owner_id: nextOwnerId,
       granted_capabilities: capabilities,
@@ -221,6 +232,18 @@ export function BrowserSpacesPanel() {
           </div>
           <form className="space-y-3" onSubmit={handleCreate}>
             <label className="block space-y-1 text-sm">
+              <span>Account <span className="text-muted-foreground">(optional)</span></span>
+              <select className="h-9 w-full rounded-md border bg-background px-2 text-sm" value={accountId} onChange={(event) => setAccountId(event.target.value)} disabled={hasMutation || !workspaceId}>
+                <option value="">No account binding</option>
+                {(accountsQuery.data?.items ?? []).map((account) => (
+                  <option key={account.id} value={account.id}>{account.label} · {account.site} · {account.status}</option>
+                ))}
+              </select>
+              <Link href={workspaceId ? `/browser-accounts?workspace=${encodeURIComponent(workspaceId)}` : '/browser-accounts'} className="inline-flex text-xs text-muted-foreground hover:text-foreground">
+                Manage account identity and login sessions
+              </Link>
+            </label>
+            <label className="block space-y-1 text-sm">
               <span>BrowserInstance ID</span>
               <Input value={browserInstanceId} onChange={(event) => setBrowserInstanceId(event.target.value)} placeholder="已有实例的 opaque ID" disabled={hasMutation || !workspaceId} />
             </label>
@@ -237,12 +260,13 @@ export function BrowserSpacesPanel() {
           </form>
           {createMutation.error ? <p role="alert" className="text-xs text-destructive">{errorCode(createMutation.error) ? `${errorCode(createMutation.error)}：` : ''}{errorText(createMutation.error)}</p> : null}
           <div className="border-t pt-4">
-            <h3 className="font-medium">Workspace Spaces</h3>
+            <div className="mb-2 flex items-center justify-between gap-2"><h3 className="font-medium">Workspace Spaces</h3><Link href={workspaceId ? `/browser-accounts?workspace=${encodeURIComponent(workspaceId)}` : '/browser-accounts'} className="text-xs text-primary hover:underline">Manage accounts</Link></div>
             {workspaces.isLoading || spacesQuery.isLoading ? <LoadingState /> : operationError && spaces.length === 0 ? <ErrorState message={errorText(operationError)} hint={BACKEND_HINT} /> : spaces.length === 0 ? <EmptyState title="暂无 Browser Space" description="先使用已有 BrowserInstance ID 创建一个独占 Space。" /> : <div className="mt-2 space-y-2">{spaces.map((space) => <button key={space.id} type="button" className={`w-full rounded-md border p-3 text-left transition-colors hover:bg-muted/40 ${space.id === activeSpaceId ? 'border-primary bg-muted/30' : ''}`} onClick={() => setSelectedSpaceId(space.id)}><div className="flex items-center justify-between gap-2"><span className="truncate font-mono text-xs">{space.id}</span><StatusBadge status={space.status} /></div><div className="mt-2 flex flex-wrap gap-1">{space.granted_capabilities.map((item) => <Badge key={item} variant="secondary">{item}</Badge>)}</div></button>)}</div>}
           </div>
         </section>
 
         <section className="min-w-0 space-y-4" aria-labelledby="browser-space-detail-title">
+          <Link href={workspaceId ? `/browser-accounts?workspace=${encodeURIComponent(workspaceId)}` : '/browser-accounts'} className="inline-flex items-center gap-1 text-xs text-primary hover:underline">Open account session manager</Link>
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
               <h3 id="browser-space-detail-title" className="font-medium">Space 任务与事件</h3>

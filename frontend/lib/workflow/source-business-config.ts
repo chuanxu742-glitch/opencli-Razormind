@@ -53,6 +53,26 @@ export function openCLISlotFromDataSource(source: DataSource): OpenCLISourceSlot
     ...(Array.isArray(positionalArgs) && positionalArgs.every((value) => typeof value === "string")
       ? { positionalArgs: [...positionalArgs] }
       : {}),
+    ...(typeof source.channel_config.account_id === "string" && source.channel_config.account_id.trim()
+      ? { accountId: source.channel_config.account_id }
+      : typeof source.channel_config.accountId === "string" && source.channel_config.accountId.trim()
+        ? { accountId: source.channel_config.accountId }
+        : {}),
+    ...(typeof source.channel_config.source_binding_id === "string" && source.channel_config.source_binding_id.trim()
+      ? { sourceBindingId: source.channel_config.source_binding_id }
+      : typeof source.channel_config.sourceBindingId === "string" && source.channel_config.sourceBindingId.trim()
+        ? { sourceBindingId: source.channel_config.sourceBindingId }
+        : {}),
+    ...(typeof source.channel_config.source_binding_revision_id === "string" && source.channel_config.source_binding_revision_id.trim()
+      ? { sourceBindingRevisionId: source.channel_config.source_binding_revision_id }
+      : typeof source.channel_config.sourceBindingRevisionId === "string" && source.channel_config.sourceBindingRevisionId.trim()
+        ? { sourceBindingRevisionId: source.channel_config.sourceBindingRevisionId }
+        : {}),
+    ...(typeof source.channel_config.source_binding_revision_number === "number" && Number.isInteger(source.channel_config.source_binding_revision_number)
+      ? { sourceBindingRevisionNumber: source.channel_config.source_binding_revision_number }
+      : typeof source.channel_config.sourceBindingRevisionNumber === "number" && Number.isInteger(source.channel_config.sourceBindingRevisionNumber)
+        ? { sourceBindingRevisionNumber: source.channel_config.sourceBindingRevisionNumber }
+        : {}),
     format: typeof source.channel_config.format === "string" ? source.channel_config.format : undefined,
   }
 }
@@ -62,9 +82,9 @@ export function sourceCapabilityKey(source: Pick<OpenCLISourceSlot, "site" | "co
 }
 
 export function sourceSlotKey(
-  source: Pick<OpenCLISourceSlot, "site" | "command" | "args" | "positionalArgs">,
+  source: Pick<OpenCLISourceSlot, "site" | "command" | "args" | "positionalArgs" | "accountId" | "sourceBindingRevisionId">,
 ): string {
-  return `${sourceCapabilityKey(source)}::${stableSerialize(source.args)}::${stableSerialize(source.positionalArgs ?? [])}`
+  return `${sourceCapabilityKey(source)}::${stableSerialize(source.args)}::${stableSerialize(source.positionalArgs ?? [])}::account=${source.accountId ?? ""}::revision=${source.sourceBindingRevisionId ?? ""}`
 }
 
 export function sourceBusinessQuery(sources: OpenCLISourceSlot[]): string | undefined {

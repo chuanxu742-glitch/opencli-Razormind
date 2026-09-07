@@ -14,7 +14,7 @@ def test_alembic_has_one_head():
     config = Config()
     config.set_main_option("script_location", "backend/migrations")
 
-    assert ScriptDirectory.from_config(config).get_heads() == ["r6s7t8u9v0w1"]
+    assert ScriptDirectory.from_config(config).get_heads() == ["add_browser_portal_security"]
 
 
 def test_ci_downgrade_target_is_unambiguous():
@@ -70,6 +70,13 @@ def test_upgrade_head_creates_identity_and_operations_tables(monkeypatch):
         "iii_collection_attempts",
         "iii_collection_outbox",
         "iii_collection_lifecycle_observations",
+        "browser_accounts",
+        "browser_login_sessions",
+        "browser_account_leases",
+        "browser_durable_commands",
+        "browser_profile_manifests",
+        "browser_portal_tickets",
+        "browser_portal_owners",
     } <= tables
 
 
