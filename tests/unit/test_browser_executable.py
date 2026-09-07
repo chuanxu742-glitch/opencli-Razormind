@@ -10,6 +10,14 @@ import pytest
 ROOT = Path(__file__).parents[2]
 
 
+def bash_path(path: Path) -> str:
+    """Return a path accepted as absolute by Git Bash on Windows."""
+    value = path.as_posix()
+    if os.name == "nt" and len(value) >= 2 and value[1] == ":":
+        return f"/{value[0].lower()}{value[2:]}"
+    return value
+
+
 def run_resolver(
     engine: str | None, overrides: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
@@ -85,6 +93,9 @@ def bash_executable() -> str:
     candidates = [
         Path(git).parent / "bash.exe" if git else None,
         Path(git).parent.parent / "bin" / "bash.exe" if git else None,
+        Path(git).parent.parent.parent / "bin" / "bash.exe" if git else None,
+        Path(r"D:\develop\git\bin\bash.exe"),
+        Path(r"D:\develop\git\usr\bin\bash.exe"),
         Path(r"C:\Program Files\Git\bin\bash.exe"),
         Path(r"C:\Program Files\Git\usr\bin\bash.exe"),
     ]
@@ -94,6 +105,7 @@ def bash_executable() -> str:
         if candidate and candidate.is_file():
             return str(candidate)
     pytest.skip("A native Bash executable is unavailable.")
+
 
 
 def run_entrypoint(
@@ -108,9 +120,26 @@ def run_entrypoint(
     bash = bash_executable()
     node = shutil.which("node")
     assert node is not None, "Node is required by the browser entrypoints"
-    for directory in ("bin", "etc/nginx/conf.d", "tmp", "home", "usr/local/bin", "opt"):
+    for directory in (
+        "bin",
+        "etc/nginx/conf.d",
+        "etc/chromium/policies/managed",
+        "tmp",
+        "home",
+        "usr/local/bin",
+        "opt",
+    ):
         (tmp_path / directory).mkdir(parents=True, exist_ok=True)
     (tmp_path / "etc/nginx/conf.d/cdp.conf.template").write_text("")
+    (tmp_path / "etc/chromium/policies/managed/opencli-account-runtime.json").write_text(
+        json.dumps(
+            {
+                "PasswordManagerEnabled": False,
+                "AutofillAddressEnabled": False,
+                "AutofillCreditCardEnabled": False,
+            }
+        )
+    )
     (tmp_path / "etc/browser-bridge-extension-id").write_text("")
     manifest = tmp_path / "opt/manifest.json"
     manifest.write_text(json.dumps({"name": "test", "version": "1", "components": []}))
@@ -122,12 +151,14 @@ def run_entrypoint(
 
     # Only filesystem locations change; all production branching remains intact.
     source = (ROOT / name / "entrypoint.sh").read_text(encoding="utf-8")
-    source = source.replace("/tmp/", f"{tmp_path.as_posix()}/tmp/")
+    shell_root = bash_path(tmp_path)
+    source = source.replace("/tmp/", f"{shell_root}/tmp/")
     for prefix in ("/etc/", "/home/", "/usr/local/bin/", "/usr/share/", "/opt/"):
-        source = source.replace(prefix, f"{tmp_path.as_posix()}{prefix}")
+        source = source.replace(prefix, f"{shell_root}{prefix}")
     entrypoint = tmp_path / "entrypoint.sh"
     entrypoint.write_text(source, encoding="utf-8", newline="\n")
     events = tmp_path / "events"
+
     for executable, event in (
         ("chromium-double", "chromium"),
         ("cloak-double", "cloak"),
@@ -140,6 +171,18 @@ def run_entrypoint(
             newline="\n",
         )
         binary.chmod(0o755)
+    # The private PATH intentionally contains only test doubles. Keep the
+    # hardened entrypoint's filesystem primitives available explicitly.
+    for executable, command in (("mkdir", "mkdir"), ("readlink", "readlink")):
+        binary = tmp_path / "bin" / executable
+        binary.write_text(
+            f"#!/bin/bash\nexec /usr/bin/{command} \"$@\"\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        binary.chmod(0o755)
+
+
 
     env = os.environ.copy()
     for key in tuple(env):
@@ -162,9 +205,18 @@ def run_entrypoint(
     if engine is not None:
         env["BROWSER_ENGINE"] = engine
     script = r"""
-# A private PATH makes stock Chromium detection independent of the test host.
+node() {
+  local args=()
+  local arg
+  for arg in "$@"; do
+    if [[ "$arg" =~ ^/[a-zA-Z]/ ]]; then
+      arg="${arg:1:1}:${arg:2}"
+    fi
+    args+=("$arg")
+  done
+  "$NODE_BIN" "${args[@]}"
+}
 export PATH="$(cd "$SANDBOX_BIN" && pwd)"
-node() { "$NODE_BIN" "$@"; }
 Xvfb() { :; }
 nginx() { :; }
 x11vnc() { :; }
@@ -183,7 +235,7 @@ sleep() { if [ "$1" = 2 ]; then exit 0; fi; }
 """
     if stock_chromium:
         script += "\nchromium() { :; }\n"
-    script += f"\nsource {shlex.quote(entrypoint.as_posix())}\n"
+    script += f"\nsource {shlex.quote(bash_path(entrypoint))}\n"
     result = subprocess.run(
         [bash, "-c", script],
         cwd=ROOT,

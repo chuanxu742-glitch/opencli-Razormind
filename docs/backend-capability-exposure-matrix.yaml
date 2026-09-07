@@ -1,6 +1,7 @@
 version: 1
 source: backend.main.app.openapi
-openapi_operation_count: 329
+openapi_operation_count: 349
+
 allowed_dispositions:
 - operator_ui
 - studio_binding
@@ -263,6 +264,15 @@ capability_groups:
   owner: opencli-admin
   wrapper_names: []
   workflow_node_ids: []
+- capability_id: operator.browser-accounts
+  label: 浏览器账号与登录会话
+  projection: operator_resource
+  distribution: builtin
+  lifecycle: active
+  owner: opencli-admin
+  wrapper_names: []
+  workflow_node_ids: []
+
 operations:
 - method: GET
   path: /api/v1/agents
@@ -3225,6 +3235,187 @@ operations:
   decision: Bind scoped workflow evidence projections to Workflow Studio.
   target_epic: Epic 8
   capability_id: studio.workflow
+- method: GET
+  path: /api/v1/browsers/bindings/migration
+  operation_id: inspect_binding_migration_api_v1_browsers_bindings_migration_get
+  disposition: setup_status
+  frontend_route: /nodes
+  wrapper: null
+  decision: Expose legacy binding migration diagnostics in the browser operations setup surface.
+  target_epic: Epic 6
+  capability_id: setup.nodes
+- method: GET
+  path: /api/v1/workspaces/{workspace_id}/browser-accounts
+  operation_id: list_browser_accounts_api_v1_workspaces__workspace_id__browser_accounts_get
+  disposition: operator_ui
+  frontend_route: /browsers
+  wrapper: null
+  decision: Expose workspace-scoped browser account inventory in the operator browser surface.
+  target_epic: Epic 6
+  capability_id: operator.browser-accounts
+- method: GET
+  path: /api/v1/workspaces/{workspace_id}/browser-accounts/{account_id}
+  operation_id: get_browser_account_api_v1_workspaces__workspace_id__browser_accounts__account_id__get
+  disposition: operator_ui
+  frontend_route: /browsers
+  wrapper: null
+  decision: Expose browser account details in the operator browser surface.
+  target_epic: Epic 6
+  capability_id: operator.browser-accounts
+- method: GET
+  path: /api/v1/workspaces/{workspace_id}/browser-accounts/{account_id}/login-sessions
+  operation_id: list_account_login_sessions_api_v1_workspaces__workspace_id__browser_accounts__account_id__login_sessions_get
+  disposition: operator_ui
+  frontend_route: /browsers
+  wrapper: null
+  decision: Expose account login-session history in the operator browser surface.
+  target_epic: Epic 6
+  capability_id: operator.browser-accounts
+- method: GET
+  path: /api/v1/workspaces/{workspace_id}/browser-accounts/{account_id}/login-sessions/{session_id}
+  operation_id: get_account_login_session_api_v1_workspaces__workspace_id__browser_accounts__account_id__login_sessions__session_id__get
+  disposition: operator_ui
+  frontend_route: /browsers
+  wrapper: null
+  decision: Expose account login-session state in the operator browser surface.
+  target_epic: Epic 6
+  capability_id: operator.browser-accounts
+- method: GET
+  path: /api/v1/workspaces/{workspace_id}/browser-accounts/{account_id}/login-sessions/{session_id}/authorization-facts
+  operation_id: get_login_authorization_facts_api_v1_workspaces__workspace_id__browser_accounts__account_id__login_sessions__session_id__authorization_facts_get
+  disposition: operator_ui
+  frontend_route: /browsers
+  wrapper: null
+  decision: Expose login authorization evidence for operator verification.
+  target_epic: Epic 6
+  capability_id: operator.browser-accounts
+- method: PATCH
+  path: /api/v1/workspaces/{workspace_id}/browser-accounts/{account_id}
+  operation_id: update_browser_account_api_v1_workspaces__workspace_id__browser_accounts__account_id__patch
+  disposition: operator_ui
+  frontend_route: /browsers
+  wrapper: null
+  decision: Manage browser account configuration through the operator browser surface.
+  target_epic: Epic 6
+  capability_id: operator.browser-accounts
+- method: POST
+  path: /api/v1/workspaces/{workspace_id}/browser-accounts
+  operation_id: create_browser_account_api_v1_workspaces__workspace_id__browser_accounts_post
+  disposition: operator_ui
+  frontend_route: /browsers
+  wrapper: null
+  decision: Create workspace-scoped browser accounts through the operator browser surface.
+  target_epic: Epic 6
+  capability_id: operator.browser-accounts
+- method: POST
+  path: /api/v1/workspaces/{workspace_id}/browser-accounts/{account_id}/auth-required
+  operation_id: set_browser_account_auth_required_api_v1_workspaces__workspace_id__browser_accounts__account_id__auth_required_post
+  disposition: operator_ui
+  frontend_route: /browsers
+  wrapper: null
+  decision: Mark browser accounts as requiring authentication in the operator surface.
+  target_epic: Epic 6
+  capability_id: operator.browser-accounts
+- method: POST
+  path: /api/v1/workspaces/{workspace_id}/browser-accounts/{account_id}/login-sessions
+  operation_id: create_account_login_session_api_v1_workspaces__workspace_id__browser_accounts__account_id__login_sessions_post
+  disposition: operator_ui
+  frontend_route: /browsers
+  wrapper: null
+  decision: Start controlled account login sessions from the operator browser surface.
+  target_epic: Epic 6
+  capability_id: operator.browser-accounts
+- method: POST
+  path: /api/v1/workspaces/{workspace_id}/browser-accounts/{account_id}/login-sessions/{session_id}/close
+  operation_id: close_account_login_session_api_v1_workspaces__workspace_id__browser_accounts__account_id__login_sessions__session_id__close_post
+  disposition: operator_ui
+  frontend_route: /browsers
+  wrapper: null
+  decision: Close controlled account login sessions from the operator browser surface.
+  target_epic: Epic 6
+  capability_id: operator.browser-accounts
+- method: POST
+  path: /api/v1/workspaces/{workspace_id}/browser-accounts/{account_id}/login-sessions/{session_id}/confirm
+  operation_id: confirm_account_login_session_api_v1_workspaces__workspace_id__browser_accounts__account_id__login_sessions__session_id__confirm_post
+  disposition: operator_ui
+  frontend_route: /browsers
+  wrapper: null
+  decision: Confirm account login evidence from the operator browser surface.
+  target_epic: Epic 6
+  capability_id: operator.browser-accounts
+- method: POST
+  path: /api/v1/workspaces/{workspace_id}/browser-accounts/{account_id}/login-sessions/{session_id}/portal-ticket/issue
+  operation_id: issue_account_portal_ticket_api_v1_workspaces__workspace_id__browser_accounts__account_id__login_sessions__session_id__portal_ticket_issue_post
+  disposition: operator_ui
+  frontend_route: /browsers
+  wrapper: null
+  decision: Issue controlled account portal tickets through the operator browser surface.
+  target_epic: Epic 6
+  capability_id: operator.browser-accounts
+- method: POST
+  path: /api/v1/workspaces/{workspace_id}/browser-accounts/{account_id}/login-sessions/{session_id}/portal-ticket/redeem
+  operation_id: redeem_account_portal_ticket_api_v1_workspaces__workspace_id__browser_accounts__account_id__login_sessions__session_id__portal_ticket_redeem_post
+  disposition: operator_ui
+  frontend_route: /browsers
+  wrapper: null
+  decision: Redeem controlled account portal tickets through the operator browser surface.
+  target_epic: Epic 6
+  capability_id: operator.browser-accounts
+- method: POST
+  path: /api/v1/workspaces/{workspace_id}/browser-accounts/{account_id}/login-sessions/{session_id}/refresh
+  operation_id: refresh_account_login_session_api_v1_workspaces__workspace_id__browser_accounts__account_id__login_sessions__session_id__refresh_post
+  disposition: operator_ui
+  frontend_route: /browsers
+  wrapper: null
+  decision: Refresh controlled account login sessions from the operator browser surface.
+  target_epic: Epic 6
+  capability_id: operator.browser-accounts
+- method: POST
+  path: /api/v1/workspaces/{workspace_id}/browser-accounts/{account_id}/login-sessions/{session_id}/takeover
+  operation_id: takeover_account_login_session_api_v1_workspaces__workspace_id__browser_accounts__account_id__login_sessions__session_id__takeover_post
+  disposition: operator_ui
+  frontend_route: /browsers
+  wrapper: null
+  decision: Take over an authorized login session from the operator browser surface.
+  target_epic: Epic 6
+  capability_id: operator.browser-accounts
+- method: POST
+  path: /api/v1/workspaces/{workspace_id}/browser-accounts/{account_id}/login-sessions/{session_id}/view
+  operation_id: view_account_login_session_api_v1_workspaces__workspace_id__browser_accounts__account_id__login_sessions__session_id__view_post
+  disposition: operator_ui
+  frontend_route: /browsers
+  wrapper: null
+  decision: Open an authorized login-session view from the operator browser surface.
+  target_epic: Epic 6
+  capability_id: operator.browser-accounts
+- method: POST
+  path: /api/v1/workspaces/{workspace_id}/browser-accounts/{account_id}/migration
+  operation_id: migrate_browser_account_api_v1_workspaces__workspace_id__browser_accounts__account_id__migration_post
+  disposition: operator_ui
+  frontend_route: /browsers
+  wrapper: null
+  decision: Queue explicit browser account migration through the operator surface.
+  target_epic: Epic 6
+  capability_id: operator.browser-accounts
+- method: POST
+  path: /api/v1/workspaces/{workspace_id}/browser-accounts/{account_id}/resume
+  operation_id: resume_browser_account_api_v1_workspaces__workspace_id__browser_accounts__account_id__resume_post
+  disposition: operator_ui
+  frontend_route: /browsers
+  wrapper: null
+  decision: Resume a paused browser account through the operator browser surface.
+  target_epic: Epic 6
+  capability_id: operator.browser-accounts
+- method: POST
+  path: /api/v1/workspaces/{workspace_id}/browser-accounts/{account_id}/suspend
+  operation_id: suspend_browser_account_api_v1_workspaces__workspace_id__browser_accounts__account_id__suspend_post
+  disposition: operator_ui
+  frontend_route: /browsers
+  wrapper: null
+  decision: Suspend a browser account through the operator browser surface.
+  target_epic: Epic 6
+  capability_id: operator.browser-accounts
+
 unreferenced_wrappers:
 - wrapper: invokeBrowserCapability
   operation_id: invoke_runtime_capability_api_v1_browser_sessions__instance_id__capabilities__capability__invoke_post

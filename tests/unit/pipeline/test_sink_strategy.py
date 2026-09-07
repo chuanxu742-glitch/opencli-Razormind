@@ -8,6 +8,8 @@ double-send.
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+pytestmark = pytest.mark.usefixtures("anonymous_account_resolution")
+
 
 from backend.pipeline.sinks import DualSink, LegacyDbSink, OdpSink, SinkResult
 from backend.pipeline.sinks.strategy import select_sink
@@ -113,7 +115,7 @@ async def test_run_pipeline_selects_sink_by_strategy(db_session):
 
     with (
         patch("backend.pipeline.collector.collect", return_value=ChannelResult.ok([{"title": "x"}])),
-        patch("backend.pipeline.sinks.strategy.select_sink", return_value=fake) as sel,
+        patch("backend.pipeline.pipeline.select_sink", return_value=fake) as sel,
     ):
         result = await run_pipeline(
             task.id, source, enable_ai=False, enable_notifications=False
