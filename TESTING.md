@@ -670,6 +670,16 @@ uv run pytest --no-cov tests/unit/test_qrac2_g_contract_repairs.py
 
 ### 分布式与浏览器前置
 
+`account-runtime-smoke` Actions 工作流提供真实 Linux 容器运行时验证：从候选分支构建
+agent 镜像，运行两个隔离命名空间，检查 Chromium/CDP、OpenCLI 扩展实际连接、同一
+容器第二个固定端口栈被拒绝，以及停止后进程和端口均释放。日志按阶段记录结果，清理
+失败不会覆盖最初的验证异常；工作流最终回收自己的容器、网络和镜像。
+
+2026-09-07 的候选提交 `bf76dee187eb3ee472eecd65de0d67811af25176` 已通过该验证，
+证据为 [fork 运行 34110170482](https://github.com/chuanxu742-glitch/opencli-Razormind/actions/runs/34110170482)。
+这是合成控制契约与受控站点的运行时证据，不等同于真实扫码、控制面授权、加密持久卷
+或容器重启恢复验收；后续影响运行时的改动必须重新验证。
+
 - 集群测试必须使用独立 `TEST_DATABASE_URL_PG`、两个中心/调度者和受监督节点；不能用测试 SQLite 代替 PostgreSQL 锁语义。
 - Redis、中心副本、节点和受控浏览器必须记录实际版本、端口、归属、启动与停止控制；没有独立资源就记录 blocked，不把 skip 记为通过。
 - 真实 Profile 卷需提供加密配置、挂载映射和运维审查记录；DB 布尔字段、路径或节点自报不是证明。

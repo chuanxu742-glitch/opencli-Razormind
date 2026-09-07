@@ -79,4 +79,6 @@ Compose 不发布 host ports：19823 agent API、19825 OpenCLI daemon、9222 CDP
 
 本地可运行 resolved Compose 预检与 focused pytest；它们验证配方隔离、无 host port、独立底层卷、解析后身份、不可变当前-checkout 镜像引用和 HTTPS URL 契约。它们不能证明真实容器、TLS 终端、控制面认证、站点授权或存储加密。
 
-当前 Windows 环境没有 Docker Engine，真实 Engine 验收仍须在 Linux 生产候选环境执行并留存证据：构建准确 checkout、核对 image ID、创建 external network、启动两节点、检查容器健康、验证 TLS 与控制面认证注册、验证每个在线账户的真实授权操作、核验底层卷加密，以及停止/恢复后的状态保留。
+仓库的 `account-runtime-smoke` GitHub Actions 工作流会在 Linux 上构建当前 checkout 的 agent 镜像，运行两个隔离容器，检查真实 Chromium/CDP、OpenCLI 1.8.7 扩展连接、固定端口容量拒绝和停止后的进程及端口释放。它使用合成控制契约和受控登录站点，不证明控制面鉴权、真实平台登录或生产持久卷恢复。可从 Actions 手动运行候选分支，并保存对应提交与运行结果。
+
+生产候选部署还须核对 image ID、创建 external network、启动两节点、验证 TLS 与控制面认证注册、验证每个在线账户的真实授权操作、核验底层卷加密，以及停止/恢复后的状态保留。Windows 本机 Docker Engine 不可用时，可使用上述 Linux 验证补充运行时证据，但不能据此跳过部署验收。
