@@ -7,7 +7,6 @@ import { CheckCircle2, ExternalLink, Loader2, Plus, RefreshCw, ShieldAlert, Wifi
 import { toast } from 'sonner'
 
 import { useAuth } from '@/components/auth/auth-provider'
-import { useMyWorkspaces } from '@/lib/api/hooks'
 import {
   createBrowserAccount,
   createBrowserLoginSession,
@@ -15,6 +14,7 @@ import {
   getBrowserLoginSession,
   issueBrowserPortalTicket,
   listBrowserAccounts,
+  listBrowserAccountWorkspaces,
   listBrowserWorkspaceMembers,
   operateBrowserAccount,
   performBrowserSessionAction,
@@ -633,16 +633,16 @@ export function BrowserAccountsPanel() {
   const { identity } = useAuth()
   const router = useRouter()
   const searchParams = useSearchParams()
-  const workspaces = useMyWorkspaces()
+  const workspaces = useQuery({ queryKey: ['browser-account-workspaces'], queryFn: listBrowserAccountWorkspaces })
   const workspaceId = searchParams.get('workspace') ?? workspaces.data?.[0]?.id ?? null
   const queryClient = useQueryClient()
   const membersQuery = useQuery({ queryKey: ['browser-workspace-members', workspaceId], queryFn: () => listBrowserWorkspaceMembers(workspaceId as string), enabled: Boolean(workspaceId), refetchInterval: 10_000 })
   const workspace = workspaces.data?.find((candidate) => candidate.id === workspaceId)
   const currentMember = membersQuery.data?.find((member) => member.subject === identity?.subject)
-  const membershipKnown = membersQuery.isSuccess && (identity?.is_platform_admin === true || Boolean(currentMember))
+  const membershipKnown = membersQuery.isSuccess && Boolean(currentMember)
   const hasBrowserAccountReadPermission = Boolean(workspace?.active && membershipKnown && !currentMember?.disabled)
-  const canManageBrowserAccounts = hasBrowserAccountReadPermission && (identity?.is_platform_admin === true || currentMember?.role === 'admin' || currentMember?.role === 'maintainer')
-  const canOperateBrowserAccounts = hasBrowserAccountReadPermission && (identity?.is_platform_admin === true || currentMember?.role === 'admin' || currentMember?.role === 'maintainer' || currentMember?.role === 'operator')
+  const canManageBrowserAccounts = hasBrowserAccountReadPermission && (currentMember?.role === 'admin' || currentMember?.role === 'maintainer')
+  const canOperateBrowserAccounts = hasBrowserAccountReadPermission && (currentMember?.role === 'admin' || currentMember?.role === 'maintainer' || currentMember?.role === 'operator')
   const accountsQuery = useInfiniteQuery({
     queryKey: ['browser-accounts', workspaceId, 'pages'],
     queryFn: ({ pageParam }) => listBrowserAccounts(workspaceId as string, { cursor: pageParam }),

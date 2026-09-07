@@ -1,5 +1,5 @@
 import { apiClient } from './client'
-import type { ApiResponse } from './types'
+import type { ApiResponse, WorkspaceSummary } from './types'
 
 /** QRAC2 account-cluster contract version accepted by the browser API. */
 export const QRAC2_CONTRACT_VERSION = 1 as const
@@ -356,4 +356,10 @@ export interface BrowserWorkspaceMember {
 export const listBrowserWorkspaceMembers = (workspaceId: string) =>
   apiClient
     .get<ApiResponse<BrowserWorkspaceMember[]>>(`/workspaces/${encodeURIComponent(workspaceId)}/members`)
+    .then((response) => response.data.data)
+
+/** Account permissions belong to governance workspaces, not Studio inventories. */
+export const listBrowserAccountWorkspaces = () =>
+  apiClient
+    .get<ApiResponse<WorkspaceSummary[]>>('/governance/workspaces')
     .then((response) => response.data.data)
