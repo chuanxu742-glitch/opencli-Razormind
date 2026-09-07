@@ -11,7 +11,8 @@ from datetime import UTC, datetime
 from inspect import signature
 from typing import Any
 
-from sqlalchemy import select
+from fastapi import HTTPException, status
+from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from backend.auth.crypto import CredentialCryptoError
@@ -49,6 +50,7 @@ from backend.schemas.workflow import (
     WorkflowRunStartRequest,
     WorkflowRunStatus,
 )
+from backend.security.identity import RequestIdentity
 from backend.services.feishu_bitable_delivery import (
     FeishuDeliveryError,
     deliver_record_once,
@@ -85,15 +87,6 @@ from backend.workflow.dify_grants import resolve_dify_ephemeral_grants
 from backend.workflow.dify_graphon_client import DifyGraphonClient
 from backend.workflow.event_mirror import publish_workflow_run_event_mirror
 from backend.workflow.fleet_inventory import match_workflow_fleet_capability
-from backend.workflow.gaojixing_runtime import (
-    GAOJIXING_CHANNEL_TYPE,
-    GAOJIXING_EXECUTION_MODES,
-    GAOJIXING_LIVE_MODE,
-    GaojixingReadinessError,
-    build_question_package,
-    capture_live_doubao,
-    map_capture_item,
-)
 from backend.workflow.gaojixing_certification import (
     GAOJIXING_BATCH_CERTIFY_EXECUTOR,
     GAOJIXING_BATCH_CERTIFY_TOOL_ID,
@@ -104,13 +97,18 @@ from backend.workflow.gaojixing_doubao import (
     GAOJIXING_DOUBAO_BATCH_TOOL_ID,
     execute_gaojixing_doubao_batch,
 )
+from backend.workflow.gaojixing_runtime import (
+    GAOJIXING_CHANNEL_TYPE,
+    GAOJIXING_EXECUTION_MODES,
+    GAOJIXING_LIVE_MODE,
+    GaojixingReadinessError,
+    build_question_package,
+    capture_live_doubao,
+    map_capture_item,
+)
 from backend.workflow.http_source_executor import (
     WorkflowHTTPSourceExecutionError,
     execute_workflow_http_source,
-)
-from backend.workflow.channel_source_executor import (
-    WorkflowChannelSourceExecutionError,
-    execute_workflow_channel_source,
 )
 from backend.workflow.intelligence_store import (
     IntelligenceStoreError,
@@ -219,6 +217,7 @@ class _StoredWorkflowRun:
     events: list[WorkflowNodeRunEvent]
     workflow_version_id: str | None = None
     studio_workflow_version_id: str | None = None
+    requested_by_user_id: str | None = None
 
 
 class _GaojixingToolTerminalError(Exception):
@@ -391,6 +390,227 @@ def build_opencli_hda_trace(
     )
 
 
+@dataclass(frozen=True)
+class _WorkflowAccountBinding:
+    account_id: str
+    source_binding_revision_id: str | None
+    source_binding_id: str | None
+
+
+def workflow_project_has_account_reference(project: WorkflowProject) -> bool:
+    """Return whether the authored graph asks to use a persisted browser account."""
+
+    pending: list[object] = [project.model_dump(mode="json", exclude_none=True)]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            if _read_string(value.get("accountId", value.get("account_id"))) is not None:
+                return True
+            account_ref = value.get("accountRef", value.get("account_ref"))
+            if isinstance(account_ref, dict) and _read_string(
+                account_ref.get("accountId", account_ref.get("account_id"))
+            ):
+                return True
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
+    return False
+
+
+def _account_binding_from_mapping(
+    value: dict[str, Any],
+) -> _WorkflowAccountBinding | None:
+    account_ref = _read_dict(value.get("accountRef", value.get("account_ref")))
+    account_id = _read_string(
+        value.get(
+            "accountId",
+            value.get("account_id", account_ref.get("accountId", account_ref.get("account_id"))),
+        )
+    )
+    if account_id is None:
+        return None
+    revision_id = _read_string(
+        value.get(
+            "sourceBindingRevisionId",
+            value.get(
+                "source_binding_revision_id",
+                account_ref.get(
+                    "sourceBindingRevisionId",
+                    account_ref.get("source_binding_revision_id"),
+                ),
+            ),
+        )
+    )
+    source_binding_id = _read_string(value.get("sourceBindingId", value.get("source_binding_id")))
+    return _WorkflowAccountBinding(account_id, revision_id, source_binding_id)
+
+
+def _workflow_account_bindings(
+    runtime_nodes: list[CompiledWorkflowNode],
+) -> list[_WorkflowAccountBinding]:
+    bindings: dict[tuple[str, str | None, str | None], _WorkflowAccountBinding] = {}
+    for node in runtime_nodes:
+        binding_input = _binding_input(node)
+        node_value = {**binding_input, **node.params}
+        candidates = [node_value]
+        if _is_collector_source_node(node):
+            account_fields = _collector_account_fields(node)
+            candidates.extend(
+                {**source, **account_fields}
+                for source in _read_dict_list(binding_input.get("sources"))
+            )
+        for candidate in candidates:
+            account_binding = _account_binding_from_mapping(candidate)
+            if account_binding is None:
+                continue
+            key = (
+                account_binding.account_id,
+                account_binding.source_binding_revision_id,
+                account_binding.source_binding_id,
+            )
+            bindings[key] = account_binding
+    return list(bindings.values())
+
+
+async def _validated_account_ref(
+    session: AsyncSession,
+    binding: _WorkflowAccountBinding,
+):
+    from backend.models.browser import BrowserAccount
+    from backend.models.source_binding import (
+        Source,
+        SourceBinding,
+        SourceBindingRevision,
+        SourceLifecycleStatus,
+        SourceRevision,
+    )
+    from backend.models.workflow import Project
+    from backend.schemas.browser_account import AccountRef
+
+    if binding.source_binding_revision_id is None:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Account execution requires an owned fixed source binding revision",
+        )
+    statement = (
+        select(SourceBindingRevision)
+        .join(
+            SourceBinding,
+            SourceBinding.id == SourceBindingRevision.source_binding_id,
+        )
+        .join(Project, Project.id == SourceBinding.project_id)
+        .join(Source, Source.id == SourceBinding.source_id)
+        .join(
+            SourceRevision,
+            and_(
+                SourceRevision.id == SourceBindingRevision.pinned_source_revision_id,
+                SourceRevision.source_id == Source.id,
+            ),
+        )
+        .join(
+            BrowserAccount,
+            and_(
+                BrowserAccount.id == SourceBindingRevision.account_id,
+                BrowserAccount.workspace_id == SourceBindingRevision.workspace_id,
+            ),
+        )
+        .where(
+            SourceBindingRevision.id == binding.source_binding_revision_id,
+            SourceBindingRevision.account_id == binding.account_id,
+            SourceBindingRevision.workspace_id == Project.workspace_id,
+            Source.workspace_id == Project.workspace_id,
+            SourceBinding.status == SourceLifecycleStatus.ACTIVE,
+            Source.status == SourceLifecycleStatus.ACTIVE,
+            Project.archived.is_(False),
+        )
+    )
+    if binding.source_binding_id is not None:
+        statement = statement.where(
+            SourceBindingRevision.source_binding_id == binding.source_binding_id
+        )
+    revision = await session.scalar(statement.limit(1))
+    if revision is None or revision.workspace_id is None:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Account execution source ownership could not be verified",
+        )
+    return AccountRef(
+        workspace_id=revision.workspace_id,
+        account_id=binding.account_id,
+        source_binding_revision_id=revision.id,
+    )
+
+
+async def _authorize_account_bound_workflow(
+    session: AsyncSession | None,
+    runtime_nodes: list[CompiledWorkflowNode],
+    *,
+    request_identity: RequestIdentity | None,
+    requested_by_user_id: str | None,
+    expected_workspace_id: str | None,
+) -> str | None:
+    bindings = _workflow_account_bindings(runtime_nodes)
+    if not bindings:
+        return None
+    if session is None:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Account workflow execution requires durable authorization",
+        )
+    refs = [await _validated_account_ref(session, binding) for binding in bindings]
+    workspace_ids = {ref.workspace_id for ref in refs}
+    if len(workspace_ids) != 1 or (
+        expected_workspace_id is not None and workspace_ids != {expected_workspace_id}
+    ):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Account workflow execution must remain in one authorized workspace",
+        )
+    workspace_id = next(iter(workspace_ids))
+
+    from backend.models.identity import User, Workspace, WorkspaceMembership
+    from backend.security.workspace_rbac import (
+        WorkspacePermission,
+        get_workspace_access,
+        require_permission,
+    )
+
+    if request_identity is not None:
+        access = await get_workspace_access(session, workspace_id, request_identity)
+        require_permission(access, WorkspacePermission.RUN_OPERATIONS_AGENTS)
+        if requested_by_user_id is not None and requested_by_user_id != access.user_id:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "Workflow actor does not match the persisted run actor",
+            )
+        return access.user_id
+    if requested_by_user_id is None:
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            "Bearer token required for account workflow execution",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    authorized_actor = await session.scalar(
+        select(User.id)
+        .join(WorkspaceMembership, WorkspaceMembership.user_id == User.id)
+        .join(Workspace, Workspace.id == WorkspaceMembership.workspace_id)
+        .where(
+            User.id == requested_by_user_id,
+            User.disabled.is_(False),
+            WorkspaceMembership.workspace_id == workspace_id,
+            WorkspaceMembership.role.in_(("admin", "maintainer", "operator")),
+            Workspace.active.is_(True),
+        )
+        .limit(1)
+    )
+    if authorized_actor is None:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Persisted workflow actor no longer has account execution permission",
+        )
+    return requested_by_user_id
+
+
 async def start_workflow_run(
     body: WorkflowRunStartRequest,
     *,
@@ -400,6 +620,9 @@ async def start_workflow_run(
     studio_workflow_version_id: str | None = None,
     graphon_client: DifyGraphonClient | None = None,
     replay_source_node_ids: set[str] | None = None,
+    request_identity: RequestIdentity | None = None,
+    requested_by_user_id: str | None = None,
+    expected_workspace_id: str | None = None,
 ) -> WorkflowRunProjection:
     """Create a replayable workflow run projection from a compiled WorkflowProject."""
 
@@ -452,6 +675,7 @@ async def start_workflow_run(
                 session=session,
                 workflow_version_id=workflow_version_id,
                 studio_workflow_version_id=studio_workflow_version_id,
+                requested_by_user_id=requested_by_user_id,
             )
             return projection
         scope_project = scope_result.project
@@ -505,6 +729,7 @@ async def start_workflow_run(
             session=session,
             workflow_version_id=workflow_version_id,
             studio_workflow_version_id=studio_workflow_version_id,
+            requested_by_user_id=requested_by_user_id,
         )
         return projection
 
@@ -550,9 +775,27 @@ async def start_workflow_run(
             session=session,
             workflow_version_id=workflow_version_id,
             studio_workflow_version_id=studio_workflow_version_id,
+            requested_by_user_id=requested_by_user_id,
         )
         return projection
 
+    requested_by_user_id = await _authorize_account_bound_workflow(
+        session,
+        runtime_nodes,
+        request_identity=request_identity,
+        requested_by_user_id=requested_by_user_id,
+        expected_workspace_id=expected_workspace_id,
+    )
+    if session is not None:
+        existing_run = await session.get(WorkflowRunRow, run_id)
+        if (
+            existing_run is not None
+            and existing_run.requested_by_user_id != requested_by_user_id
+        ):
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "Workflow actor does not match the persisted run actor",
+            )
     runtime_nodes_by_id = {node.id: node for node in runtime_nodes}
     if session is not None:
         queued_projection = _build_projection(
@@ -574,6 +817,7 @@ async def start_workflow_run(
             session=session,
             workflow_version_id=workflow_version_id,
             studio_workflow_version_id=studio_workflow_version_id,
+            requested_by_user_id=requested_by_user_id,
         )
     should_trace_opencli = any(
         _binding_id(node) == OPENCLI_BINDING_ID for node in runtime_nodes
@@ -1039,10 +1283,7 @@ async def start_workflow_run(
             if not bool(getattr(body.project.agentPermissions, "canFetchNetwork", False)):
                 reason = WorkflowRunBlockReason(
                     code=FETCH_PERMISSION_REQUIRED,
-                    message=(
-                        "Collector source fetch requires "
-                        "agentPermissions.canFetchNetwork."
-                    ),
+                    message=("Collector source fetch requires agentPermissions.canFetchNetwork."),
                     source="workflow_permissions",
                     details={
                         "nodeId": node.id,
@@ -1059,7 +1300,11 @@ async def start_workflow_run(
                 continue
 
             try:
-                output_items, source_results = await _execute_collector_source_node(node)
+                output_items, source_results = await _execute_collector_source_node(
+                    node,
+                    actor_user_id=requested_by_user_id,
+                    execution_id=run_id,
+                )
             except (TypeError, ValueError) as exc:
                 reason = WorkflowRunBlockReason(
                     code="collector_source_execution_failed",
@@ -1078,17 +1323,9 @@ async def start_workflow_run(
 
             source_results_by_node[node.id] = source_results
             outputs_by_node[node.id] = output_items
-            failed = [
-                result for result in source_results if result["status"] == "failed"
-            ]
-            completed = [
-                result
-                for result in source_results
-                if result["status"] == "completed"
-            ]
-            skipped = [
-                result for result in source_results if result["status"] == "skipped"
-            ]
+            failed = [result for result in source_results if result["status"] == "failed"]
+            completed = [result for result in source_results if result["status"] == "completed"]
+            skipped = [result for result in source_results if result["status"] == "skipped"]
             details = {
                 "bindingId": _binding_id(node),
                 "items": output_items[:50],
@@ -1266,7 +1503,9 @@ async def start_workflow_run(
                     node,
                     "partial",
                     message="Live channel source loaded as workflow items",
-                    batch=_node_batch_reference(body.project.id, run_id, node, item_count=len(live_items)),
+                    batch=_node_batch_reference(
+                        body.project.id, run_id, node, item_count=len(live_items)
+                    ),
                     details={
                         "bindingId": SOURCE_FETCH_BINDING_ID,
                         "channelType": binding_input.get("channelType"),
@@ -1394,9 +1633,7 @@ async def start_workflow_run(
             propagated_source_results = details.get("sourceResults")
             if isinstance(propagated_source_results, list):
                 source_results_by_node[node.id] = [
-                    dict(result)
-                    for result in propagated_source_results
-                    if isinstance(result, dict)
+                    dict(result) for result in propagated_source_results if isinstance(result, dict)
                 ]
             else:
                 source_results_by_node[node.id] = [
@@ -1419,12 +1656,14 @@ async def start_workflow_run(
             continue
 
         if _is_first_loop_native_node(node):
-            browser_tool_block = _opentabs_tool_block_reason(
-                node,
-                body.project.agentPermissions,
-            ) or _bbx_tool_block_reason(
-                node, body.project.agentPermissions
-            ) or _feishu_bitable_block_reason(node, body.project.agentPermissions)
+            browser_tool_block = (
+                _opentabs_tool_block_reason(
+                    node,
+                    body.project.agentPermissions,
+                )
+                or _bbx_tool_block_reason(node, body.project.agentPermissions)
+                or _feishu_bitable_block_reason(node, body.project.agentPermissions)
+            )
             if browser_tool_block is not None:
                 emitter.emit(
                     node,
@@ -1478,9 +1717,7 @@ async def start_workflow_run(
                         output_item_count=len(output_items),
                     ),
                     "outputPort": binding_input.get("outputPort", "unknown"),
-                    "sampleOutputs": [
-                        _trace_sample_output(item) for item in output_items[:3]
-                    ],
+                    "sampleOutputs": [_trace_sample_output(item) for item in output_items[:3]],
                 }
                 emitter.emit(
                     node,
@@ -1688,9 +1925,7 @@ async def start_workflow_run(
             propagated_source_results = details.get("sourceResults")
             if isinstance(propagated_source_results, list):
                 source_results_by_node[node.id] = [
-                    dict(result)
-                    for result in propagated_source_results
-                    if isinstance(result, dict)
+                    dict(result) for result in propagated_source_results if isinstance(result, dict)
                 ]
             else:
                 source_results_by_node[node.id] = [
@@ -1812,7 +2047,12 @@ async def start_workflow_run(
                 },
             )
         dispatch_call = _dispatch_opencli_source_to_fleet
-        dispatch_kwargs = {"node": node} if "node" in signature(dispatch_call).parameters else {}
+        dispatch_params = signature(dispatch_call).parameters
+        dispatch_kwargs: dict[str, object] = {}
+        if "node" in dispatch_params:
+            dispatch_kwargs["node"] = node
+        if "actor_user_id" in dispatch_params:
+            dispatch_kwargs["actor_user_id"] = requested_by_user_id
         output_items, agent_dispatch_details = await dispatch_call(
             dispatch,
             fleet_match,
@@ -1945,9 +2185,7 @@ async def start_workflow_run(
             continue
 
         descendant_ids = {
-            node.id
-            for node in runtime_nodes
-            if package_node.id in _package_ancestor_ids(node)
+            node.id for node in runtime_nodes if package_node.id in _package_ancestor_ids(node)
         }
         waiting_descendant_ids = sorted(descendant_ids & waiting_nodes)
         if waiting_descendant_ids:
@@ -2058,6 +2296,7 @@ async def start_workflow_run(
         session=session,
         workflow_version_id=workflow_version_id,
         studio_workflow_version_id=studio_workflow_version_id,
+        requested_by_user_id=requested_by_user_id,
     )
     if session is not None:
         stored = await _load_workflow_run(run_id, session=session, cache=False)
@@ -2081,6 +2320,7 @@ async def start_workflow_run(
                 session=session,
                 workflow_version_id=workflow_version_id,
                 studio_workflow_version_id=studio_workflow_version_id,
+                requested_by_user_id=requested_by_user_id,
             )
     await _materialize_waiting_image_jobs(
         body,
@@ -2356,6 +2596,7 @@ async def replay_downstream_from_persisted_gaojixing_source(
         workflow_version_id=source_run.workflow_version_id,
         studio_workflow_version_id=expected_studio_workflow_version_id,
         replay_source_node_ids=set(source_outputs),
+        requested_by_user_id=source_run.requested_by_user_id,
     )
 
 
@@ -2364,6 +2605,7 @@ async def continue_workflow_run_with_source_outputs(
     body: WorkflowRunSourceOutputsRequest,
     *,
     session: AsyncSession | None = None,
+    request_identity: RequestIdentity | None = None,
 ) -> WorkflowRunProjection | None:
     # Hold the per-run_id lock across the read of prior stored state through
     # the write in _store_workflow_run (invoked inside start_workflow_run).
@@ -2415,6 +2657,8 @@ async def continue_workflow_run_with_source_outputs(
         return await start_workflow_run(
             request,
             session=session,
+            request_identity=request_identity,
+            requested_by_user_id=stored.requested_by_user_id,
             existing_events=stored.events,
             workflow_version_id=stored.workflow_version_id,
             studio_workflow_version_id=stored.studio_workflow_version_id,
@@ -2483,6 +2727,7 @@ async def resume_gaojixing_workflow_run(
         projection = await start_workflow_run(
             request,
             session=session,
+            requested_by_user_id=stored.requested_by_user_id,
             existing_events=stored.events,
             workflow_version_id=stored.workflow_version_id,
             studio_workflow_version_id=stored.studio_workflow_version_id,
@@ -2529,6 +2774,7 @@ async def refresh_gaojixing_workflow_run(
             existing_events=stored.events,
             workflow_version_id=stored.workflow_version_id,
             studio_workflow_version_id=stored.studio_workflow_version_id,
+            requested_by_user_id=stored.requested_by_user_id,
         )
 
 
@@ -2541,11 +2787,13 @@ async def _store_workflow_run(
     session: AsyncSession | None,
     workflow_version_id: str | None = None,
     studio_workflow_version_id: str | None = None,
+    requested_by_user_id: str | None = None,
 ) -> None:
     events_to_mirror = list(events)
     stored_events = list(events)
     if session is not None:
         row = await session.get(WorkflowRunRow, run_id)
+        row_exists = row is not None
         if row is None:
             row = WorkflowRunRow(id=run_id)
             session.add(row)
@@ -2554,6 +2802,12 @@ async def _store_workflow_run(
         row.trace_id = projection.traceId
         row.status = projection.status
         row.valid = projection.valid
+        if row_exists and requested_by_user_id != row.requested_by_user_id:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "Workflow actor does not match the persisted run actor",
+            )
+        row.requested_by_user_id = requested_by_user_id
         row.package_node_id = projection.packageNodeId
         row.workflow_version_id = workflow_version_id
         row.studio_workflow_version_id = studio_workflow_version_id
@@ -2569,11 +2823,12 @@ async def _store_workflow_run(
         events_to_mirror = append_result.appended_events
 
     stored = _StoredWorkflowRun(
-        request,
-        projection,
-        stored_events,
-        workflow_version_id,
-        studio_workflow_version_id,
+        request=request,
+        projection=projection,
+        events=stored_events,
+        workflow_version_id=workflow_version_id,
+        studio_workflow_version_id=studio_workflow_version_id,
+        requested_by_user_id=requested_by_user_id,
     )
     if session is None:
         _RUNS[run_id] = stored
@@ -2637,6 +2892,7 @@ async def _load_workflow_run(
         request=WorkflowRunStartRequest.model_validate(row.request),
         projection=WorkflowRunProjection.model_validate(row.projection),
         events=[WorkflowNodeRunEvent.model_validate(event_row.payload) for event_row in event_rows],
+        requested_by_user_id=row.requested_by_user_id,
         workflow_version_id=row.workflow_version_id,
         studio_workflow_version_id=row.studio_workflow_version_id,
     )
@@ -2975,10 +3231,7 @@ async def _match_dispatch_fleet_target(
 ) -> WorkflowFleetCapabilityMatchResponse | None:
     if session is None:
         return None
-    if (
-        _read_string(node.params.get("accountId", node.params.get("account_id")))
-        is not None
-    ):
+    if _read_string(node.params.get("accountId", node.params.get("account_id"))) is not None:
         # Account execution resolves its node through A, never through site
         # bindings or arbitrary fleet capability matches.
         return None
@@ -3010,8 +3263,11 @@ def _fleet_match_trace_details(
 
 async def _resolve_dispatch_account_session(
     dispatch: WorkflowOpenCLIHDATraceDispatch,
+    *,
+    actor_user_id: str | None,
 ) -> tuple[Any, Any] | None:
-    """Resolve an account-bound workflow dispatch through A exactly once."""
+    """Resolve an account-bound dispatch only from the server-persisted run actor."""
+
     payload = _read_dict(dispatch.iii.get("payload"))
     account_id = _read_string(payload.get("account_id"))
     revision_id = _read_string(payload.get("source_binding_revision_id"))
@@ -3020,28 +3276,30 @@ async def _resolve_dispatch_account_session(
     if revision_id is None:
         raise RuntimeError("account_binding_revision_required")
     from backend.database import AsyncSessionLocal
-    from backend.models.source_binding import SourceBindingRevision
-    from backend.schemas.browser_account import AccountRef, ExecutionContextV1
+    from backend.schemas.browser_account import ExecutionContextV1, SessionEnvelopeV1
     from backend.services.browser_account_service import resolve_account_session
 
     async with AsyncSessionLocal() as session:
-        revision = await session.get(SourceBindingRevision, revision_id)
-        if revision is None or revision.account_id != account_id or not revision.workspace_id:
-            raise RuntimeError("account_binding_revision_mismatch")
-        ref = AccountRef(
-            workspace_id=revision.workspace_id,
-            account_id=account_id,
-            source_binding_revision_id=revision_id,
+        ref = await _validated_account_ref(
+            session,
+            _WorkflowAccountBinding(
+                account_id=account_id,
+                source_binding_revision_id=revision_id,
+                source_binding_id=_read_string(payload.get("source_binding_id")),
+            ),
         )
         context = ExecutionContextV1(
             account_ref=ref,
-            execution_id=dispatch.taskId,
-            caller_id=dispatch.nodeId,
+            execution_id=_read_string(payload.get("workflow_run_id")) or dispatch.taskId,
+            caller_id=actor_user_id,
             source_binding_revision_id=revision_id,
         )
-        envelope = await resolve_account_session(session, ref, context)
-    from backend.schemas.browser_account import SessionEnvelopeV1
-
+        envelope = await resolve_account_session(
+            session,
+            ref,
+            context,
+            actor_user_id=actor_user_id,
+        )
     if not isinstance(envelope, SessionEnvelopeV1):
         raise RuntimeError(
             f"account session {getattr(envelope, 'status', 'blocked')}: "
@@ -3055,8 +3313,12 @@ async def _dispatch_opencli_source_to_fleet(
     match: WorkflowFleetCapabilityMatchResponse | None,
     *,
     node: CompiledWorkflowNode | None = None,
+    actor_user_id: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, object] | None]:
-    account_resolution = await _resolve_dispatch_account_session(dispatch)
+    account_resolution = await _resolve_dispatch_account_session(
+        dispatch,
+        actor_user_id=actor_user_id,
+    )
     if account_resolution is not None:
         ref, envelope = account_resolution
         payload = _read_dict(dispatch.iii.get("payload"))
@@ -3074,7 +3336,7 @@ async def _dispatch_opencli_source_to_fleet(
             {
                 "_account_ref": ref,
                 "_account_session": envelope,
-                "execution_id": dispatch.taskId,
+                "execution_id": _read_string(payload.get("workflow_run_id")) or dispatch.taskId,
             },
         )
         details: dict[str, object] = {
@@ -3177,26 +3439,40 @@ async def _dispatch_opencli_source_to_fleet(
             )
         elif protocol == "ws":
             result = await _collect_via_ws_agent(
-                agent_url, dispatch.site, dispatch.command, dispatch.args,
-                positional_args, output_format, mode,
+                agent_url,
+                dispatch.site,
+                dispatch.command,
+                dispatch.args,
+                positional_args,
+                output_format,
+                mode,
             )
         else:
             result = await _collect_via_agent(
-                agent_url, dispatch.site, dispatch.command, dispatch.args,
-                positional_args, output_format, mode,
+                agent_url,
+                dispatch.site,
+                dispatch.command,
+                dispatch.args,
+                positional_args,
+                output_format,
+                mode,
             )
     except Exception as exc:
-        details.update({
-            "success": False,
-            "itemCount": 0,
-            "error": str(exc),
-            "errorType": type(exc).__name__,
-        })
+        details.update(
+            {
+                "success": False,
+                "itemCount": 0,
+                "error": str(exc),
+                "errorType": type(exc).__name__,
+            }
+        )
         return [], details
-    details.update({
-        "success": result.success,
-        "itemCount": len(result.items) if result.success else 0,
-    })
+    details.update(
+        {
+            "success": result.success,
+            "itemCount": len(result.items) if result.success else 0,
+        }
+    )
     if result.error:
         details["error"] = result.error
     if result.error_type:
@@ -3204,7 +3480,6 @@ async def _dispatch_opencli_source_to_fleet(
     if result.metadata:
         details["metadata"] = result.metadata
     return (result.items if result.success else []), details
-
 
 
 def _fleet_agent_dispatch_target(
@@ -3863,7 +4138,6 @@ async def _execute_gaojixing_source(
 ) -> None:
     """Run live Gaojixing once for every upstream keyword item."""
     del trace_id
-    binding_input = _binding_input(node)
     adapter_config = _gaojixing_adapter_config(node)
     source_group = _source_group(node, node.id)
     upstream_items = _upstream_outputs(node, outputs_by_node) or [None]
@@ -4273,14 +4547,21 @@ def _bound_source_id_from_items(items: list[dict[str, Any]]) -> str | None:
 
 
 def _collector_account_fields(node: CompiledWorkflowNode) -> dict[str, Any]:
-    """Copy only explicit account identity into each collector source."""
+    """Copy only fixed account identity from the node binding."""
+
     binding_input = _read_dict(_read_dict(node.runtime.get("binding")).get("input"))
     values: dict[str, Any] = {}
     for key in (
-        "account_ref", "accountRef", "account_id", "accountId",
-        "workspace_id", "workspaceId", "source_binding_revision_id",
-        "sourceBindingRevisionId", "execution_id", "executionId",
-        "caller_id", "callerId",
+        "account_ref",
+        "accountRef",
+        "account_id",
+        "accountId",
+        "workspace_id",
+        "workspaceId",
+        "source_binding_revision_id",
+        "sourceBindingRevisionId",
+        "source_binding_id",
+        "sourceBindingId",
     ):
         value = binding_input.get(key, node.params.get(key))
         if value is not None:
@@ -4290,6 +4571,9 @@ def _collector_account_fields(node: CompiledWorkflowNode) -> dict[str, Any]:
 
 async def _execute_collector_source_node(
     node: CompiledWorkflowNode,
+    *,
+    actor_user_id: str | None = None,
+    execution_id: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Fan out one typed collector node while preserving source order."""
 
@@ -4297,8 +4581,16 @@ async def _execute_collector_source_node(
     binding_input = _read_dict(binding.get("input"))
     sources = _read_dict_list(binding_input.get("sources"))
     account_fields = _collector_account_fields(node)
-    if account_fields:
-        sources = [{**source, **account_fields} for source in sources]
+    prepared_sources: list[dict[str, Any]] = []
+    for source in sources:
+        prepared = {**source, **account_fields}
+        for key in ("caller_id", "callerId", "execution_id", "executionId"):
+            prepared.pop(key, None)
+        if _account_binding_from_mapping(prepared) is not None:
+            prepared["caller_id"] = actor_user_id
+            prepared["execution_id"] = execution_id or node.id
+        prepared_sources.append(prepared)
+    sources = prepared_sources
     binding_id = _read_string(binding.get("binding_id"))
     collector_type = _collector_binding_type(binding_input)
     if collector_type is None and binding_id and binding_id.startswith(COLLECTOR_BINDING_PREFIX):
@@ -4318,8 +4610,7 @@ async def _execute_collector_source_node(
         ]
         if mismatched_sources:
             raise ValueError(
-                f"collector_source_kind_mismatch:{collector_type}:"
-                + ",".join(mismatched_sources)
+                f"collector_source_kind_mismatch:{collector_type}:" + ",".join(mismatched_sources)
             )
 
     execution = _read_dict(binding_input.get("execution"))
@@ -4476,8 +4767,7 @@ async def _collect_source_once(
             "workspace_id": source.get("workspace_id") or source.get("workspaceId"),
             "account_id": source.get("account_id") or source.get("accountId"),
             "source_binding_revision_id": (
-                source.get("source_binding_revision_id")
-                or source.get("sourceBindingRevisionId")
+                source.get("source_binding_revision_id") or source.get("sourceBindingRevisionId")
             ),
         }
     if account_ref_value is not None:
@@ -4489,34 +4779,60 @@ async def _collect_source_once(
         )
         from backend.services.browser_account_service import resolve_account_session
 
-        ref = (
-            account_ref_value
+        requested_binding = _account_binding_from_mapping(
+            account_ref_value.to_wire()
             if isinstance(account_ref_value, AccountRef)
-            else AccountRef.from_wire(account_ref_value)
+            else _read_dict(account_ref_value)
         )
-        execution_id = source.get("execution_id") or source.get("executionId")
-        caller_id = source.get("caller_id") or source.get("callerId")
-        if not execution_id or not caller_id:
-            raise ValueError("account collector source requires execution_id and caller_id")
-        context = ExecutionContextV1(
-            account_ref=ref,
-            execution_id=str(execution_id),
-            caller_id=str(caller_id),
-            source_binding_revision_id=ref.source_binding_revision_id,
-        )
+        if requested_binding is None:
+            raise ValueError("account collector source requires an account id")
+        execution_id = source.get("execution_id")
+        actor_user_id = source.get("caller_id")
+        if not execution_id or not actor_user_id:
+            raise ValueError("account collector source requires a persisted execution actor")
         async with AsyncSessionLocal() as session:
-            resolution = await resolve_account_session(session, ref, context)
+            ref = await _validated_account_ref(
+                session,
+                requested_binding,
+            )
+            context = ExecutionContextV1(
+                account_ref=ref,
+                execution_id=str(execution_id),
+                caller_id=str(actor_user_id),
+                source_binding_revision_id=ref.source_binding_revision_id,
+            )
+            resolution = await resolve_account_session(
+                session,
+                ref,
+                context,
+                actor_user_id=str(actor_user_id),
+            )
         if not isinstance(resolution, SessionEnvelopeV1):
+            error = getattr(resolution, "error_code", None) or getattr(
+                resolution,
+                "reason",
+                "unavailable",
+            )
             raise RuntimeError(
-                f"account session {getattr(resolution, 'status', 'blocked')}: "
-                f"{getattr(resolution, 'error_code', None) or getattr(resolution, 'reason', 'unavailable')}"
+                f"account session {getattr(resolution, 'status', 'blocked')}: {error}"
             )
         parameters["_account_ref"] = ref
         parameters["_account_session"] = resolution
     for key in (
-        "account_ref", "accountRef", "account_id", "accountId",
-        "workspace_id", "workspaceId", "source_binding_revision_id",
-        "sourceBindingRevisionId", "caller_id", "callerId",
+        "account_ref",
+        "accountRef",
+        "account_id",
+        "accountId",
+        "workspace_id",
+        "workspaceId",
+        "source_binding_revision_id",
+        "sourceBindingRevisionId",
+        "source_binding_id",
+        "sourceBindingId",
+        "caller_id",
+        "callerId",
+        "execution_id",
+        "executionId",
     ):
         parameters.pop(key, None)
     credential_ref = _read_string(source.get("credentialRef"))
@@ -4560,9 +4876,7 @@ def _collector_channel_config(
         }
     )
     if sensitive_paths:
-        raise ValueError(
-            "collector_plaintext_credential_forbidden:" + ",".join(sensitive_paths)
-        )
+        raise ValueError("collector_plaintext_credential_forbidden:" + ",".join(sensitive_paths))
     config = _read_dict(source.get("config"))
     safe = {
         key: value
@@ -4631,10 +4945,7 @@ def _collector_channel_config(
                 raise ValueError(f"unknown_opencli_adapter_node:{adapter_id}")
             if adapter.access != "read":
                 raise ValueError(f"opencli_adapter_write_access_forbidden:{adapter_id}")
-            arguments = (
-                _read_dict(source.get("arguments"))
-                or _read_dict(source.get("args"))
-            )
+            arguments = _read_dict(source.get("arguments")) or _read_dict(source.get("args"))
             validate_opencli_adapter_arguments(adapter, arguments)
             safe["site"] = adapter.site
             safe["command"] = adapter.command
@@ -4729,9 +5040,7 @@ def _find_collector_sensitive_paths(
             matches.extend(_find_collector_sensitive_paths(item, nested_path))
     elif isinstance(value, list | tuple):
         for index, item in enumerate(value):
-            matches.extend(
-                _find_collector_sensitive_paths(item, (*path, str(index)))
-            )
+            matches.extend(_find_collector_sensitive_paths(item, (*path, str(index))))
     return matches
 
 
@@ -4977,12 +5286,8 @@ async def _execute_native_node(
             {
                 "bindingId": binding_id,
                 "strategy": binding_input.get("strategy", "concat"),
-                "inputType": binding_input.get(
-                    "inputType", "CollectorMergeInputV1"
-                ),
-                "outputType": binding_input.get(
-                    "outputType", "recordCandidate[]"
-                ),
+                "inputType": binding_input.get("inputType", "CollectorMergeInputV1"),
+                "outputType": binding_input.get("outputType", "recordCandidate[]"),
                 "preserveLineage": binding_input.get("preserveLineage", True),
                 "inputCandidateCount": len(input_items),
                 "mergedCandidateCount": len(merged),
@@ -5451,9 +5756,7 @@ async def _execute_external_tool_capability(
             notification_permission_granted=agent_can_send_notifications,
         )
         output["runtimeRevision"] = _gaojixing_runtime_revision()
-        output_items = [
-            _external_tool_output(node, output, input_items, run_id, 0, binding_input)
-        ]
+        output_items = [_external_tool_output(node, output, input_items, run_id, 0, binding_input)]
         if output.get("status") == "verification_required":
             raise _GaojixingToolTerminalError(
                 event_type="waiting",
@@ -5488,9 +5791,7 @@ async def _execute_external_tool_capability(
             input_items,
             _gaojixing_tool_params(binding_input, workflow_input, run_id=run_id),
         )
-        output_items = [
-            _external_tool_output(node, output, input_items, run_id, 0, binding_input)
-        ]
+        output_items = [_external_tool_output(node, output, input_items, run_id, 0, binding_input)]
         if output.get("status") == "rejected":
             raise _GaojixingToolTerminalError(
                 event_type="failed",
@@ -5938,9 +6239,7 @@ async def _store_record_sink_outputs(
                 sink_node_id=node.id,
                 cache=materialized_source_tasks,
             )
-            channel_type = _workflow_source_channel_type(
-                runtime_nodes_by_id[source_node_id]
-            )
+            channel_type = _workflow_source_channel_type(runtime_nodes_by_id[source_node_id])
         elif _is_gaojixing_project_record(item):
             source_node_id = f"gaojixing-certified-archive:{run_id}"
             source_id, task_id = await _materialize_gaojixing_source_task(
@@ -6869,10 +7168,18 @@ def _to_dispatch(
     args = {
         key: value
         for key, value in raw_args.items()
-        if key not in {
-            "account_id", "accountId", "workspace_id", "workspaceId",
-            "source_binding_revision_id", "sourceBindingRevisionId",
-            "caller_id", "callerId", "execution_id", "executionId",
+        if key
+        not in {
+            "account_id",
+            "accountId",
+            "workspace_id",
+            "workspaceId",
+            "source_binding_revision_id",
+            "sourceBindingRevisionId",
+            "caller_id",
+            "callerId",
+            "execution_id",
+            "executionId",
         }
     }
     task_id = _task_id(project.id, run_id, node.id, source_group)
@@ -6904,9 +7211,7 @@ def _to_dispatch(
             "sourceBindingId",
             node.params.get(
                 "source_binding_id",
-                binding_input.get("sourceBindingId")
-                if isinstance(binding_input, dict)
-                else None,
+                binding_input.get("sourceBindingId") if isinstance(binding_input, dict) else None,
             ),
         )
     )
@@ -6945,9 +7250,7 @@ def _to_dispatch(
             "accountId",
             node.params.get(
                 "account_id",
-                binding_input.get("accountId")
-                if isinstance(binding_input, dict)
-                else None,
+                binding_input.get("accountId") if isinstance(binding_input, dict) else None,
             ),
         )
     )
@@ -6956,9 +7259,7 @@ def _to_dispatch(
             "workspaceId",
             node.params.get(
                 "workspace_id",
-                binding_input.get("workspaceId")
-                if isinstance(binding_input, dict)
-                else None,
+                binding_input.get("workspaceId") if isinstance(binding_input, dict) else None,
             ),
         )
     )
@@ -7072,9 +7373,9 @@ def _expand_gaojixing_project_records(
             )
     return expanded
 
+
 def _is_gaojixing_project_record(item: dict[str, Any]) -> bool:
     return _read_dict(item.get("raw")).get("schema") == "gaojixing.project-record.v1"
-
 
 
 def _read_string(value: object) -> str | None:

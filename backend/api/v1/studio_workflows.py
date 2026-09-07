@@ -3,7 +3,18 @@
 import json
 import uuid
 
-from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    status,
+)
 from pydantic import ValidationError
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
@@ -26,6 +37,8 @@ from backend.api.v1.studio_schemas import (
     WorkflowRead,
 )
 from backend.api.v1.workflows import (
+    _account_workflow_identity,
+    _account_workflow_run_identity,
     build_evidence_projection,
     dispatch_materialized_image_jobs,
     get_evidence_batch,
@@ -33,6 +46,7 @@ from backend.api.v1.workflows import (
     parse_projection_includes,
 )
 from backend.database import get_db, rollback_session
+from backend.models.gaojixing_collection import GaojixingCollectionRun
 from backend.models.studio import (
     StudioProject,
     StudioWorkflow,
@@ -42,6 +56,12 @@ from backend.models.studio import (
 from backend.models.workflow_run import WorkflowRun
 from backend.schemas import workflow as workflow_schemas
 from backend.schemas.common import ApiResponse, PaginationMeta
+from backend.security.identity import RequestIdentity
+from backend.security.workspace_rbac import (
+    WorkspacePermission,
+    get_workspace_access,
+    require_permission,
+)
 from backend.services.gaojixing_collection_service import (
     GaojixingCollectionConflictError,
     resume_collection,
@@ -177,7 +197,6 @@ async def _project_runtime_scope(
         .all()
     )
     return workflow_names, {version.id: version.version for version in versions}
-
 
 
 @router.get(
@@ -441,6 +460,7 @@ async def _existing_published_run_projection(
     workflow_id: str,
     version_id: str,
     requested_identity: str,
+    requested_by_user_id: str | None,
 ) -> workflow_schemas.WorkflowRunProjection | None:
     existing = await db.get(WorkflowRun, run_id)
     if existing is None:
@@ -457,6 +477,7 @@ async def _existing_published_run_projection(
     if (
         existing.workflow_id != workflow_id
         or existing.studio_workflow_version_id != version_id
+        or existing.requested_by_user_id != requested_by_user_id
         or not identity_matches
     ):
         raise HTTPException(
@@ -487,8 +508,15 @@ async def _start_published_version_run(
     trigger_node_id: str | None = None,
     idempotency_key: str | None = None,
     run_id: str | None = None,
+    request_identity: RequestIdentity | None = None,
 ) -> ApiResponse:
     version_id = version.id
+    project = workflow_schemas.WorkflowProject.model_validate(version.graph)
+    requested_by_user_id: str | None = None
+    if request_identity is not None:
+        access = await get_workspace_access(db, workspace_id, request_identity)
+        require_permission(access, WorkspacePermission.RUN_OPERATIONS_AGENTS)
+        requested_by_user_id = access.user_id
     resolved_run_id = run_id or _published_run_id(
         workspace_id=workspace_id,
         project_id=project_id,
@@ -508,11 +536,11 @@ async def _start_published_version_run(
             workflow_id=workflow_id,
             version_id=version_id,
             requested_identity=requested_identity,
+            requested_by_user_id=requested_by_user_id,
         )
         if existing_projection is not None:
             return ApiResponse.ok(existing_projection)
 
-    project = workflow_schemas.WorkflowProject.model_validate(version.graph)
     resolved_trigger_kind = trigger_kind or _default_published_trigger_kind(
         project,
         trigger_node_id,
@@ -533,6 +561,9 @@ async def _start_published_version_run(
             ),
             session=db,
             studio_workflow_version_id=version_id,
+            request_identity=request_identity,
+            requested_by_user_id=requested_by_user_id,
+            expected_workspace_id=workspace_id,
         )
     except IntegrityError:
         if not idempotency_key:
@@ -544,6 +575,7 @@ async def _start_published_version_run(
             workflow_id=workflow_id,
             version_id=version_id,
             requested_identity=requested_identity,
+            requested_by_user_id=requested_by_user_id,
         )
         if projection is None:
             raise
@@ -562,6 +594,7 @@ async def start_published_workflow_run(
     project_id: str,
     workflow_id: str,
     body: PublishedWorkflowRunStart,
+    request: Request,
     idempotency_header: str | None = Header(default=None, alias="Idempotency-Key"),
     request_id_header: str | None = Header(default=None, alias="X-Request-ID"),
     db: AsyncSession = Depends(get_db),
@@ -574,6 +607,8 @@ async def start_published_workflow_run(
         project_id=project_id,
         workflow_id=workflow_id,
     )
+    project = workflow_schemas.WorkflowProject.model_validate(version.graph)
+    identity = await _account_workflow_identity(project, request)
     request_id = body.request_id or request_id_header or str(uuid.uuid4())
     idempotency_key = body.idempotency_key or idempotency_header
     return await _start_published_version_run(
@@ -593,6 +628,7 @@ async def start_published_workflow_run(
         response_mode=body.response_mode,
         trigger_kind=body.trigger_kind,
         trigger_node_id=body.trigger_node_id,
+        request_identity=identity,
     )
 
 
@@ -605,6 +641,7 @@ async def start_published_workflow_run_from_question_bank(
     workspace_id: str,
     project_id: str,
     workflow_id: str,
+    request_context: Request,
     question_bank: UploadFile = File(..., alias="questionBank"),
     request: str = Form(...),
     idempotency_header: str | None = Header(default=None, alias="Idempotency-Key"),
@@ -620,6 +657,7 @@ async def start_published_workflow_run_from_question_bank(
         workflow_id=workflow_id,
     )
     project = workflow_schemas.WorkflowProject.model_validate(version.graph)
+    identity = await _account_workflow_identity(project, request_context)
     if not accepts_managed_question_batch(project):
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -671,6 +709,7 @@ async def start_published_workflow_run_from_question_bank(
             trigger_kind=body.trigger_kind,
             trigger_node_id=body.trigger_node_id,
             run_id=run_id,
+            request_identity=identity,
         )
     except Exception:
         if request_owns_run_directory and staged.created:
@@ -694,6 +733,7 @@ async def replay_persisted_gaojixing_source_downstream(
     project_id: str,
     workflow_id: str,
     run_id: str,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse:
     """Replay normalization through sink from completed persisted Gaojixing evidence."""
@@ -718,6 +758,7 @@ async def replay_persisted_gaojixing_source_downstream(
         workflow_id=workflow_id,
         run_id=run_id,
     )
+    await _account_workflow_run_identity(db, run_id, request)
     try:
         projection = await replay_downstream_from_persisted_gaojixing_source(
             run_id,
@@ -944,7 +985,6 @@ async def get_project_workflow_evidence_projection(
     )
 
 
-
 @router.post(
     (
         "/workspaces/{workspace_id}/projects/{project_id}/workflows/{workflow_id}"
@@ -958,6 +998,7 @@ async def resume_published_gaojixing_run(
     project_id: str,
     workflow_id: str,
     run_id: str,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse[workflow_schemas.WorkflowRunProjection]:
     """Resume only a run owned by the requested Studio workflow scope."""
@@ -966,10 +1007,9 @@ async def resume_published_gaojixing_run(
     row = await db.get(WorkflowRun, run_id)
     if row is None or row.workflow_id != workflow_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Workflow run not found")
+    await _account_workflow_run_identity(db, run_id, request)
     job = await db.scalar(
-        select(GaojixingCollectionRun).where(
-            GaojixingCollectionRun.workflow_run_id == run_id
-        )
+        select(GaojixingCollectionRun).where(GaojixingCollectionRun.workflow_run_id == run_id)
     )
     if job is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Gaojixing collection not found")

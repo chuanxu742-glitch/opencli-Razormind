@@ -22,7 +22,7 @@ def test_alembic_has_one_head():
     config = Config()
     config.set_main_option("script_location", "backend/migrations")
 
-    assert ScriptDirectory.from_config(config).get_heads() == ["add_task_execution_actor"]
+    assert ScriptDirectory.from_config(config).get_heads() == ["add_workflow_run_actor"]
 
 
 def test_ci_downgrade_target_is_unambiguous():
@@ -62,6 +62,12 @@ def test_upgrade_head_creates_identity_and_operations_tables(monkeypatch):
             task_foreign_keys = list(
                 connection.execute("PRAGMA foreign_key_list(collection_tasks)")
             )
+            workflow_run_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(workflow_runs)")
+            }
+            workflow_run_foreign_keys = list(
+                connection.execute("PRAGMA foreign_key_list(workflow_runs)")
+            )
         finally:
             connection.close()
 
@@ -100,11 +106,19 @@ def test_upgrade_head_creates_identity_and_operations_tables(monkeypatch):
         and row[6] == "SET NULL"
         for row in task_foreign_keys
     )
+    assert "requested_by_user_id" in workflow_run_columns
+    assert any(
+        row[2] == "users"
+        and row[3] == "requested_by_user_id"
+        and row[4] == "id"
+        and row[6] == "SET NULL"
+        for row in workflow_run_foreign_keys
+    )
 
 
 @pytest.mark.asyncio
-async def test_task_actor_migration_upgrades_disposable_postgres():
-    async with temporary_postgres_database("task_actor_migration") as database_url:
+async def test_execution_actor_migrations_upgrade_disposable_postgres():
+    async with temporary_postgres_database("execution_actor_migration") as database_url:
         environment = {**os.environ, "DATABASE_URL": database_url}
         result = await asyncio.to_thread(
             subprocess.run,
@@ -120,40 +134,46 @@ async def test_task_actor_migration_upgrades_disposable_postgres():
         engine = create_async_engine(database_url)
         try:
             async with engine.connect() as connection:
-                column = (
+                columns = (
                     await connection.execute(
                         text(
                             """
-                            SELECT is_nullable
+                            SELECT table_name, is_nullable
                             FROM information_schema.columns
                             WHERE table_schema = 'public'
-                              AND table_name = 'collection_tasks'
+                              AND table_name IN ('collection_tasks', 'workflow_runs')
                               AND column_name = 'requested_by_user_id'
                             """
                         )
                     )
-                ).scalar_one_or_none()
-                delete_rule = (
+                ).all()
+                delete_rules = (
                     await connection.execute(
                         text(
                             """
-                            SELECT rc.delete_rule
+                            SELECT kcu.table_name, rc.delete_rule
                             FROM information_schema.referential_constraints AS rc
                             JOIN information_schema.key_column_usage AS kcu
                               ON kcu.constraint_schema = rc.constraint_schema
                              AND kcu.constraint_name = rc.constraint_name
                             WHERE kcu.table_schema = 'public'
-                              AND kcu.table_name = 'collection_tasks'
+                              AND kcu.table_name IN ('collection_tasks', 'workflow_runs')
                               AND kcu.column_name = 'requested_by_user_id'
                             """
                         )
                     )
-                ).scalar_one_or_none()
+                ).all()
         finally:
             await engine.dispose()
 
-    assert column == "YES"
-    assert delete_rule == "SET NULL"
+    assert set(columns) == {
+        ("collection_tasks", "YES"),
+        ("workflow_runs", "YES"),
+    }
+    assert set(delete_rules) == {
+        ("collection_tasks", "SET NULL"),
+        ("workflow_runs", "SET NULL"),
+    }
 
 
 def test_workflow_run_version_foreign_key_is_restrict(monkeypatch):

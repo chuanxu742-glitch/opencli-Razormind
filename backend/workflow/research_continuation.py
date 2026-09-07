@@ -24,6 +24,7 @@ from backend.schemas.workflow import (
     WorkflowRunStartRequest,
     WorkflowRunTrigger,
 )
+from backend.security.identity import RequestIdentity
 from backend.workflow.opencli_hda_tracer import start_workflow_run
 
 _MAX_CONTINUATION_ITEMS = 200
@@ -43,6 +44,7 @@ async def continue_research_workflow_run(
     body: WorkflowResearchContinuationRequest,
     *,
     session: AsyncSession,
+    request_identity: RequestIdentity | None = None,
 ) -> WorkflowResearchContinuationResponse | None:
     parent = await _load_run(parent_run_id, session)
     if parent is None:
@@ -211,7 +213,14 @@ async def continue_research_workflow_run(
         },
         deep=True,
     )
-    await start_workflow_run(child_request, session=session)
+    parent_row = await session.get(WorkflowRun, parent_run_id)
+    assert parent_row is not None
+    await start_workflow_run(
+        child_request,
+        session=session,
+        request_identity=request_identity,
+        requested_by_user_id=parent_row.requested_by_user_id,
+    )
     return await _continuation_response(
         ledger_id=root_run_id,
         parent_run_id=parent_run_id,
@@ -364,9 +373,7 @@ def _ledger_entry(
         rootRunId=str(context.get("rootRunId") or root_run_id),
         iteration=int(report.get("iteration") or context.get("iteration") or 1),
         additionalCollectionCount=int(
-            report.get("additionalCollectionCount")
-            or context.get("additionalCollectionCount")
-            or 0
+            report.get("additionalCollectionCount") or context.get("additionalCollectionCount") or 0
         ),
         revisionId=_text(_latest_metrics(events, "revisionId").get("revisionId")),
         parentRevisionId=_text(context.get("parentRevisionId")),
@@ -461,8 +468,7 @@ def _restart_source_outputs(
     request: WorkflowRunStartRequest,
 ) -> dict[str, list[dict[str, Any]]]:
     outputs = {
-        node_id: [dict(item) for item in items]
-        for node_id, items in request.sourceOutputs.items()
+        node_id: [dict(item) for item in items] for node_id, items in request.sourceOutputs.items()
     }
     for node in _walk_project_nodes(request.project.nodes):
         if node.kind != "source" or node.id in outputs:

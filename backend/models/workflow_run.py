@@ -22,6 +22,12 @@ class WorkflowRun(TimestampMixin):
         nullable=True,
         index=True,
     )
+    requested_by_user_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     trace_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     status: Mapped[str] = mapped_column(String(50), nullable=False)
     valid: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)

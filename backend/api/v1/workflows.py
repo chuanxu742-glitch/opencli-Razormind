@@ -12,6 +12,7 @@ from fastapi import (
     Header,
     HTTPException,
     Query,
+    Request,
     Response,
     UploadFile,
 )
@@ -23,10 +24,12 @@ from backend.api.v1.dify_imports import get_dify_graphon_client
 from backend.config import get_settings
 from backend.database import get_db
 from backend.image_studio.worker_runtime import dispatch_block_reason
+from backend.models.identity import User
 from backend.models.image_studio import ImageGenerationJob, ImageGenerationJobStatus
 from backend.models.workflow_run import WorkflowRun as WorkflowRunRow
 from backend.schemas import workflow as workflow_schemas
 from backend.schemas.common import ApiResponse
+from backend.security.identity import RequestIdentity, get_request_identity
 from backend.services import image_studio_service
 from backend.services.gaojixing_collection_service import (
     GaojixingCollectionConflictError,
@@ -67,6 +70,7 @@ from backend.workflow.opencli_hda_tracer import (
     get_workflow_run_projection,
     list_workflow_run_events,
     start_workflow_run,
+    workflow_project_has_account_reference,
 )
 from backend.workflow.opentabs_tool_nodes import list_opentabs_tool_nodes
 from backend.workflow.patcher import preview_workflow_patch
@@ -79,6 +83,35 @@ from backend.workflow.runtime_registry import WEBHOOK_TRIGGER_BINDING_ID
 from backend.workflow.tool_capabilities import list_workflow_tool_capabilities
 
 router = APIRouter(prefix="/workflows", tags=["workflows"])
+
+
+async def _account_workflow_identity(
+    project: workflow_schemas.WorkflowProject,
+    request: Request,
+) -> RequestIdentity | None:
+    if not workflow_project_has_account_reference(project):
+        return None
+    return await get_request_identity(request)
+
+
+async def _account_workflow_run_identity(
+    db: AsyncSession,
+    run_id: str,
+    request: Request,
+) -> RequestIdentity | None:
+    run = await db.get(WorkflowRunRow, run_id)
+    if run is None or run.requested_by_user_id is None:
+        return None
+    identity = await get_request_identity(request)
+    caller_user_id = await db.scalar(
+        select(User.id).where(
+            User.subject == identity.subject,
+            User.disabled.is_(False),
+        )
+    )
+    if caller_user_id != run.requested_by_user_id:
+        raise HTTPException(status_code=403, detail="Workflow actor does not match requester")
+    return identity
 
 
 async def _reject_workspace_scoped_run(db: AsyncSession, run_id: str) -> None:
@@ -308,15 +341,18 @@ async def import_external_runtime_workflow(
 )
 async def start_run(
     body: workflow_schemas.WorkflowRunStartRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     graphon_client: DifyGraphonClient = Depends(get_dify_graphon_client),
 ) -> ApiResponse[workflow_schemas.WorkflowRunProjection]:
     """Start a WorkflowProject run and emit replayable node-level events."""
 
+    identity = await _account_workflow_identity(body.project, request)
     projection = await start_workflow_run(
         body,
         session=db,
         graphon_client=graphon_client,
+        request_identity=identity,
     )
     await dispatch_materialized_image_jobs(db, projection.runId)
     return ApiResponse.ok(projection)
@@ -328,6 +364,7 @@ async def start_run(
     status_code=202,
 )
 async def start_run_from_question_bank(
+    request_context: Request,
     question_bank: UploadFile = File(..., alias="questionBank"),
     request: str = Form(...),
     db: AsyncSession = Depends(get_db),
@@ -337,6 +374,10 @@ async def start_run_from_question_bank(
 
     try:
         run_request = workflow_schemas.WorkflowRunStartRequest.model_validate_json(request)
+        identity = await _account_workflow_identity(
+            run_request.project,
+            request_context,
+        )
         if run_request.runId is not None:
             raise HTTPException(
                 status_code=400,
@@ -380,6 +421,7 @@ async def start_run_from_question_bank(
             ),
             session=db,
             graphon_client=graphon_client,
+            request_identity=identity,
         )
     except Exception:
         if staged.created:
@@ -401,6 +443,7 @@ async def start_run_from_webhook(
     workflow_id: str,
     trigger_node_id: str,
     body: workflow_schemas.WorkflowWebhookIngressRequest,
+    request: Request,
     idempotency_header: str | None = Header(default=None, alias="Idempotency-Key"),
     request_id_header: str | None = Header(default=None, alias="X-Request-ID"),
     source_id_header: str | None = Header(default=None, alias="X-Source-ID"),
@@ -416,6 +459,7 @@ async def start_run_from_webhook(
             trigger_node_id=trigger_node_id,
         )
 
+    identity = await _account_workflow_identity(body.workflowProject, request)
     compile_result = compile_workflow_project(body.workflowProject)
     if not compile_result.valid or compile_result.plan is None:
         raise HTTPException(
@@ -478,6 +522,7 @@ async def start_run_from_webhook(
     if run_id is not None and idempotency_key:
         existing = await get_workflow_run_projection(run_id, session=db)
         if existing is not None:
+            await _account_workflow_run_identity(db, run_id, request)
             return ApiResponse.ok(
                 _webhook_ingress_response(
                     existing,
@@ -510,6 +555,7 @@ async def start_run_from_webhook(
         ),
         session=db,
         graphon_client=get_dify_graphon_client(),
+        request_identity=identity,
     )
     await dispatch_materialized_image_jobs(db, projection.runId)
     return ApiResponse.ok(
@@ -683,6 +729,7 @@ async def get_run_evidence_projection(
 async def continue_run_with_source_outputs(
     run_id: str,
     body: workflow_schemas.WorkflowRunSourceOutputsRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse[workflow_schemas.WorkflowRunProjection]:
     """Continue a workflow run after external source batches arrive."""
@@ -701,7 +748,13 @@ async def continue_run_with_source_outputs(
             status_code=409,
             detail=("Image generation outputs are accepted only from the platform job worker"),
         )
-    projection = await continue_workflow_run_with_source_outputs(run_id, body, session=db)
+    identity = await _account_workflow_run_identity(db, run_id, request)
+    projection = await continue_workflow_run_with_source_outputs(
+        run_id,
+        body,
+        session=db,
+        request_identity=identity,
+    )
     if projection is None:
         raise HTTPException(status_code=404, detail="Workflow run not found")
     return ApiResponse.ok(projection)
@@ -714,17 +767,17 @@ async def continue_run_with_source_outputs(
 )
 async def resume_gaojixing_run(
     run_id: str,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse[workflow_schemas.WorkflowRunProjection]:
     """Explicitly requeue a human-cleared governed checkpoint."""
 
     await _reject_workspace_scoped_run(db, run_id)
+    await _account_workflow_run_identity(db, run_id, request)
     from backend.models.gaojixing_collection import GaojixingCollectionRun
 
     job = await db.scalar(
-        select(GaojixingCollectionRun).where(
-            GaojixingCollectionRun.workflow_run_id == run_id
-        )
+        select(GaojixingCollectionRun).where(GaojixingCollectionRun.workflow_run_id == run_id)
     )
     if job is None:
         raise HTTPException(status_code=404, detail="Gaojixing collection not found")
@@ -765,13 +818,20 @@ async def get_run_research_ledger(
 async def continue_research_run(
     run_id: str,
     body: workflow_schemas.WorkflowResearchContinuationRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse[workflow_schemas.WorkflowResearchContinuationResponse]:
     """Start one bounded child Run from an accepted collect_more proposal."""
 
     await _reject_workspace_scoped_run(db, run_id)
+    identity = await _account_workflow_run_identity(db, run_id, request)
     try:
-        result = await continue_research_workflow_run(run_id, body, session=db)
+        result = await continue_research_workflow_run(
+            run_id,
+            body,
+            session=db,
+            request_identity=identity,
+        )
     except ResearchContinuationError as exc:
         status_code = 413 if "too_large" in exc.code else 409
         raise HTTPException(
