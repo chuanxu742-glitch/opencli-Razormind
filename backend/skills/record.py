@@ -41,6 +41,7 @@ Design (mirrors the execute leg's substrate — no new browser plumbing):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 import uuid
@@ -49,6 +50,7 @@ from typing import Any
 
 from backend.skills.loop import StepRecord
 from backend.skills.page import SkillPage
+from backend.skills.perception import clear_session_sensitive, is_session_sensitive, set_session_sensitive
 from backend.skills.trace import assemble_trace, outcome_from_loop
 
 logger = logging.getLogger(__name__)
@@ -69,23 +71,50 @@ logger = logging.getLogger(__name__)
 # no-ops the second session's capture entirely — the bug this comment is
 # guarding against actually happened during development).
 CAPTURE_JS = r"""
-(sessionId) => {
+(rawOptions = {}) => {
+  const options = typeof rawOptions === 'string' ? {sessionId: rawOptions} : (rawOptions || {});
+  const sessionId = options.sessionId;
+  const requestedSensitive = options.sensitive === true;
+  const preserveSensitive = options.preserve === true;
+  if (typeof sessionId !== 'string' || !sessionId) return false;
   const boundKey = '__skillRecordBound_' + sessionId;
   const stateKey = boundKey + '_state';
+  const sensitiveStorageKey = '__skillRecordSensitiveStorage_' + sessionId;
   const currentDocument = document;
+  let previousSensitive = false;
+  try {
+    previousSensitive = sessionStorage.getItem(sensitiveStorageKey) === '1';
+  } catch (_) {}
   const state = {
     document: currentDocument,
     generation: 0,
-    blocked: true,
+    blocked: requestedSensitive || (preserveSensitive && previousSensitive),
     listenersInstalled: false,
     listenerRevoked: true,
     handlers: null,
   };
+  try {
+    if (state.blocked) sessionStorage.setItem(sensitiveStorageKey, '1');
+    else sessionStorage.removeItem(sensitiveStorageKey);
+  } catch (_) {}
   const targetIsCurrent = (event) => {
     if (state.blocked) return false;
     if (state.document !== currentDocument || currentDocument.defaultView !== window) return false;
     const target = event && event.target;
     return Boolean(target && target.ownerDocument === currentDocument);
+  };
+  const sensitiveElement = (el) => {
+    if (!el || !el.getAttribute) return true;
+    const sensitivePattern = /password|passwd|pwd|otp|token|secret|verification|challenge|code/i;
+    let current = el;
+    while (current && current.getAttribute) {
+      const type = String(current.type || '').toLowerCase();
+      const marker = current.getAttribute('data-sensitive-field');
+      const name = String(current.getAttribute('name') || '');
+      if (type === 'password' || marker || sensitivePattern.test(name)) return true;
+      current = current.parentElement;
+    }
+    return false;
   };
   const nameOf = (el) => {
     if (!el || !el.getAttribute) return '';
@@ -105,28 +134,28 @@ CAPTURE_JS = r"""
   const install = () => {
     if (state.listenersInstalled || state.blocked || state.document !== currentDocument) return;
     const click = (e) => {
-      if (!targetIsCurrent(e)) return;
-      window.__record_event({ verb: 'click', name: nameOf(e.target), role: roleOf(e.target) });
+      if (!targetIsCurrent(e) || sensitiveElement(e.target)) return;
+      window.__record_event({session_id: sessionId, verb: 'click', name: nameOf(e.target), role: roleOf(e.target)});
     };
     const change = (e) => {
-      if (!targetIsCurrent(e)) return;
-      const tag = ((e.target && e.target.tagName) || '').toLowerCase();
+      if (!targetIsCurrent(e) || sensitiveElement(e.target)) return;
+      const target = e.target;
+      const tag = ((target && target.tagName) || '').toLowerCase();
       const isSelect = tag === 'select';
-      const inputType = ((e.target && e.target.type) || '').toLowerCase();
-      const isSensitive = inputType === 'password';
       window.__record_event({
+        session_id: sessionId,
         verb: isSelect ? 'select' : 'type',
-        name: nameOf(e.target),
-        role: roleOf(e.target),
-        value: isSensitive ? '' : String((e.target && e.target.value) ?? ''),
-        redacted: isSensitive,
+        name: nameOf(target),
+        role: roleOf(target),
+        value: isSelect ? String(target.value ?? '') : String(target.value ?? ''),
+        redacted: false,
       });
     };
     const submit = (e) => {
       if (!targetIsCurrent(e)) return;
-      window.__record_event({ verb: 'submit', name: nameOf(e.target), role: 'form' });
+      window.__record_event({session_id: sessionId, verb: 'submit', name: nameOf(e.target), role: 'form'});
     };
-    state.handlers = { click, change, submit };
+    state.handlers = {click, change, submit};
     document.addEventListener('click', click, true);
     document.addEventListener('change', change, true);
     document.addEventListener('submit', submit, true);
@@ -149,12 +178,19 @@ CAPTURE_JS = r"""
     if (!Number.isInteger(generation) || generation < state.generation) return false;
     state.generation = generation;
     state.blocked = Boolean(enabled);
+    try {
+      if (state.blocked) sessionStorage.setItem(sensitiveStorageKey, '1');
+      else sessionStorage.removeItem(sensitiveStorageKey);
+    } catch (_) {}
     if (state.blocked) revoke();
     else install();
     return true;
   };
   window[stateKey] = state;
   window[boundKey + '_apply'] = apply;
+  if (state.blocked) revoke();
+  else install();
+  return true;
 }
 """
 APPLY_CAPTURE_STATE_JS = r"""
@@ -196,6 +232,8 @@ class RecordSession:
     _frame_update_tasks: set[asyncio.Task[Any]] = field(default_factory=set, init=False, repr=False)
     stopped: bool = False
     sensitive: bool = False
+    _navigation_handler_installed: bool = field(default=False, init=False, repr=False)
+    _close_handler_installed: bool = field(default=False, init=False, repr=False)
     _trace: dict[str, Any] | None = field(default=None, init=False, repr=False)
     def _raw_page(self) -> Any:
         return getattr(self.page, "page", self.page)
@@ -235,6 +273,7 @@ class RecordSession:
         # attempt: Python callbacks must fail closed if a frame update fails.
         self.sensitive = True
         self._listener_installed = False
+        set_session_sensitive(self.session_id, True)
         self._listener_revoked = True
 
     async def _set_page_capture_state(self, enabled: bool) -> None:
@@ -275,9 +314,75 @@ class RecordSession:
             await self._drain_event.wait()
         self._pending_events_drained = True
 
+    def _capture_targets(self) -> list[Any]:
+        """Return every live document that may own a capture listener.
+
+        ``Page.add_init_script`` runs for child frames as well as the main
+        document, so changing the guard in only ``page.evaluate`` leaves an
+        existing iframe collecting events.  A browser-free fake page has no
+        ``frames`` property; retaining the page fallback keeps the existing
+        unit-test seam while real Playwright uses ``Frame.evaluate``.
+        """
+        frames = getattr(self.page.page, "frames", None)
+        if frames:
+            try:
+                targets = list(frames)
+            except TypeError:
+                targets = []
+            if targets:
+                return targets
+        return [self.page.page]
+
+    async def _evaluate_capture(self, options: dict[str, Any]) -> None:
+        """Apply a capture state to every current frame, then report failures.
+
+        Continue after one frame fails so a detached/closing frame cannot
+        prevent cleanup in the remaining documents.  Callers keep the
+        process-side guard enabled whenever any frame reports an error.
+        """
+        failures: list[BaseException] = []
+        for target in self._capture_targets():
+            evaluate = getattr(target, "evaluate", None)
+            if not callable(evaluate):
+                failures.append(TypeError("capture target has no evaluate"))
+                continue
+            try:
+                await evaluate(CAPTURE_JS, options)
+            except BaseException as exc:  # pragma: no cover - browser failure
+                failures.append(exc)
+        if failures:
+            raise failures[0]
+
+    async def _add_guarded_init_script(self) -> None:
+        guarded_arg = json.dumps(
+            {"sessionId": self.session_id, "sensitive": True, "preserve": True},
+            separators=(",", ":"),
+        )
+        await self.page.page.add_init_script(f"({CAPTURE_JS})({guarded_arg})")
+
+    def _remove_listener(self, event: str, handler: Any) -> None:
+        remove_listener = getattr(self.page.page, "remove_listener", None)
+        if not callable(remove_listener):
+            return
+        try:
+            remove_listener(event, handler)
+        except Exception:  # pragma: no cover - browser teardown race
+            logger.debug("record listener removal failed | event=%s", event, exc_info=True)
+
+    def _remove_page_handlers(self) -> None:
+        if self._navigation_handler_installed:
+            self._remove_listener("framenavigated", self._on_navigate)
+            self._navigation_handler_installed = False
+        if self._close_handler_installed:
+            self._remove_listener("close", self._on_page_close)
+            self._close_handler_installed = False
+
     async def start(self) -> None:
         """Wire the capture binding and listener onto every live frame."""
+        set_session_sensitive(self.session_id, False)
         raw_page = self._raw_page()
+        raw_page.on("close", self._on_page_close)
+        self._close_handler_installed = True
         await raw_page.expose_binding("__record_event", self._on_event)
         add_init_script = getattr(raw_page, "add_init_script", None)
         if not callable(add_init_script):
@@ -298,6 +403,7 @@ class RecordSession:
         self._listener_revoked = False
         self._pending_events_drained = True
         raw_page.on("framenavigated", self._on_navigate)
+        self._navigation_handler_installed = True
 
     def _frame_for_target(self, frame_id: Any | None) -> Any:
         frames = self._frames()
@@ -335,6 +441,14 @@ class RecordSession:
             )
         )
 
+    def _on_page_close(self, *_args: Any) -> None:
+        """A browser/page teardown is an ownership boundary, not a normal exit."""
+        self.sensitive = True
+        self.stopped = True
+        self._navigation_handler_installed = False
+        self._close_handler_installed = False
+        clear_session_sensitive(self.session_id)
+
     def _on_navigate(self, frame: Any) -> None:
         # Every frame has an independent document generation. Main-frame
         # navigations remain trace steps; iframe navigations update binding
@@ -347,7 +461,7 @@ class RecordSession:
         if frame is main_frame:
             self._document_generation = self._frame_document_generations[frame]
         self._schedule_frame_update(frame)
-        if frame is not main_frame or self.sensitive or self.stopped:
+        if frame is not main_frame or self.sensitive or is_session_sensitive(self.session_id):
             return
         self._append(verb="navigate", args={"url": frame.url}, target=frame.url)
 
@@ -403,14 +517,17 @@ class RecordSession:
         """Revoke or restore the real capture listeners and drain callbacks."""
         if self.stopped:
             raise RuntimeError("stopped recording cannot change sensitive mode")
+        if enabled:
+            set_session_sensitive(self.session_id, True)
         async with self._event_lock:
             await self._set_page_capture_state(enabled)
             self.sensitive = enabled
             self._listener_installed = not enabled
             self._listener_revoked = enabled
+        if not enabled:
+            set_session_sensitive(self.session_id, False)
         await self._drain_events()
         return True
-
     async def stop(self, *, status: str = "success", note: str | None = None) -> dict[str, Any]:
         """Revoke capture, drain callbacks, and assemble the recorded trace."""
         if self._trace is not None:
@@ -428,9 +545,8 @@ class RecordSession:
                 await self._drain_events()
         finally:
             self.stopped = True
-            remove_listener = getattr(self._raw_page(), "remove_listener", None)
-            if callable(remove_listener):
-                remove_listener("framenavigated", self._on_navigate)
+            set_session_sensitive(self.session_id, False)
+            self._remove_page_handlers()
         self._append(
             verb="done",
             args={"status": status, "note": note},
@@ -463,7 +579,7 @@ async def start_recording(cdp_endpoint: str, *, domain: str, capability: str) ->
     )
     try:
         await session.start()
-    except Exception:
+    except BaseException:
         # Never leak the already-opened page/CDP connection if wiring the
         # capture listener fails — same "never leak a held Chrome on
         # failure" rule the API layer's own record_start applies.

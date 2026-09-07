@@ -1,0 +1,37 @@
+{
+  "id": "controlled-login-fixture",
+  "version": "1.0.0",
+  "platform": "controlled-login-fixture",
+  "allowed_origins": ["http://127.0.0.1:49906", "http://localhost:49906"],
+  "login_url": "/login",
+  "allowed_redirect_origins": ["http://127.0.0.1:49906", "http://localhost:49906"],
+  "frames": ["main", "same-origin"],
+  "modes": ["qr", "form", "native"],
+  "selectors": [
+    { "id": "qr", "selector": "#qr-region img#login-qr", "kind": "qr", "frame": "main" },
+    { "id": "form", "selector": "#login-form", "kind": "form", "frame": "main" },
+    { "id": "identity", "selector": "#identity-evidence", "kind": "identity", "frame": "main" },
+    { "id": "authenticated", "selector": "#authenticated", "kind": "authenticated_state", "frame": "main" }
+  ],
+  "sensitive_regions": [
+    { "x": 0, "y": 0, "width": 4096, "height": 4096 }
+  ],
+  "refresh": { "trigger": "qr_expired", "interval": 30, "max_attempts": 3 },
+  "auth": { "identity_path": "/identity", "status_path": "/auth-status" },
+  "mode_selectors": {
+    "qr": "#qr-region img#login-qr",
+    "form": "#login-form",
+    "native": "#login-form"
+  },
+  "mode_evidence": {
+    "qr": "#qr-region img#login-qr",
+    "form": "#login-form",
+    "native": "#login-form"
+  },
+  "success": {
+    "authenticated_evidence": ["identity_endpoint", "auth_status"],
+    "identity_extractor": "#authenticated[data-authenticated-identity]",
+    "page_state": "[data-flow-state=authenticated]"
+  },
+  "challenge_conditions": ["[data-challenge-state=required]", "data-sensitive-field=challenge"]
+}
