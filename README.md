@@ -235,6 +235,16 @@ uv run python scripts/verify_browser_account_capacity.py \
 
 脚本只创建临时容量表，输出 keyset 分页和有界 claim 的 `EXPLAIN`、p95、RSS 与进程计数；输出不能冒充真实平台吞吐、浏览器隔离、节点迁移或认证成功。未提供专用 PostgreSQL、节点 Profile 卷加密挂载及运维审查记录时，相关验收必须标记 blocked，不得用数据库布尔字段或节点自报替代。
 
+迁移链回归使用同一专用 PostgreSQL 管理库，并在唯一临时 sibling database 中验证 recovered `refine_browser_account_contract` head：
+
+~~~powershell
+$env:TEST_DATABASE_URL_PG = "postgresql+asyncpg://opencli_test:<password>@127.0.0.1:55432/opencli_test_db"
+$env:REQUIRE_POSTGRES_CONFORMANCE = "1"
+uv run pytest --no-cov --confcutdir=tests/integration tests/integration/test_browser_account_migration.py
+~~~
+
+该回归保留旧 source-only binding、回填 workspace，并证明跨 workspace account 引用被 composite foreign key 拒绝；这不是调度器、节点 fencing、Docker、Redis 或真实平台通过证明。
+
 登录协议回归使用受控真实 HTTP fixture：
 
 ~~~bash

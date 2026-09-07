@@ -619,6 +619,27 @@ uv run python scripts/verify_browser_account_capacity.py \
 
 脚本拒绝 SQLite、缺失连接串、超过 100 的 page/claim limit；只创建临时表并输出脱敏数据库身份、`EXPLAIN` 违规节点、p95、RSS 和进程计数。必须保存原始输出及执行硬件；`Seq Scan`、全量 `Materialize`、page/claim 超限、RSS 或活跃进程随库存增长均为失败。单表结构实验不证明两个中心、节点 fencing、Profile 停机、跨副本权限或真实平台吞吐。
 
+### Browser-account migration proof
+
+Run the migration regression against the dedicated PostgreSQL admin database. The
+fixture creates a unique disposable sibling database through
+`tests.postgres_conformance.temporary_postgres_database`; it never creates test
+tables in `opencli_test_db` itself:
+
+```powershell
+$env:TEST_DATABASE_URL_PG = "postgresql+asyncpg://opencli_test:<password>@127.0.0.1:55432/opencli_test_db"
+$env:REQUIRE_POSTGRES_CONFORMANCE = "1"
+uv run pytest --no-cov --confcutdir=tests/integration `
+  tests/integration/test_browser_account_migration.py
+```
+
+The proof upgrades through `add_browser_accounts` and then `head` (the recovered
+`refine_browser_account_contract` revision), verifies the source-only legacy
+binding remains readable with its workspace backfilled, and rejects a
+cross-workspace account reference through the composite foreign key. A passing
+test is migration/constraint evidence only; it does not claim scheduler,
+node-fencing, browser, Docker, Redis, or real-platform acceptance.
+
 ### 分布式与浏览器前置
 
 - 集群测试必须使用独立 `TEST_DATABASE_URL_PG`、两个中心/调度者和受监督节点；不能用测试 SQLite 代替 PostgreSQL 锁语义。
