@@ -2975,6 +2975,13 @@ async def _match_dispatch_fleet_target(
 ) -> WorkflowFleetCapabilityMatchResponse | None:
     if session is None:
         return None
+    if (
+        _read_string(node.params.get("accountId", node.params.get("account_id")))
+        is not None
+    ):
+        # Account execution resolves its node through A, never through site
+        # bindings or arbitrary fleet capability matches.
+        return None
 
     adapter_node_id = _read_string(node.params.get("opencliAdapterNodeId"))
     if adapter_node_id:
@@ -3001,12 +3008,91 @@ def _fleet_match_trace_details(
     return match.model_dump(mode="json", exclude_none=True)
 
 
+async def _resolve_dispatch_account_session(
+    dispatch: WorkflowOpenCLIHDATraceDispatch,
+) -> tuple[Any, Any] | None:
+    """Resolve an account-bound workflow dispatch through A exactly once."""
+    payload = _read_dict(dispatch.iii.get("payload"))
+    account_id = _read_string(payload.get("account_id"))
+    revision_id = _read_string(payload.get("source_binding_revision_id"))
+    if account_id is None:
+        return None
+    if revision_id is None:
+        raise RuntimeError("account_binding_revision_required")
+    from backend.database import AsyncSessionLocal
+    from backend.models.source_binding import SourceBindingRevision
+    from backend.schemas.browser_account import AccountRef, ExecutionContextV1
+    from backend.services.browser_account_service import resolve_account_session
+
+    async with AsyncSessionLocal() as session:
+        revision = await session.get(SourceBindingRevision, revision_id)
+        if revision is None or revision.account_id != account_id or not revision.workspace_id:
+            raise RuntimeError("account_binding_revision_mismatch")
+        ref = AccountRef(
+            workspace_id=revision.workspace_id,
+            account_id=account_id,
+            source_binding_revision_id=revision_id,
+        )
+        context = ExecutionContextV1(
+            account_ref=ref,
+            execution_id=dispatch.taskId,
+            caller_id=dispatch.nodeId,
+            source_binding_revision_id=revision_id,
+        )
+        envelope = await resolve_account_session(session, ref, context)
+    from backend.schemas.browser_account import SessionEnvelopeV1
+
+    if not isinstance(envelope, SessionEnvelopeV1):
+        raise RuntimeError(
+            f"account session {getattr(envelope, 'status', 'blocked')}: "
+            f"{getattr(envelope, 'error_code', None) or getattr(envelope, 'reason', 'unavailable')}"
+        )
+    return ref, envelope
+
+
 async def _dispatch_opencli_source_to_fleet(
     dispatch: WorkflowOpenCLIHDATraceDispatch,
     match: WorkflowFleetCapabilityMatchResponse | None,
     *,
     node: CompiledWorkflowNode | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, object] | None]:
+    account_resolution = await _resolve_dispatch_account_session(dispatch)
+    if account_resolution is not None:
+        ref, envelope = account_resolution
+        payload = _read_dict(dispatch.iii.get("payload"))
+        from backend.channels.registry import get_channel
+
+        config: dict[str, Any] = {
+            "site": dispatch.site,
+            "command": dispatch.command,
+            "format": _read_string(payload.get("format")) or "json",
+            "args": dispatch.args,
+            "positional_args": payload.get("positional_args", []),
+        }
+        result = await get_channel("opencli").collect(
+            config,
+            {
+                "_account_ref": ref,
+                "_account_session": envelope,
+                "execution_id": dispatch.taskId,
+            },
+        )
+        details: dict[str, object] = {
+            "attempted": True,
+            "protocol": "account",
+            "site": dispatch.site,
+            "command": dispatch.command,
+            "success": result.success,
+            "itemCount": len(result.items) if result.success else 0,
+            "account_id": ref.account_id,
+            "session_id": envelope.session_id,
+        }
+        if result.error:
+            details["error"] = result.error
+        if result.error_type:
+            details["errorType"] = result.error_type
+        return (result.items if result.success else []), details
+
     target = _fleet_agent_dispatch_target(dispatch, match)
     if target is None:
         payload = _read_dict(dispatch.iii.get("payload"))
@@ -3021,9 +3107,6 @@ async def _dispatch_opencli_source_to_fleet(
             adapter_node = resolve_opencli_adapter_node(adapter_node_id)
             local_adapter = adapter_node is not None and not adapter_node.browser
         if dispatch.packageNodeId is not None and dispatch_policy != "inline" and not local_adapter:
-            # Packaged HDA fanout retains its asynchronous worker-envelope
-            # contract unless the package explicitly exposes raw items to a
-            # downstream node in the same run.
             return [], None
         from backend.channels.registry import get_channel
 
@@ -3068,7 +3151,6 @@ async def _dispatch_opencli_source_to_fleet(
     if not isinstance(positional_args, list):
         positional_args = []
     positional_args = [str(item) for item in positional_args]
-
     details: dict[str, object] = {
         "attempted": True,
         "protocol": protocol,
@@ -3095,41 +3177,26 @@ async def _dispatch_opencli_source_to_fleet(
             )
         elif protocol == "ws":
             result = await _collect_via_ws_agent(
-                agent_url,
-                dispatch.site,
-                dispatch.command,
-                dispatch.args,
-                positional_args,
-                output_format,
-                mode,
+                agent_url, dispatch.site, dispatch.command, dispatch.args,
+                positional_args, output_format, mode,
             )
         else:
             result = await _collect_via_agent(
-                agent_url,
-                dispatch.site,
-                dispatch.command,
-                dispatch.args,
-                positional_args,
-                output_format,
-                mode,
+                agent_url, dispatch.site, dispatch.command, dispatch.args,
+                positional_args, output_format, mode,
             )
     except Exception as exc:
-        details.update(
-            {
-                "success": False,
-                "itemCount": 0,
-                "error": str(exc),
-                "errorType": type(exc).__name__,
-            }
-        )
+        details.update({
+            "success": False,
+            "itemCount": 0,
+            "error": str(exc),
+            "errorType": type(exc).__name__,
+        })
         return [], details
-
-    details.update(
-        {
-            "success": result.success,
-            "itemCount": len(result.items) if result.success else 0,
-        }
-    )
+    details.update({
+        "success": result.success,
+        "itemCount": len(result.items) if result.success else 0,
+    })
     if result.error:
         details["error"] = result.error
     if result.error_type:
@@ -3137,6 +3204,7 @@ async def _dispatch_opencli_source_to_fleet(
     if result.metadata:
         details["metadata"] = result.metadata
     return (result.items if result.success else []), details
+
 
 
 def _fleet_agent_dispatch_target(
@@ -4204,6 +4272,22 @@ def _bound_source_id_from_items(items: list[dict[str, Any]]) -> str | None:
     return None
 
 
+def _collector_account_fields(node: CompiledWorkflowNode) -> dict[str, Any]:
+    """Copy only explicit account identity into each collector source."""
+    binding_input = _read_dict(_read_dict(node.runtime.get("binding")).get("input"))
+    values: dict[str, Any] = {}
+    for key in (
+        "account_ref", "accountRef", "account_id", "accountId",
+        "workspace_id", "workspaceId", "source_binding_revision_id",
+        "sourceBindingRevisionId", "execution_id", "executionId",
+        "caller_id", "callerId",
+    ):
+        value = binding_input.get(key, node.params.get(key))
+        if value is not None:
+            values[key] = value
+    return values
+
+
 async def _execute_collector_source_node(
     node: CompiledWorkflowNode,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -4212,6 +4296,9 @@ async def _execute_collector_source_node(
     binding = _read_dict(node.runtime.get("binding"))
     binding_input = _read_dict(binding.get("input"))
     sources = _read_dict_list(binding_input.get("sources"))
+    account_fields = _collector_account_fields(node)
+    if account_fields:
+        sources = [{**source, **account_fields} for source in sources]
     binding_id = _read_string(binding.get("binding_id"))
     collector_type = _collector_binding_type(binding_input)
     if collector_type is None and binding_id and binding_id.startswith(COLLECTOR_BINDING_PREFIX):
@@ -4381,6 +4468,57 @@ async def _collect_source_once(
 
     config = _collector_channel_config(source, source_type)
     parameters = _read_dict(source.get("arguments")) or _read_dict(source.get("args"))
+    account_ref_value = source.get("account_ref") or source.get("accountRef")
+    if account_ref_value is None and (
+        source.get("account_id") is not None or source.get("accountId") is not None
+    ):
+        account_ref_value = {
+            "workspace_id": source.get("workspace_id") or source.get("workspaceId"),
+            "account_id": source.get("account_id") or source.get("accountId"),
+            "source_binding_revision_id": (
+                source.get("source_binding_revision_id")
+                or source.get("sourceBindingRevisionId")
+            ),
+        }
+    if account_ref_value is not None:
+        from backend.database import AsyncSessionLocal
+        from backend.schemas.browser_account import (
+            AccountRef,
+            ExecutionContextV1,
+            SessionEnvelopeV1,
+        )
+        from backend.services.browser_account_service import resolve_account_session
+
+        ref = (
+            account_ref_value
+            if isinstance(account_ref_value, AccountRef)
+            else AccountRef.from_wire(account_ref_value)
+        )
+        execution_id = source.get("execution_id") or source.get("executionId")
+        caller_id = source.get("caller_id") or source.get("callerId")
+        if not execution_id or not caller_id:
+            raise ValueError("account collector source requires execution_id and caller_id")
+        context = ExecutionContextV1(
+            account_ref=ref,
+            execution_id=str(execution_id),
+            caller_id=str(caller_id),
+            source_binding_revision_id=ref.source_binding_revision_id,
+        )
+        async with AsyncSessionLocal() as session:
+            resolution = await resolve_account_session(session, ref, context)
+        if not isinstance(resolution, SessionEnvelopeV1):
+            raise RuntimeError(
+                f"account session {getattr(resolution, 'status', 'blocked')}: "
+                f"{getattr(resolution, 'error_code', None) or getattr(resolution, 'reason', 'unavailable')}"
+            )
+        parameters["_account_ref"] = ref
+        parameters["_account_session"] = resolution
+    for key in (
+        "account_ref", "accountRef", "account_id", "accountId",
+        "workspace_id", "workspaceId", "source_binding_revision_id",
+        "sourceBindingRevisionId", "caller_id", "callerId",
+    ):
+        parameters.pop(key, None)
     credential_ref = _read_string(source.get("credentialRef"))
     credential_scheme = _read_string(source.get("credentialScheme"))
     auth = (
@@ -6727,7 +6865,16 @@ def _to_dispatch(
 
     internal_node_id = _internal_node_id(node.id, package_node_id) if package_node_id else None
     source_group = _source_group(node, internal_node_id or node.id)
-    args = _read_dict(node.params.get("args"))
+    raw_args = _read_dict(node.params.get("args"))
+    args = {
+        key: value
+        for key, value in raw_args.items()
+        if key not in {
+            "account_id", "accountId", "workspace_id", "workspaceId",
+            "source_binding_revision_id", "sourceBindingRevisionId",
+            "caller_id", "callerId", "execution_id", "executionId",
+        }
+    }
     task_id = _task_id(project.id, run_id, node.id, source_group)
     payload: dict[str, object] = {
         "workflow_id": project.id,
@@ -6753,17 +6900,35 @@ def _to_dispatch(
     if mode:
         payload["mode"] = mode
     source_binding_id = _read_string(
-        node.params.get("sourceBindingId", node.params.get("source_binding_id"))
+        node.params.get(
+            "sourceBindingId",
+            node.params.get(
+                "source_binding_id",
+                binding_input.get("sourceBindingId")
+                if isinstance(binding_input, dict)
+                else None,
+            ),
+        )
     )
     source_binding_revision_id = _read_string(
         node.params.get(
             "sourceBindingRevisionId",
-            node.params.get("source_binding_revision_id"),
+            node.params.get(
+                "source_binding_revision_id",
+                binding_input.get("sourceBindingRevisionId")
+                if isinstance(binding_input, dict)
+                else None,
+            ),
         )
     )
     source_binding_revision_number = node.params.get(
         "sourceBindingRevisionNumber",
-        node.params.get("source_binding_revision_number"),
+        node.params.get(
+            "source_binding_revision_number",
+            binding_input.get("sourceBindingRevisionNumber")
+            if isinstance(binding_input, dict)
+            else None,
+        ),
     )
     if source_binding_id:
         payload["source_binding_id"] = source_binding_id
@@ -6775,6 +6940,36 @@ def _to_dispatch(
         and source_binding_revision_number >= 1
     ):
         payload["source_binding_revision_number"] = source_binding_revision_number
+    account_id = _read_string(
+        node.params.get(
+            "accountId",
+            node.params.get(
+                "account_id",
+                binding_input.get("accountId")
+                if isinstance(binding_input, dict)
+                else None,
+            ),
+        )
+    )
+    workspace_id = _read_string(
+        node.params.get(
+            "workspaceId",
+            node.params.get(
+                "workspace_id",
+                binding_input.get("workspaceId")
+                if isinstance(binding_input, dict)
+                else None,
+            ),
+        )
+    )
+    if account_id is not None:
+        payload["account_id"] = account_id
+        if source_binding_revision_id:
+            payload["account_ref"] = {
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+                "source_binding_revision_id": source_binding_revision_id,
+            }
     dispatch_policy = _read_string(
         node.params.get("dispatchPolicy", node.params.get("dispatch_policy"))
     )

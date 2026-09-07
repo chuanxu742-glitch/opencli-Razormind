@@ -101,6 +101,12 @@ async def list_bindings(db: AsyncSession = Depends(get_db)) -> ApiResponse:
     return ApiResponse.ok([BrowserBindingRead.model_validate(b) for b in bindings])
 
 
+@router.get("/bindings/migration", response_model=ApiResponse[list[dict]])
+async def inspect_binding_migration(db: AsyncSession = Depends(get_db)) -> ApiResponse:
+    """Expose preserved legacy mappings and explicit ownership blocks."""
+    return ApiResponse.ok(await browser_service.inspect_legacy_binding_migration(db))
+
+
 @router.post("/bindings", response_model=ApiResponse[BrowserBindingRead])
 async def create_binding(
     body: BrowserBindingCreate, db: AsyncSession = Depends(get_db)

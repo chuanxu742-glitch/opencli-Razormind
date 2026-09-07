@@ -359,6 +359,24 @@ def _resolve_opencli_node(
         "write" if node.kind == "action" else "read"
     )
     mutation_mode = "write" if access == "write" else "read"
+    account_id = _read_string(
+        node.params.get("accountId", node.params.get("account_id"))
+    )
+    source_binding_revision_id = _read_string(
+        node.params.get(
+            "sourceBindingRevisionId",
+            node.params.get("source_binding_revision_id"),
+        )
+    )
+    binding_input = {
+        "site": site,
+        "command": command,
+        **({"access": "write"} if mutation_mode == "write" else {}),
+    }
+    if account_id is not None:
+        binding_input["accountId"] = account_id
+    if source_binding_revision_id is not None:
+        binding_input["sourceBindingRevisionId"] = source_binding_revision_id
     return {
         "binding": WorkflowRuntimeBinding(
             binding_id=OPENCLI_BINDING_ID,
@@ -366,11 +384,7 @@ def _resolve_opencli_node(
             worker=OPENCLI_WORKER,
             function_id=OPENCLI_FUNCTION_ID,
             channel="opencli",
-            input={
-                "site": site,
-                "command": command,
-                **({"access": "write"} if mutation_mode == "write" else {}),
-            },
+            input=binding_input,
         ).model_dump(),
         "resource_requirement": WorkflowRuntimeResourceRequirement(
             nodeId=node_id,
@@ -383,6 +397,8 @@ def _resolve_opencli_node(
             mutationMode=mutation_mode,
             requestedCapability=f"opencli.{site}.{command}",
             adapterNodeId=_read_string(node.params.get("opencliAdapterNodeId")),
+            accountId=account_id,
+            sourceBindingRevisionId=source_binding_revision_id,
         ).model_dump(mode="json", exclude_none=True),
     }
 
