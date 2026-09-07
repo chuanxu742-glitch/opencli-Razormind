@@ -417,6 +417,7 @@ async def dispatch_collect(
     mode: str,
     timeout: float | None = None,
     request_id: str | None = None,
+    account_session: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Send a collect task to a WS agent and await the result dict.
 
@@ -431,6 +432,15 @@ async def dispatch_collect(
     ws = _connections.get(agent_url)
     if ws is None:
         raise RuntimeError(f"No active WS connection for agent: {agent_url}")
+    if account_session is not None:
+        session = SessionEnvelopeV1.model_validate(account_session)
+        identity = _connection_identities.get(agent_url)
+        if identity is None or (
+            identity.node_id != session.node_id or identity.boot_id != session.node_boot_id
+        ):
+            raise RuntimeError("account collection session is not owned by this node")
+        account_session = session.to_wire()
+
 
     request_id = request_id or str(uuid.uuid4())
     loop = asyncio.get_running_loop()
@@ -447,6 +457,7 @@ async def dispatch_collect(
             "positional_args": positional_args,
             "format": output_format,
             "mode": mode,
+            **({"account_session": account_session} if account_session is not None else {}),
         })
         logger.debug("WS dispatch | agent=%s request_id=%s site=%s cmd=%s",
                      agent_url, request_id, site, command)
