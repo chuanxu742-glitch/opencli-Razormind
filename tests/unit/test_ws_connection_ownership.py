@@ -2,12 +2,14 @@
 
 import asyncio
 import json
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from starlette.websockets import WebSocketDisconnect
 
 from backend import ws_agent_manager as manager
+from backend.schemas.browser_account import PortalOwnerRouteV1
 
 
 @pytest.fixture(autouse=True)
@@ -31,6 +33,94 @@ def isolated_connections():
     yield
     for registry in registries:
         registry.clear()
+
+
+def portal_route():
+    target = {
+        "tab_id": "tab",
+        "frame_id": "frame",
+        "document_id": "doc",
+        "origin": "https://fixture.test",
+    }
+    return PortalOwnerRouteV1.model_validate(
+        {
+            "binding": {
+                "account_ref": {"workspace_id": "workspace", "account_id": "account"},
+                "session_id": "portal",
+                "epoch": 1,
+                "target": target,
+                "view_generation": 1,
+                "record_session_id": "record",
+            },
+            "node_identity": {"node_id": "node", "boot_id": "boot"},
+            "owner_endpoint": "https://node.test",
+            "tunnel_handle": "tunnel",
+            "tunnel_auth_digest": "a" * 64,
+            "region_focus": {
+                "target": target,
+                "view_generation": 1,
+                "region_kind": "form",
+                "approved_regions": [{"x": 0, "y": 0, "width": 8, "height": 8}],
+                "focused_field_ref": "password",
+            },
+            "session_revision": 1,
+            "route_expires_at": datetime.now(UTC) + timedelta(minutes=1),
+            "max_frame_bytes": 4096,
+            "max_input_bytes": 4096,
+        }
+    )
+
+
+@pytest.mark.parametrize("operation", ["open", "close"])
+async def test_delayed_portal_cleanup_preserves_replacement(operation):
+    route = portal_route()
+    old, replacement = AsyncMock(), AsyncMock()
+    old.scope = replacement.scope = {"scheme": "wss"}
+    blocked, resume = asyncio.Event(), asyncio.Event()
+
+    def register(socket):
+        manager.register_connection(
+            "agent",
+            socket,
+            route.node_identity,
+            tunnel_handle=route.tunnel_handle,
+            tunnel_auth_digest=route.tunnel_auth_digest,
+        )
+
+    async def old_send(payload):
+        if payload["type"] == f"portal_{operation}":
+            blocked.set()
+            await resume.wait()
+        elif payload["type"] == "portal_open":
+            await manager.resolve_portal_ready(
+                "agent", {"type": "portal_ready", "portal_id": "portal"}, old
+            )
+
+    async def replacement_send(payload):
+        await manager.resolve_portal_ready(
+            "agent", {"type": "portal_ready", "portal_id": "portal"}, replacement
+        )
+
+    old.send_json.side_effect = old_send
+    replacement.send_json.side_effect = replacement_send
+    register(old)
+    if operation == "open":
+        pending = asyncio.create_task(manager.open_portal_route("agent", route))
+    else:
+        transport = await manager.open_portal_route("agent", route)
+        pending = asyncio.create_task(transport.close())
+    await asyncio.wait_for(blocked.wait(), 1)
+    register(replacement)
+    new_transport = await manager.open_portal_route("agent", route)
+    resume.set()
+    if operation == "open":
+        with pytest.raises(RuntimeError, match="disconnected"):
+            await asyncio.wait_for(pending, 1)
+    else:
+        await asyncio.wait_for(pending, 1)
+    assert manager._portal_transports["portal"] is new_transport
+    assert manager._portal_ready["portal"].result() is None
+    assert not new_transport._closed
 
 
 async def test_foreign_collection_result_cannot_complete_owned_work():

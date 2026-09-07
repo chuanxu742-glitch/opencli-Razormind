@@ -190,8 +190,9 @@ class PortalTransport:
             )
         except Exception:
             logger.debug("portal close send failed for %s", self.portal_id, exc_info=True)
-        _portal_transports.pop(self.portal_id, None)
-        _portal_ready.pop(self.portal_id, None)
+        if _portal_transports.get(self.portal_id) is self:
+            _portal_transports.pop(self.portal_id, None)
+            _portal_ready.pop(self.portal_id, None)
         self._finish()
 
 
@@ -373,8 +374,10 @@ async def open_portal_route(
         await asyncio.wait_for(ready, timeout=timeout)
         return transport
     except BaseException:
-        _portal_transports.pop(portal_id, None)
-        _portal_ready.pop(portal_id, None)
+        if _portal_transports.get(portal_id) is transport:
+            _portal_transports.pop(portal_id, None)
+        if _portal_ready.get(portal_id) is ready:
+            _portal_ready.pop(portal_id, None)
         transport._finish()
         raise
 
