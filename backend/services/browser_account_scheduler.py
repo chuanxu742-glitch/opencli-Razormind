@@ -525,6 +525,8 @@ class BrowserAccountScheduler:
                 command.claimed_at = now
                 claims.append(
                     NodeClaimV1(
+                        workspace_id=command.workspace_id,
+                        account_id=command.account_id,
                         command_id=command.id,
                         session_id=command.session_id,
                         node_id=identity.node_id,
@@ -563,6 +565,8 @@ class BrowserAccountScheduler:
             capacity.occupied_slots += 1
             claims.append(
                 NodeClaimV1(
+                    workspace_id=command.workspace_id,
+                    account_id=command.account_id,
                     command_id=command.id,
                     session_id=command.session_id,
                     node_id=identity.node_id,
@@ -657,6 +661,8 @@ class BrowserAccountScheduler:
         lease.expires_at = now + self.lease_ttl
         await db.flush()
         return NodeClaimV1(
+            workspace_id=command.workspace_id,
+            account_id=command.account_id,
             command_id=claim.command_id,
             session_id=claim.session_id,
             node_id=claim.node_id,
