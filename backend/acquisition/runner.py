@@ -45,8 +45,14 @@ async def _managed_browser_pool(
         await browser_pool.ensure_ready()
 
     async with session_factory() as db:
-        result = await db.execute(select(BrowserInstance))
-        instances = list(result.scalars().all())
+        instances_result = await db.execute(select(BrowserInstance))
+        instances = list(instances_result.scalars().all())
+        from backend.models.edge_node import EdgeNode
+
+        account_nodes_result = await db.execute(
+            select(EdgeNode.url).where(EdgeNode.account_capable.is_(True))
+        )
+        account_agent_urls = {url.rstrip("/") for url in account_nodes_result.scalars().all()}
         deployment_rows = await db.execute(select(BrowserRuntimeDeployment))
         deployments = {
             deployment.browser_instance_id: deployment
@@ -54,6 +60,11 @@ async def _managed_browser_pool(
         }
 
     for instance in instances:
+        if (
+            instance.endpoint.rstrip("/") in account_agent_urls
+            or (instance.agent_url or "").rstrip("/") in account_agent_urls
+        ):
+            continue
         if isinstance(pool, RedisBrowserPool):
             await pool.register_endpoint(instance.endpoint)
         elif instance.endpoint not in pool.endpoints:
