@@ -540,16 +540,31 @@ async def create_login_session(
     *,
     purpose: Literal["login", "execution"] = "login",
     execution_id: str | None = None,
-    expires_in_seconds: int = 1_800,
-    takeover: bool = False,
+    expected_revision: int,
+    source_binding_revision_id: str | None = None,
 ) -> BrowserLoginSession:
-    if not 60 <= expires_in_seconds <= 1_800:
-        raise BrowserAccountError("invalid_expiry", "session expiry must be between 60 and 1800 seconds", 422)
     if purpose == "execution" and not execution_id:
         raise BrowserAccountError("invalid_request", "execution sessions require execution_id", 422)
     account = await _account_or_error(db, workspace_id, account_id, for_update=True)
+    if expected_revision != account.revision:
+        raise BrowserAccountError(BrowserAccountErrorCode.STALE_GENERATION, "account revision is stale")
+    if source_binding_revision_id is not None:
+        binding = await db.scalar(
+            select(SourceBindingRevision).where(
+                SourceBindingRevision.id == source_binding_revision_id,
+                SourceBindingRevision.workspace_id == workspace_id,
+                SourceBindingRevision.account_id == account_id,
+            )
+        )
+        if binding is None:
+            raise BrowserAccountError(
+                BrowserAccountErrorCode.ACCOUNT_MIGRATION_REQUIRED,
+                "source binding revision does not belong to browser account",
+            )
     if account.status in _TERMINAL_SESSION_STATUSES:
-        raise BrowserAccountError(BrowserAccountErrorCode.ACCOUNT_MIGRATION_REQUIRED, "account is not available")
+        raise BrowserAccountError(
+            BrowserAccountErrorCode.ACCOUNT_MIGRATION_REQUIRED, "account is not available"
+        )
     if account.paused:
         raise BrowserAccountError(BrowserAccountErrorCode.PERMISSION_DENIED, "account is suspended")
     active = await db.scalar(
@@ -561,11 +576,8 @@ async def create_login_session(
         )
         .order_by(BrowserLoginSession.updated_at.desc(), BrowserLoginSession.id.desc())
     )
-    if active is not None and not takeover:
-        return active
     if active is not None:
-        active.status = BrowserAccountStatus.CLOSED.value
-        active.closed_at = _now()
+        return active
     node = await db.get(EdgeNode, account.node_id) if account.node_id else None
     session = BrowserLoginSession(
         id=str(uuid.uuid4()),
@@ -584,7 +596,7 @@ async def create_login_session(
         purpose=purpose,
         execution_id=execution_id,
         status=BrowserAccountStatus.OPENING.value,
-        expires_at=_now() + timedelta(seconds=expires_in_seconds),
+        expires_at=_now() + timedelta(seconds=1_800),
     )
     db.add(session)
     account.status = BrowserAccountStatus.OPENING.value
@@ -642,16 +654,6 @@ async def get_login_session(db: AsyncSession, workspace_id: str, account_id: str
     return await _session_or_error(db, workspace_id, account_id, session_id)
 
 
-async def takeover_login_session(db: AsyncSession, workspace_id: str, account_id: str, session_id: str) -> BrowserLoginSession:
-    account = await _account_or_error(db, workspace_id, account_id, for_update=True)
-    session = await _session_or_error(db, workspace_id, account_id, session_id, for_update=True)
-    if session.status in _TERMINAL_SESSION_STATUSES:
-        raise BrowserAccountError(BrowserAccountErrorCode.SESSION_EXPIRED, "login session is closed")
-    session.status = BrowserAccountStatus.PRESENTING.value
-    account.status = BrowserAccountStatus.PRESENTING.value
-    _set_revision(account)
-    await db.flush()
-    return session
 
 
 async def refresh_login_session(
@@ -703,11 +705,12 @@ async def takeover_login_session(
 ) -> BrowserLoginSession:
     account = await _account_or_error(db, workspace_id, account_id, for_update=True)
     session = await _session_or_error(db, workspace_id, account_id, session_id, for_update=True)
-    if expected_revision is not None and expected_revision != account.revision:
-        raise BrowserAccountError(BrowserAccountErrorCode.STALE_GENERATION, "account revision is stale")
+    if expected_revision is not None and expected_revision != session.revision:
+        raise BrowserAccountError(BrowserAccountErrorCode.STALE_GENERATION, "session revision is stale")
     if session.status in _TERMINAL_SESSION_STATUSES:
         raise BrowserAccountError(BrowserAccountErrorCode.SESSION_EXPIRED, "login session is closed")
     session.status = BrowserAccountStatus.PRESENTING.value
+    session.revision += 1
     account.status = BrowserAccountStatus.PRESENTING.value
     _set_revision(account)
     await db.flush()
@@ -727,8 +730,8 @@ async def confirm_login_session(
 ) -> BrowserLoginSession:
     account = await _account_or_error(db, workspace_id, account_id, for_update=True)
     session = await _session_or_error(db, workspace_id, account_id, session_id, for_update=True)
-    if expected_revision is not None and expected_revision != account.revision:
-        raise BrowserAccountError(BrowserAccountErrorCode.STALE_GENERATION, "account revision is stale")
+    if expected_revision is not None and expected_revision != session.revision:
+        raise BrowserAccountError(BrowserAccountErrorCode.STALE_GENERATION, "session revision is stale")
     if expected_view_generation is not None and expected_view_generation != session.view_generation:
         raise BrowserAccountError(BrowserAccountErrorCode.STALE_GENERATION, "session view generation is stale")
     if session.status not in {
@@ -739,9 +742,6 @@ async def confirm_login_session(
             "invalid_transition",
             "manual confirmation is only valid for an active login challenge",
         )
-    # Manual confirmation is an explicit exception, never trusted platform
-    # identity evidence and never an automatic save trigger.
-    account.auth_required = False
     account.auth_evidence = BrowserAuthEvidence.UNKNOWN.value
     account.evidence_source = BrowserEvidenceSource.MANUAL_FALLBACK.value
     account.evidence_observed_at = _now()
@@ -754,6 +754,7 @@ async def confirm_login_session(
         )
     account.status = BrowserAccountStatus.UNKNOWN.value
     session.status = BrowserAccountStatus.UNKNOWN.value
+    session.revision += 1
     _set_revision(account)
     await db.flush()
     return session
@@ -770,8 +771,8 @@ async def close_login_session(
 ) -> BrowserLoginSession:
     account = await _account_or_error(db, workspace_id, account_id, for_update=True)
     session = await _session_or_error(db, workspace_id, account_id, session_id, for_update=True)
-    if expected_revision is not None and expected_revision != account.revision:
-        raise BrowserAccountError(BrowserAccountErrorCode.STALE_GENERATION, "account revision is stale")
+    if expected_revision is not None and expected_revision != session.revision:
+        raise BrowserAccountError(BrowserAccountErrorCode.STALE_GENERATION, "session revision is stale")
     if session.status in _TERMINAL_SESSION_STATUSES:
         return session
     session.status = (
@@ -790,6 +791,7 @@ async def close_login_session(
         payload=CloseSessionCommandPayloadV1(reason=reason),
     )
     session.command_id = command.id
+    session.revision += 1
     active_other = await db.scalar(
         select(BrowserLoginSession.id).where(
             BrowserLoginSession.workspace_id == workspace_id,
