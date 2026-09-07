@@ -1,0 +1,84 @@
+# One managed browser-account runtime per container and network namespace.
+#
+# Before starting, create ACCOUNT_CLUSTER_CONTROL_NETWORK on the same Docker
+# engine as the control plane. This file deliberately publishes no ports.
+name: opencli-account-cluster
+
+x-account-agent: &account-agent
+  image: ${DOCKER_REGISTRY:-ghcr.io/}${DOCKER_IMAGE_NAMESPACE:-2233admin}/opencli-admin-agent:${IMAGE_TAG:-0.4.1}${CHROME_SUFFIX:-}
+  init: true
+  restart: unless-stopped
+  networks: [account-control]
+  healthcheck:
+    # Process/API readiness only. A passing probe does not prove that the
+    # account credential is accepted, that a site session is authenticated, or
+    # that the account is authorized for an operation.
+    test: ["CMD", "curl", "-fsS", "http://localhost:19823/health"]
+    interval: 15s
+    timeout: 5s
+    retries: 4
+    start_period: 45s
+
+services:
+  account-node-1:
+    <<: *account-agent
+    hostname: account-node-1
+    environment:
+      CENTRAL_API_URL: ${CENTRAL_API_URL:?Set CENTRAL_API_URL to the reachable control-plane API URL}
+      AGENT_ADVERTISE_URL: http://account-node-1:19823
+      AGENT_PORT: "19823"
+      AGENT_MODE: bridge
+      AGENT_LABEL: ${ACCOUNT_NODE_1_LABEL:-Managed browser account node 1}
+      AGENT_REGISTER: ws
+      API_AUTH_TOKEN: ${API_AUTH_TOKEN:?Set API_AUTH_TOKEN outside version control}
+      AGENT_NODE_ID: ${ACCOUNT_NODE_1_ID:?Set stable node 1 ID}
+      AGENT_NODE_CREDENTIAL_ID: ${ACCOUNT_NODE_1_CREDENTIAL_ID:?Set node 1 credential ID}
+      AGENT_NODE_CREDENTIAL: ${ACCOUNT_NODE_1_CREDENTIAL:?Set node 1 credential outside version control}
+      BROWSER_RUNTIME_BUNDLE_ID: ${ACCOUNT_NODE_1_BROWSER_RUNTIME_BUNDLE_ID:?Set the control-plane registered runtime bundle ID for node 1}
+      BROWSER_RUNTIME_BUNDLE_ROOT: /opt/browser-runtime-bundles
+      BROWSER_RUNTIME_BUNDLE_MANIFEST: /opt/browser-runtime-bundles/opencli-default/2/manifest.json
+      PROFILE_DIR: /home/agent/.config/chromium
+      RUNTIME_HOME: /home/agent
+      RUNTIME_CACHE_DIR: /home/agent/.cache
+      RUNTIME_STATE_DIR: /var/lib/opencli/account-runtime
+      CHROMIUM_POLICY_FILE: /etc/chromium/policies/managed/opencli-account-runtime.json
+    volumes:
+      - account_node_1_profile:/home/agent/.config/chromium
+      - account_node_1_runtime_state:/var/lib/opencli/account-runtime
+
+  account-node-2:
+    <<: *account-agent
+    hostname: account-node-2
+    environment:
+      CENTRAL_API_URL: ${CENTRAL_API_URL:?Set CENTRAL_API_URL to the reachable control-plane API URL}
+      AGENT_ADVERTISE_URL: http://account-node-2:19823
+      AGENT_PORT: "19823"
+      AGENT_MODE: bridge
+      AGENT_LABEL: ${ACCOUNT_NODE_2_LABEL:-Managed browser account node 2}
+      AGENT_REGISTER: ws
+      API_AUTH_TOKEN: ${API_AUTH_TOKEN:?Set API_AUTH_TOKEN outside version control}
+      AGENT_NODE_ID: ${ACCOUNT_NODE_2_ID:?Set stable node 2 ID}
+      AGENT_NODE_CREDENTIAL_ID: ${ACCOUNT_NODE_2_CREDENTIAL_ID:?Set node 2 credential ID}
+      AGENT_NODE_CREDENTIAL: ${ACCOUNT_NODE_2_CREDENTIAL:?Set node 2 credential outside version control}
+      BROWSER_RUNTIME_BUNDLE_ID: ${ACCOUNT_NODE_2_BROWSER_RUNTIME_BUNDLE_ID:?Set the control-plane registered runtime bundle ID for node 2}
+      BROWSER_RUNTIME_BUNDLE_ROOT: /opt/browser-runtime-bundles
+      BROWSER_RUNTIME_BUNDLE_MANIFEST: /opt/browser-runtime-bundles/opencli-default/2/manifest.json
+      PROFILE_DIR: /home/agent/.config/chromium
+      RUNTIME_HOME: /home/agent
+      RUNTIME_CACHE_DIR: /home/agent/.cache
+      RUNTIME_STATE_DIR: /var/lib/opencli/account-runtime
+      CHROMIUM_POLICY_FILE: /etc/chromium/policies/managed/opencli-account-runtime.json
+    volumes:
+      - account_node_2_profile:/home/agent/.config/chromium
+      - account_node_2_runtime_state:/var/lib/opencli/account-runtime
+
+networks:
+  account-control:
+    external: true
+    name: ${ACCOUNT_CLUSTER_CONTROL_NETWORK:?Create and set the existing control-plane Docker network name}
+
+volumes:
+  account_node_1_profile:
+  account_node_1_runtime_state:
+  account_node_2_profile:
+  account_node_2_runtime_state:
