@@ -12,6 +12,7 @@ from fastapi import (
     Header,
     HTTPException,
     Query,
+    Request,
     Response,
     UploadFile,
 )
@@ -27,6 +28,7 @@ from backend.models.image_studio import ImageGenerationJob, ImageGenerationJobSt
 from backend.models.workflow_run import WorkflowRun as WorkflowRunRow
 from backend.schemas import workflow as workflow_schemas
 from backend.schemas.common import ApiResponse
+from backend.security.identity import RequestIdentity, get_request_identity
 from backend.services import image_studio_service
 from backend.services.gaojixing_collection_service import (
     GaojixingCollectionConflictError,
@@ -61,12 +63,14 @@ from backend.workflow.managed_gaojixing_question_batches import (
 )
 from backend.workflow.opencli_adapter_nodes import list_opencli_adapter_nodes
 from backend.workflow.opencli_hda_tracer import (
+    authorize_workflow_project_actor,
     build_opencli_hda_trace,
     continue_workflow_run_with_source_outputs,
     get_workflow_run_checkpoint,
     get_workflow_run_projection,
     list_workflow_run_events,
     start_workflow_run,
+    workflow_project_has_account_reference,
 )
 from backend.workflow.opentabs_tool_nodes import list_opentabs_tool_nodes
 from backend.workflow.patcher import preview_workflow_patch
@@ -79,6 +83,76 @@ from backend.workflow.runtime_registry import WEBHOOK_TRIGGER_BINDING_ID
 from backend.workflow.tool_capabilities import list_workflow_tool_capabilities
 
 router = APIRouter(prefix="/workflows", tags=["workflows"])
+
+
+async def _account_workflow_identity(
+    project: workflow_schemas.WorkflowProject,
+    request: Request,
+    db: AsyncSession,
+    *,
+    expected_workspace_id: str | None = None,
+) -> RequestIdentity | None:
+    if not workflow_project_has_account_reference(project):
+        return None
+    identity = await get_request_identity(request)
+    await authorize_workflow_project_actor(
+        db,
+        project,
+        request_identity=identity,
+        expected_workspace_id=expected_workspace_id,
+    )
+    return identity
+
+
+async def _account_workflow_runs_identity(
+    db: AsyncSession,
+    runs: list[WorkflowRunRow],
+    request: Request,
+) -> RequestIdentity | None:
+    identity: RequestIdentity | None = None
+    for run in runs:
+        try:
+            stored_request = workflow_schemas.WorkflowRunStartRequest.model_validate(run.request)
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=403,
+                detail="Workflow run authorization context is unavailable",
+            ) from exc
+        has_account_reference = workflow_project_has_account_reference(stored_request.project)
+        if run.requested_by_user_id is None:
+            if has_account_reference:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Workflow run actor is unavailable",
+                )
+            continue
+        if not has_account_reference:
+            raise HTTPException(
+                status_code=403,
+                detail="Workflow run authorization context is unavailable",
+            )
+        if identity is None:
+            identity = await get_request_identity(request)
+        actor_user_id = await authorize_workflow_project_actor(
+            db,
+            stored_request.project,
+            request_identity=identity,
+            requested_by_user_id=run.requested_by_user_id,
+        )
+        if actor_user_id != run.requested_by_user_id:
+            raise HTTPException(status_code=403, detail="Workflow actor does not match requester")
+    return identity
+
+
+async def _account_workflow_run_identity(
+    db: AsyncSession,
+    run_id: str,
+    request: Request,
+) -> RequestIdentity | None:
+    run = await db.get(WorkflowRunRow, run_id)
+    if run is None:
+        return None
+    return await _account_workflow_runs_identity(db, [run], request)
 
 
 async def _reject_workspace_scoped_run(db: AsyncSession, run_id: str) -> None:
@@ -308,15 +382,18 @@ async def import_external_runtime_workflow(
 )
 async def start_run(
     body: workflow_schemas.WorkflowRunStartRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     graphon_client: DifyGraphonClient = Depends(get_dify_graphon_client),
 ) -> ApiResponse[workflow_schemas.WorkflowRunProjection]:
     """Start a WorkflowProject run and emit replayable node-level events."""
 
+    identity = await _account_workflow_identity(body.project, request, db)
     projection = await start_workflow_run(
         body,
         session=db,
         graphon_client=graphon_client,
+        request_identity=identity,
     )
     await dispatch_materialized_image_jobs(db, projection.runId)
     return ApiResponse.ok(projection)
@@ -328,6 +405,7 @@ async def start_run(
     status_code=202,
 )
 async def start_run_from_question_bank(
+    request_context: Request,
     question_bank: UploadFile = File(..., alias="questionBank"),
     request: str = Form(...),
     db: AsyncSession = Depends(get_db),
@@ -337,6 +415,11 @@ async def start_run_from_question_bank(
 
     try:
         run_request = workflow_schemas.WorkflowRunStartRequest.model_validate_json(request)
+        identity = await _account_workflow_identity(
+            run_request.project,
+            request_context,
+            db,
+        )
         if run_request.runId is not None:
             raise HTTPException(
                 status_code=400,
@@ -380,6 +463,7 @@ async def start_run_from_question_bank(
             ),
             session=db,
             graphon_client=graphon_client,
+            request_identity=identity,
         )
     except Exception:
         if staged.created:
@@ -401,6 +485,7 @@ async def start_run_from_webhook(
     workflow_id: str,
     trigger_node_id: str,
     body: workflow_schemas.WorkflowWebhookIngressRequest,
+    request: Request,
     idempotency_header: str | None = Header(default=None, alias="Idempotency-Key"),
     request_id_header: str | None = Header(default=None, alias="X-Request-ID"),
     source_id_header: str | None = Header(default=None, alias="X-Source-ID"),
@@ -408,6 +493,7 @@ async def start_run_from_webhook(
 ) -> ApiResponse[workflow_schemas.WorkflowWebhookIngressResponse]:
     """Normalize an inbound webhook into the canonical workflow run input."""
 
+    identity = await _account_workflow_identity(body.workflowProject, request, db)
     if workflow_id != body.workflowProject.id:
         raise _webhook_validation_error(
             "workflow_id_mismatch",
@@ -475,41 +561,65 @@ async def start_run_from_webhook(
             )
         )
 
-    if run_id is not None and idempotency_key:
-        existing = await get_workflow_run_projection(run_id, session=db)
-        if existing is not None:
-            return ApiResponse.ok(
-                _webhook_ingress_response(
-                    existing,
-                    trigger_node_id=trigger_node_id,
-                    request_id=request_id,
-                    source_id=body.input.sourceId or source_id_header or "external",
-                    idempotency_key=idempotency_key,
-                )
-            )
-
     runtime_input = body.input.model_copy(
         update={
             "source": "external",
             "sourceId": body.input.sourceId or source_id_header or "external",
         }
     )
-    projection = await start_workflow_run(
-        workflow_schemas.WorkflowRunStartRequest(
-            project=body.workflowProject,
-            runId=run_id,
-            traceId=body.traceId,
-            trigger=workflow_schemas.WorkflowRunTrigger(
-                kind="webhook",
-                triggerNodeId=trigger_node_id,
-                requestId=request_id,
-                idempotencyKey=idempotency_key,
-            ),
-            input=runtime_input,
-            responseMode=body.responseMode,
+    start_request = workflow_schemas.WorkflowRunStartRequest(
+        project=body.workflowProject,
+        runId=run_id,
+        traceId=body.traceId,
+        trigger=workflow_schemas.WorkflowRunTrigger(
+            kind="webhook",
+            triggerNodeId=trigger_node_id,
+            requestId=request_id,
+            idempotencyKey=idempotency_key,
         ),
+        input=runtime_input,
+        responseMode=body.responseMode,
+    )
+    if run_id is not None and idempotency_key:
+        await _reject_workspace_scoped_run(db, run_id)
+        existing = await get_workflow_run_projection(run_id, session=db)
+        if existing is not None:
+            await _account_workflow_run_identity(db, run_id, request)
+            row = await db.get(WorkflowRunRow, run_id)
+            try:
+                existing_request = workflow_schemas.WorkflowRunStartRequest.model_validate(
+                    row.request if row is not None else None
+                )
+            except ValidationError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Idempotency key collides with an unavailable workflow run",
+                ) from exc
+            if (
+                existing_request.project != start_request.project
+                or existing_request.trigger.kind != "webhook"
+                or existing_request.trigger.triggerNodeId != trigger_node_id
+                or existing_request.trigger.idempotencyKey != idempotency_key
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Idempotency key collides with another workflow request",
+                )
+            return ApiResponse.ok(
+                _webhook_ingress_response(
+                    existing,
+                    trigger_node_id=trigger_node_id,
+                    request_id=request_id,
+                    source_id=runtime_input.sourceId,
+                    idempotency_key=idempotency_key,
+                )
+            )
+
+    projection = await start_workflow_run(
+        start_request,
         session=db,
         graphon_client=get_dify_graphon_client(),
+        request_identity=identity,
     )
     await dispatch_materialized_image_jobs(db, projection.runId)
     return ApiResponse.ok(
@@ -581,11 +691,13 @@ async def dispatch_materialized_image_jobs(db: AsyncSession, run_id: str) -> Non
 )
 async def get_run_projection(
     run_id: str,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse[workflow_schemas.WorkflowRunProjection]:
     """Return the latest node-state projection for a workflow run."""
 
     await _reject_workspace_scoped_run(db, run_id)
+    await _account_workflow_run_identity(db, run_id, request)
     projection = await get_workflow_run_projection(run_id, session=db)
     if projection is None:
         raise HTTPException(status_code=404, detail="Workflow run not found")
@@ -598,6 +710,7 @@ async def get_run_projection(
 )
 async def get_run_evidence_batches(
     run_id: str,
+    request: Request,
     node_id: str | None = Query(default=None),
     source_group: str | None = Query(default=None),
     cursor: str | None = Query(default=None),
@@ -607,6 +720,7 @@ async def get_run_evidence_batches(
     """List compact EvidenceBatch metadata without returning raw records."""
 
     await _reject_workspace_scoped_run(db, run_id)
+    await _account_workflow_run_identity(db, run_id, request)
     projection = await get_workflow_run_projection(run_id, session=db)
     if projection is None:
         raise HTTPException(status_code=404, detail="Workflow run not found")
@@ -630,11 +744,13 @@ async def get_run_evidence_batches(
 async def get_run_evidence_batch(
     run_id: str,
     batch_id: str,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse[workflow_schemas.WorkflowEvidenceBatchDetail]:
     """Return one compact EvidenceBatch manifest and source coverage projection."""
 
     await _reject_workspace_scoped_run(db, run_id)
+    await _account_workflow_run_identity(db, run_id, request)
     projection = await get_workflow_run_projection(run_id, session=db)
     if projection is None:
         raise HTTPException(status_code=404, detail="Workflow run not found")
@@ -650,6 +766,7 @@ async def get_run_evidence_batch(
 )
 async def get_run_evidence_projection(
     run_id: str,
+    request: Request,
     node_id: str | None = Query(default=None),
     source_group: str | None = Query(default=None),
     include: str | None = Query(default=None),
@@ -658,6 +775,7 @@ async def get_run_evidence_projection(
     """Project run results for Canvas and AI consumers from replayable metadata."""
 
     await _reject_workspace_scoped_run(db, run_id)
+    await _account_workflow_run_identity(db, run_id, request)
     projection = await get_workflow_run_projection(run_id, session=db)
     if projection is None:
         raise HTTPException(status_code=404, detail="Workflow run not found")
@@ -683,11 +801,13 @@ async def get_run_evidence_projection(
 async def continue_run_with_source_outputs(
     run_id: str,
     body: workflow_schemas.WorkflowRunSourceOutputsRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse[workflow_schemas.WorkflowRunProjection]:
     """Continue a workflow run after external source batches arrive."""
 
     await _reject_workspace_scoped_run(db, run_id)
+    identity = await _account_workflow_run_identity(db, run_id, request)
     checkpoint = await get_workflow_run_checkpoint(run_id, session=db)
     if checkpoint is None:
         raise HTTPException(status_code=404, detail="Workflow run not found")
@@ -701,7 +821,12 @@ async def continue_run_with_source_outputs(
             status_code=409,
             detail=("Image generation outputs are accepted only from the platform job worker"),
         )
-    projection = await continue_workflow_run_with_source_outputs(run_id, body, session=db)
+    projection = await continue_workflow_run_with_source_outputs(
+        run_id,
+        body,
+        session=db,
+        request_identity=identity,
+    )
     if projection is None:
         raise HTTPException(status_code=404, detail="Workflow run not found")
     return ApiResponse.ok(projection)
@@ -714,17 +839,17 @@ async def continue_run_with_source_outputs(
 )
 async def resume_gaojixing_run(
     run_id: str,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse[workflow_schemas.WorkflowRunProjection]:
     """Explicitly requeue a human-cleared governed checkpoint."""
 
     await _reject_workspace_scoped_run(db, run_id)
+    await _account_workflow_run_identity(db, run_id, request)
     from backend.models.gaojixing_collection import GaojixingCollectionRun
 
     job = await db.scalar(
-        select(GaojixingCollectionRun).where(
-            GaojixingCollectionRun.workflow_run_id == run_id
-        )
+        select(GaojixingCollectionRun).where(GaojixingCollectionRun.workflow_run_id == run_id)
     )
     if job is None:
         raise HTTPException(status_code=404, detail="Gaojixing collection not found")
@@ -746,11 +871,13 @@ async def resume_gaojixing_run(
 )
 async def get_run_research_ledger(
     run_id: str,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse[workflow_schemas.WorkflowResearchLedgerResponse]:
     """Return the immutable parent/child revision chain for one research run."""
 
     await _reject_workspace_scoped_run(db, run_id)
+    await _account_workflow_run_identity(db, run_id, request)
     ledger = await get_research_ledger(run_id, session=db)
     if ledger is None:
         raise HTTPException(status_code=404, detail="Workflow run not found")
@@ -765,13 +892,20 @@ async def get_run_research_ledger(
 async def continue_research_run(
     run_id: str,
     body: workflow_schemas.WorkflowResearchContinuationRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse[workflow_schemas.WorkflowResearchContinuationResponse]:
     """Start one bounded child Run from an accepted collect_more proposal."""
 
     await _reject_workspace_scoped_run(db, run_id)
+    identity = await _account_workflow_run_identity(db, run_id, request)
     try:
-        result = await continue_research_workflow_run(run_id, body, session=db)
+        result = await continue_research_workflow_run(
+            run_id,
+            body,
+            session=db,
+            request_identity=identity,
+        )
     except ResearchContinuationError as exc:
         status_code = 413 if "too_large" in exc.code else 409
         raise HTTPException(
@@ -789,11 +923,13 @@ async def continue_research_run(
 )
 async def get_run_checkpoint(
     run_id: str,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse[workflow_schemas.WorkflowRunCheckpoint]:
     """Return the latest durable checkpoint descriptor for a workflow run."""
 
     await _reject_workspace_scoped_run(db, run_id)
+    await _account_workflow_run_identity(db, run_id, request)
     checkpoint = await get_workflow_run_checkpoint(run_id, session=db)
     if checkpoint is None:
         raise HTTPException(status_code=404, detail="Workflow run not found")
@@ -806,6 +942,7 @@ async def get_run_checkpoint(
 )
 async def query_run_trace(
     run_id: str,
+    request: Request,
     after_sequence: int | None = Query(default=None, ge=0, alias="afterSequence"),
     node_id: str | None = Query(default=None, alias="nodeId"),
     event_type: workflow_schemas.WorkflowNodeRunEventType | None = Query(
@@ -818,6 +955,7 @@ async def query_run_trace(
     """Query persisted run trace events with a checkpoint for resume/replay."""
 
     await _reject_workspace_scoped_run(db, run_id)
+    await _account_workflow_run_identity(db, run_id, request)
     projection = await get_workflow_run_projection(run_id, session=db)
     checkpoint = await get_workflow_run_checkpoint(run_id, session=db)
     events = await list_workflow_run_events(
@@ -854,6 +992,7 @@ async def query_run_trace(
 )
 async def get_run_events(
     run_id: str,
+    request: Request,
     after_sequence: int | None = Query(default=None, ge=0, alias="afterSequence"),
     node_id: str | None = Query(default=None, alias="nodeId"),
     event_type: workflow_schemas.WorkflowNodeRunEventType | None = Query(
@@ -866,6 +1005,7 @@ async def get_run_events(
     """Replay node-level events already emitted for a workflow run."""
 
     await _reject_workspace_scoped_run(db, run_id)
+    await _account_workflow_run_identity(db, run_id, request)
     events = await list_workflow_run_events(
         run_id,
         session=db,
@@ -882,11 +1022,13 @@ async def get_run_events(
 @router.get("/runs/{run_id}/events/stream")
 async def stream_run_events(
     run_id: str,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> Response:
     """Replay node events as a server-sent event response."""
 
     await _reject_workspace_scoped_run(db, run_id)
+    await _account_workflow_run_identity(db, run_id, request)
     projection = await get_workflow_run_projection(run_id, session=db)
     events = await list_workflow_run_events(run_id, session=db)
     if projection is None or events is None:

@@ -66,9 +66,7 @@ async def test_workflow_webhook_ingress_rejects_unsupported_trigger_node(client)
     assert response.status_code == 422
     assert response.json()["detail"] == {
         "code": "unsupported_webhook_trigger",
-        "message": (
-            "The selected node does not implement the workflow webhook input contract."
-        ),
+        "message": ("The selected node does not implement the workflow webhook input contract."),
         "workflowId": "wf-webhook-ingress",
         "nodeId": "incoming-webhook",
     }
@@ -143,3 +141,11 @@ async def test_workflow_webhook_ingress_starts_run_with_traceable_identifiers(cl
     )
     assert replay.status_code == 202
     assert replay.json()["data"]["runId"] == data["runId"]
+
+    changed_project = {**project, "name": "Caller replacement graph"}
+    collision = await client.post(
+        "/api/v1/workflows/wf-webhook-ingress/webhooks/incoming-webhook",
+        headers={"Idempotency-Key": "delivery-001"},
+        json={"workflowProject": changed_project, "input": {"payload": {"event": "duplicate"}}},
+    )
+    assert collision.status_code == 409

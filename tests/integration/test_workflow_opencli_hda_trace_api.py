@@ -1373,6 +1373,7 @@ async def test_workflow_run_trace_records_fleet_match_for_opencli_source(
         "mutationMode": "read",
         "requestedCapability": "opencli.twitter.search",
         "adapterNodeId": "opencli.adapter.twitter.search",
+        "sourceBindingRevisionId": "binding-video-r3",
     }
     resource_resolution = batch_ready["details"]["resourceResolution"]
     assert resource_resolution["status"] == "resolved"
