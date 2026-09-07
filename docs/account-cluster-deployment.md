@@ -6,6 +6,8 @@
 
 ## 前置条件
 
+- 本地构建组合使用 `!override` 保留原命名卷并替换镜像内挂载位置，要求 Docker Compose 2.24.4 或更高版本。构建版固定使用 `/home/agent` 和 `/var/lib/opencli/account-runtime`；旧 Chrome 镜像的目录环境变量不改变构建版的卷位置。
+
 - 在同一 Docker Engine 上已有控制平面，并创建其可达的 Docker network；该 network 名称填入 `ACCOUNT_CLUSTER_CONTROL_NETWORK`。Compose 的 external network 不会创建它，避免意外把账户节点接到错误控制面。
 - 必须从**当前 checkout** 构建包含 Chromium 的 agent image，并使用 `--iidfile` 产生的不可变本地 image ID。配方设置 `pull_policy: never` 且没有上游 release fallback，因而缺少该镜像时会失败而不是静默运行旧 allocator。
 - 为每个同时在线节点在控制面创建**不同且稳定**的 node ID、credential ID、credential 和已注册 runtime bundle ID。节点重建时恢复同一组 ID 与同一组持久卷；休眠账户保留在控制面清单中，只有获得独立节点容量后才上线。

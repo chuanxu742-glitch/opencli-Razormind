@@ -63,6 +63,7 @@ services:
       PROFILE_DIR: /home/agent/.config/chromium
       RUNTIME_HOME: /home/agent
       RUNTIME_CACHE_DIR: /home/agent/.cache
+      RUNTIME_STATE_DIR: /var/lib/opencli/account-runtime
     # Replace inherited /home/chrome targets while retaining the existing
     # named volumes and their data for the uid-1000 agent image.
     volumes: !override

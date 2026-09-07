@@ -239,13 +239,17 @@ def test_vnc_agent_image_is_the_registered_browser_bridge_runtime():
 
 
 @pytest.mark.skipif(shutil.which("docker") is None, reason="Docker Compose CLI is unavailable")
-def test_source_build_override_uses_agent_owned_runtime_paths():
+@pytest.mark.parametrize(
+    "legacy_state_dir", ["/var/lib/opencli/account-runtime", "/custom/chrome-state"]
+)
+def test_source_build_override_uses_agent_owned_runtime_paths(legacy_state_dir):
     environment = os.environ.copy()
     environment.update(
         {
             "API_AUTH_TOKEN": "packaging-test-token",
             "BOOTSTRAP_ADMIN_TOKEN": "packaging-test-bootstrap-token",
             "SECRET_KEY": "packaging-test-secret",
+            "CHROME_RUNTIME_STATE_DIR": legacy_state_dir,
         }
     )
     result = subprocess.run(
@@ -274,11 +278,12 @@ def test_source_build_override_uses_agent_owned_runtime_paths():
     agent = json.loads(result.stdout)["services"]["agent-1"]
     assert {
         key: agent["environment"][key]
-        for key in ("PROFILE_DIR", "RUNTIME_HOME", "RUNTIME_CACHE_DIR")
+        for key in ("PROFILE_DIR", "RUNTIME_HOME", "RUNTIME_CACHE_DIR", "RUNTIME_STATE_DIR")
     } == {
         "PROFILE_DIR": "/home/agent/.config/chromium",
         "RUNTIME_HOME": "/home/agent",
         "RUNTIME_CACHE_DIR": "/home/agent/.cache",
+        "RUNTIME_STATE_DIR": "/var/lib/opencli/account-runtime",
     }
     assert {
         mount["target"]: mount["source"] for mount in agent["volumes"]
