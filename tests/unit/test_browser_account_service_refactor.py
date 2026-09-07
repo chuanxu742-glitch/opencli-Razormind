@@ -8,6 +8,7 @@ from sqlalchemy import select
 from backend.models.browser import (
     BrowserAccount,
     BrowserDurableCommand,
+    BrowserLoginSession,
     BrowserProfileManifest,
     BrowserRuntimeBundle,
 )
@@ -25,7 +26,7 @@ from backend.services.browser_account_service import (
 
 
 @pytest.mark.asyncio
-async def test_manifest_mismatch_does_not_create_execution_command(db_session):
+async def test_manifest_mismatch_does_not_create_execution_state(db_session):
     """Admission rejects a mismatched manifest before creating execution state."""
     now = datetime.now(UTC)
     workspace = Workspace(id="refactor-w", name="Refactor", slug="refactor")
@@ -119,6 +120,15 @@ async def test_manifest_mismatch_does_not_create_execution_command(db_session):
         await ensure_execution_session(db_session, ref, context, actor_user_id=user.id)
 
     assert raised.value.code == BrowserAccountErrorCode.PROFILE_CORRUPT.value
+    assert (
+        await db_session.scalar(
+            select(BrowserLoginSession).where(
+                BrowserLoginSession.account_id == account.id,
+                BrowserLoginSession.purpose == "execution",
+                BrowserLoginSession.execution_id == context.execution_id,
+            )
+        )
+    ) is None
     assert (
         await db_session.scalar(
             select(BrowserDurableCommand).where(
