@@ -9,7 +9,7 @@ from typing import Any
 from sqlalchemy import select
 
 from backend.channels.base import ChannelFetchError
-from backend.control.error_kinds import map_error_type, map_exception
+from backend.control.error_kinds import map_exception
 from backend.control.recorder import FreshnessInfo, record_run_measurement
 from backend.models.source import DataSource
 from backend.models.task import CollectionTask
@@ -175,6 +175,8 @@ async def _resolve_account_execution(
         task = await session.get(CollectionTask, task_id)
         if task is None:
             raise ValueError(f"account execution task {task_id} was not found")
+        if task.source_id != source.id:
+            raise ValueError("account execution task does not match the source")
         persisted_parameters = dict(task.parameters or {})
         ref = execution_account_ref(persisted_parameters, source.channel_config or {})
         if ref is None:

@@ -497,7 +497,7 @@ async def test_manual_account_admission_rejects_viewer_and_non_member(
 
 
 @pytest.mark.asyncio
-async def test_anonymous_legacy_task_admission_remains_unchanged(db_session):
+async def test_anonymous_legacy_task_admission_remains_unchanged(db_session, db_engine):
     source = DataSource(
         id="anonymous-source",
         name="Anonymous source",
@@ -521,6 +521,39 @@ async def test_anonymous_legacy_task_admission_remains_unchanged(db_session):
     assert task is not None
     assert task.requested_by_user_id is None
     assert executor.calls == [(task.id, {"limit": 5})]
+    session_factory = async_sessionmaker(db_engine, class_=AsyncSession, expire_on_commit=False)
+    with patch("backend.database.AsyncSessionLocal", session_factory):
+        assert await _resolve_account_execution(task.id, source, {"limit": 5}) is None
+
+
+@pytest.mark.asyncio
+async def test_pipeline_rejects_task_from_another_source(db_session, db_engine):
+    workspace, user, _node, account = await _seed_account(db_session)
+    admitted = DataSource(id="admitted-source", name="Admitted", channel_type="rss")
+    other = DataSource(
+        id="other-source",
+        name="Other",
+        channel_type="opencli",
+        channel_config={"workspace_id": workspace.id, "account_id": account.id},
+    )
+    task = CollectionTask(
+        id="source-mismatch-task",
+        source_id=admitted.id,
+        trigger_type="manual",
+        requested_by_user_id=user.id,
+        parameters={},
+    )
+    db_session.add_all([admitted, other, task])
+    await db_session.commit()
+    session_factory = async_sessionmaker(db_engine, class_=AsyncSession, expire_on_commit=False)
+    with patch("backend.database.AsyncSessionLocal", session_factory):
+        with pytest.raises(ValueError, match="does not match the source"):
+            await _resolve_account_execution(task.id, other, {})
+    assert await db_session.scalar(
+        select(BrowserDurableCommand.id).where(
+            BrowserDurableCommand.kind == "execute_reference"
+        )
+    ) is None
 
 
 @pytest.mark.asyncio

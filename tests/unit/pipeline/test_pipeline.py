@@ -7,6 +7,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from backend.channels.base import ChannelResult
 from backend.pipeline.pipeline import PipelineResult, run_pipeline
 
+pytestmark = pytest.mark.usefixtures("anonymous_account_resolution")
+
 
 def _make_source(db_session, name="Pipeline Test Source", channel_type="rss"):
     from backend.models.source import DataSource
