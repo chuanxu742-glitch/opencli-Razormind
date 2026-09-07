@@ -681,6 +681,7 @@ async def _portal_authorization_monitor() -> None:
                     or not snapshot.owner_active
                     or snapshot.facts.user_disabled
                     or not snapshot.facts.workspace_active
+                    or snapshot.facts.role not in {"admin", "maintainer", "operator"}
                     or snapshot.facts.session_revoked
                     or snapshot.account_paused
                     or (
@@ -818,10 +819,22 @@ async def account_portal_websocket(
                 BrowserAccount.id == account_id,
             )
         )
+        authorization = await browser_account_service.get_portal_authorization_batch(
+            db, [(workspace_id, account_id, session_id, owner.subject, digest)]
+        ) if owner is not None else {}
+        authorized = authorization.get(
+            (workspace_id, account_id, session_id, owner.subject, digest)
+        ) if owner is not None else None
     if (
         owner is None
         or session is None
         or account is None
+        or authorized is None
+        or not authorized.owner_active
+        or authorized.facts.user_disabled
+        or not authorized.facts.workspace_active
+        or authorized.facts.role not in {"admin", "maintainer", "operator"}
+        or authorized.facts.session_revoked
         or _as_utc(owner.expires_at) <= now
         or _as_utc(owner.hard_expires_at) <= now
         or owner.session_revision != session.revision
@@ -843,21 +856,98 @@ async def account_portal_websocket(
     }
     _ACTIVE_PORTAL_SOCKETS[key] = state
     _ensure_portal_authorization_monitor()
+    transport = None
+    relays: list[asyncio.Task[None]] = []
     try:
-        while True:
-            message = await websocket.receive()
-            if message["type"] == "websocket.disconnect":
-                return
-            # A-to-R transient frame relay is intentionally not implicit: until
-            # R registers its dedicated PortalOwnerRoute transport, accepting and
-            # discarding input would be a credential/pixel sink.
-            await websocket.close(code=1011, reason="Portal transport is unavailable")
-            return
+        from backend import ws_agent_manager
+        from backend.services.browser_portal_contract import (
+            decode_portal_wire_frame,
+            encode_portal_wire_frame,
+            validate_portal_frame_binding,
+        )
+
+        async with AsyncSessionLocal() as db:
+            endpoint, envelope, revision = (
+                await browser_account_service.get_portal_session_envelope(
+                    db, workspace_id, account_id, session_id
+                )
+            )
+        route = await ws_agent_manager.prepare_portal_route(
+            endpoint, envelope, session_revision=revision, timeout=15
+        )
+        binding = route.binding
+        if (
+            binding.account_ref.workspace_id != workspace_id
+            or binding.account_ref.account_id != account_id
+            or binding.session_id != session_id
+            or binding.epoch != envelope.epoch
+            or binding.view_generation != envelope.view_generation
+            or (envelope.target.is_complete() and binding.target != envelope.target)
+            or route.node_identity.node_id != envelope.node_id
+            or route.node_identity.boot_id != envelope.node_boot_id
+            or route.session_revision != revision
+            or revision != owner.session_revision
+            or route.route_expires_at > envelope.lease_expires_at
+            or route.route_expires_at <= datetime.now(UTC)
+            or _ACTIVE_PORTAL_SOCKETS.get(key) is not state
+        ):
+            raise ValueError("portal route no longer matches its authorized session")
+        transport = await ws_agent_manager.open_portal_route(endpoint, route)
+
+        async def relay_input() -> None:
+            sequence = -1
+            while _ACTIVE_PORTAL_SOCKETS.get(key) is state:
+                message = await websocket.receive()
+                if message["type"] == "websocket.disconnect":
+                    return
+                wire = message.get("bytes")
+                if wire is None:
+                    raise ValueError("portal controls require binary framing")
+                frame = decode_portal_wire_frame(wire)
+                if frame.encoding != "control-json" or frame.sequence <= sequence:
+                    raise ValueError("portal control framing or sequence is invalid")
+                validate_portal_frame_binding(route, frame)
+                sequence = frame.sequence
+                await transport.send(frame)
+
+        async def relay_pixels() -> None:
+            sequence = -1
+            while _ACTIVE_PORTAL_SOCKETS.get(key) is state:
+                remaining = (route.route_expires_at - datetime.now(UTC)).total_seconds()
+                if remaining <= 0:
+                    return
+                try:
+                    frame = await transport.receive(timeout=min(remaining, 1.0))
+                except TimeoutError:
+                    continue
+                if frame is None:
+                    return
+                if frame.encoding != "pixel-binary" or frame.sequence <= sequence:
+                    raise ValueError("portal pixel framing or sequence is invalid")
+                validate_portal_frame_binding(route, frame)
+                sequence = frame.sequence
+                if _ACTIVE_PORTAL_SOCKETS.get(key) is not state:
+                    return
+                await websocket.send_bytes(encode_portal_wire_frame(frame))
+
+        relays = [asyncio.create_task(relay_input()), asyncio.create_task(relay_pixels())]
+        finished, _ = await asyncio.wait(relays, return_when=asyncio.FIRST_COMPLETED)
+        for relay in finished:
+            relay.result()
     except WebSocketDisconnect:
         return
+    except Exception:
+        # Transient controls and pixels must never enter exception logs.
+        await _close_portal_socket(key, state, reason="Portal connection ended")
     finally:
+        for relay in relays:
+            relay.cancel()
+        if relays:
+            await asyncio.gather(*relays, return_exceptions=True)
+        if transport is not None:
+            await transport.close(reason="portal_closed")
         if _ACTIVE_PORTAL_SOCKETS.get(key) is state:
-            _ACTIVE_PORTAL_SOCKETS.pop(key, None)
+            await _close_portal_socket(key, state, reason="Portal connection ended")
 
 
 __all__ = ["router"]

@@ -856,6 +856,44 @@ async def _lease_expiry_for_session(account: BrowserAccount, session: BrowserLog
     return _now() + _COMMAND_TTL
 
 
+async def get_portal_session_envelope(
+    db: AsyncSession, workspace_id: str, account_id: str, session_id: str
+) -> tuple[str, SessionEnvelopeV1, int]:
+    """Resolve a portal only through its current persisted node lease."""
+
+    account = await _account_or_error(db, workspace_id, account_id)
+    session = await _session_or_error(db, workspace_id, account_id, session_id)
+    lease = await _active_lease(db, workspace_id, account_id)
+    node = await db.get(EdgeNode, session.node_id) if session.node_id else None
+    if (
+        lease is None
+        or node is None
+        or node.quarantined
+        or node.status != "online"
+        or not node.account_capable
+        or lease.lease_id != session.lease_id
+        or lease.node_id != session.node_id
+        or lease.node_boot_id != session.node_boot_id
+        or node.boot_id != session.node_boot_id
+        or lease.epoch != session.epoch
+        or account.node_id != session.node_id
+        or account.paused
+        or (account.auth_required and session.purpose != "login")
+        or session.status not in _ACTIVE_SESSION_STATUSES
+        or session.expires_at is None
+        or _as_utc(session.expires_at) <= _now()
+    ):
+        raise BrowserAccountError(
+            BrowserAccountErrorCode.SESSION_EXPIRED,
+            "portal session has no current node lease",
+        )
+    envelope = await _session_envelope(account, session)
+    envelope.lease_expires_at = min(
+        _as_utc(lease.expires_at), _as_utc(session.expires_at)
+    )
+    return node.url.rstrip("/"), envelope, session.revision
+
+
 async def resolve_account_session(
     db: AsyncSession,
     account_ref: AccountRef | Mapping[str, Any],
