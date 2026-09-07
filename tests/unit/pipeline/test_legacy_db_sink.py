@@ -11,6 +11,8 @@ import pytest
 
 from backend.pipeline.sinks import LegacyDbSink, RunContext, SinkResult
 
+pytestmark = pytest.mark.usefixtures("anonymous_account_resolution")
+
 
 def _ctx(**over):
     base = dict(task_id="t1", source_id="s1", provider="rss")

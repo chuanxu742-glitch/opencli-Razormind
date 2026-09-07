@@ -12,6 +12,8 @@ import pytest
 from backend.pipeline.sinks import DualSink, LegacyDbSink, OdpSink, SinkResult
 from backend.pipeline.sinks.strategy import select_sink
 
+pytestmark = pytest.mark.usefixtures("anonymous_account_resolution")
+
 
 def test_legacy_does_not_forward_to_odp():
     # P1-1 strangler collapse: legacy must NOT forward to ODP just because a
@@ -112,8 +114,10 @@ async def test_run_pipeline_selects_sink_by_strategy(db_session):
     fake.write_batch = AsyncMock(return_value=SinkResult(accepted=1, records=[MagicMock()]))
 
     with (
-        patch("backend.pipeline.collector.collect", return_value=ChannelResult.ok([{"title": "x"}])),
-        patch("backend.pipeline.sinks.strategy.select_sink", return_value=fake) as sel,
+        patch(
+            "backend.pipeline.collector.collect", return_value=ChannelResult.ok([{"title": "x"}])
+        ),
+        patch("backend.pipeline.pipeline.select_sink", return_value=fake) as sel,
     ):
         result = await run_pipeline(
             task.id, source, enable_ai=False, enable_notifications=False
@@ -148,7 +152,9 @@ async def test_run_pipeline_injected_sink_overrides_strategy(db_session):
     injected.write_batch = AsyncMock(return_value=SinkResult(accepted=0, records=[]))
 
     with (
-        patch("backend.pipeline.collector.collect", return_value=ChannelResult.ok([{"title": "x"}])),
+        patch(
+            "backend.pipeline.collector.collect", return_value=ChannelResult.ok([{"title": "x"}])
+        ),
         patch("backend.pipeline.sinks.strategy.select_sink") as sel,
     ):
         await run_pipeline(
