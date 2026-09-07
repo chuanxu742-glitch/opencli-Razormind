@@ -281,6 +281,7 @@ class BrowserLoginSession(TimestampMixin):
     node_id: Mapped[str | None] = mapped_column(
         ForeignKey("edge_nodes.id", ondelete="RESTRICT"), nullable=True
     )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     node_boot_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     lease_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -353,6 +354,11 @@ class BrowserDurableCommand(TimestampMixin):
             "idempotency_key",
             name="uq_browser_commands_idempotency",
         ),
+        UniqueConstraint(
+            "workspace_id",
+            "id",
+            name="uq_browser_commands_workspace_id",
+        ),
         CheckConstraint(
             "kind IN ('start_login', 'apply_login_rule', 'refresh_login', 'stop_and_save', "
             "'execute_reference', 'close_session', 'isolate', 'migrate')",
@@ -366,6 +372,12 @@ class BrowserDurableCommand(TimestampMixin):
             ["workspace_id", "account_id"],
             ["browser_accounts.workspace_id", "browser_accounts.id"],
             ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "session_id"],
+            ["browser_login_sessions.workspace_id", "browser_login_sessions.id"],
+            ondelete="RESTRICT",
+            name="fk_browser_commands_session_workspace",
         ),
     )
 
@@ -410,6 +422,12 @@ class BrowserProfileManifest(TimestampMixin):
             ["workspace_id", "account_id"],
             ["browser_accounts.workspace_id", "browser_accounts.id"],
             ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "command_id"],
+            ["browser_durable_commands.workspace_id", "browser_durable_commands.id"],
+            ondelete="RESTRICT",
+            name="fk_browser_profile_manifest_command_workspace",
         ),
     )
 
