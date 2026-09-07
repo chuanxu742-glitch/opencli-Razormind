@@ -87,7 +87,13 @@ RUN pip install --no-cache-dir \
     "uvicorn[standard]" \
     httpx \
     pyyaml \
-    websockets
+    websockets \
+    "sqlalchemy[asyncio]>=2.0.0" \
+    "aiosqlite>=0.20.0" \
+    "pydantic-settings>=2.7.0" \
+    "playwright>=1.40.0" \
+    pillow \
+    "cryptography>=46.0.5"
 
 # Default bundle is immutable image content. Browser profiles only store site
 # state and can be mounted independently without changing capabilities.
@@ -128,6 +134,19 @@ COPY backend/agent_runtime_dispatch.py ./backend/agent_runtime_dispatch.py
 COPY backend/agent_runtimes/ ./backend/agent_runtimes/
 COPY backend/miniflow/ ./backend/miniflow/
 COPY backend/security/ ./backend/security/
+COPY backend/schemas/ ./backend/schemas/
+COPY backend/models/ ./backend/models/
+COPY backend/auth/ ./backend/auth/
+COPY backend/channels/__init__.py ./backend/channels/__init__.py
+COPY backend/channels/base.py ./backend/channels/base.py
+COPY backend/skills/ ./backend/skills/
+COPY backend/config.py ./backend/config.py
+COPY backend/database.py ./backend/database.py
+COPY backend/workflow/__init__.py ./backend/workflow/__init__.py
+COPY backend/workflow/native_intelligence_state.py ./backend/workflow/native_intelligence_state.py
+COPY backend/workflow/native_intelligence_contracts.py ./backend/workflow/native_intelligence_contracts.py
+COPY backend/services/__init__.py ./backend/services/__init__.py
+COPY backend/services/browser_portal_contract.py ./backend/services/browser_portal_contract.py
 RUN touch ./backend/__init__.py
 
 COPY agent/entrypoint.sh /entrypoint.sh
