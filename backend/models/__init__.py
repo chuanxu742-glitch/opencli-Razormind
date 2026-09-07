@@ -42,6 +42,7 @@ from backend.models.browser_space import (
 from backend.models.consumer_grant import ConsumerGrant
 from backend.models.control_action import ControlActionRecord
 from backend.models.cookie_jar import CookieJarEntry
+from backend.models.delivery_connection import DeliveryAttempt, DeliveryConnection
 from backend.models.edge_node import EdgeNode, EdgeNodeBoot, EdgeNodeCapacity, EdgeNodeEvent
 from backend.models.gaojixing_collection import (
     GaojixingCollectionRun,
