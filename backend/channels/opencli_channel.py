@@ -41,6 +41,29 @@ _help_cache: dict[tuple[str, str, str], tuple[float, frozenset[str]]] = {}
 _browser_requirement_cache: dict[tuple[str, str, str], tuple[float, bool]] = {}
 
 
+_INTERNAL_ROUTING_KEYS = frozenset(
+    {
+        "chrome_endpoint",
+        "required_profile_kind",
+        "execution_id",
+        "account_ref",
+        "accountRef",
+        "account_id",
+        "accountId",
+        "workspace_id",
+        "workspaceId",
+        "source_binding_revision_id",
+        "sourceBindingRevisionId",
+        "caller_id",
+        "callerId",
+        "account_session",
+        "_account_ref",
+        "_account_session",
+        "_execution_context",
+    }
+)
+
+
 def _cache_get(
     cache: dict[tuple[str, str, str], tuple[float, Any]],
     key: tuple[str, str, str],
@@ -73,25 +96,7 @@ def _split_routing_parameters(
     cli_parameters = {
         key: value
         for key, value in parameters.items()
-        if key
-        not in {
-            "chrome_endpoint",
-            "required_profile_kind",
-            "execution_id",
-            "account_ref",
-            "accountRef",
-            "account_id",
-            "accountId",
-            "workspace_id",
-            "workspaceId",
-            "source_binding_revision_id",
-            "sourceBindingRevisionId",
-            "caller_id",
-            "callerId",
-            "_account_ref",
-            "_account_session",
-            "_execution_context",
-        }
+        if key not in _INTERNAL_ROUTING_KEYS
     }
     return (chrome_endpoint, required_profile_kind), cli_parameters
 
@@ -688,7 +693,15 @@ class OpenCLIChannel(AbstractChannel):
         (chrome_endpoint, required_profile_kind), cli_params = (
             _split_routing_parameters(parameters)
         )
-        raw_args: dict = {**config.get("args", {}), **cli_params}
+        configured_args = config.get("args", {})
+        if not isinstance(configured_args, dict):
+            configured_args = {}
+        raw_args: dict = {
+            key: value
+            for key, value in configured_args.items()
+            if key not in _INTERNAL_ROUTING_KEYS
+        }
+        raw_args.update(cli_params)
         positional_args: list[str] = [str(v) for v in config.get("positional_args", [])]
         opencli_bin_early = _resolve_bin("cdp")
         named_options = await _get_named_options(opencli_bin_early, site, command)

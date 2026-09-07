@@ -3019,7 +3019,7 @@ async def _resolve_dispatch_account_session(
         return None
     if revision_id is None:
         raise RuntimeError("account_binding_revision_required")
-    from backend.database import AsyncSessionLocal
+    from backend.database import AsyncSessionLocal, commit_session
     from backend.models.source_binding import SourceBindingRevision
     from backend.schemas.browser_account import AccountRef, ExecutionContextV1
     from backend.services.browser_account_service import resolve_account_session
@@ -3040,6 +3040,9 @@ async def _resolve_dispatch_account_session(
             source_binding_revision_id=revision_id,
         )
         envelope = await resolve_account_session(session, ref, context)
+        # Keep A's durable wake/restore enqueue and fence mutation atomic with
+        # this owned session; otherwise waiting rolls the scheduler work back.
+        await commit_session(session)
     from backend.schemas.browser_account import SessionEnvelopeV1
 
     if not isinstance(envelope, SessionEnvelopeV1):
@@ -4481,7 +4484,7 @@ async def _collect_source_once(
             ),
         }
     if account_ref_value is not None:
-        from backend.database import AsyncSessionLocal
+        from backend.database import AsyncSessionLocal, commit_session
         from backend.schemas.browser_account import (
             AccountRef,
             ExecutionContextV1,
@@ -4506,6 +4509,9 @@ async def _collect_source_once(
         )
         async with AsyncSessionLocal() as session:
             resolution = await resolve_account_session(session, ref, context)
+            # This caller owns the session too; do not discard A's durable
+            # command or fence mutation when resolution is waiting.
+            await commit_session(session)
         if not isinstance(resolution, SessionEnvelopeV1):
             raise RuntimeError(
                 f"account session {getattr(resolution, 'status', 'blocked')}: "
