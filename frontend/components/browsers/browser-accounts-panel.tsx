@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useSearchParams } from 'next/navigation'
+import { useRouter, useSearchParams } from 'next/navigation'
 import { CheckCircle2, ExternalLink, Loader2, Plus, RefreshCw, ShieldAlert, Wifi, X } from 'lucide-react'
 import { toast } from 'sonner'
 
@@ -615,6 +615,7 @@ function AccountDetail({ workspaceId, account, canManage, canOperate, onRefresh 
 
 export function BrowserAccountsPanel() {
   const { identity } = useAuth()
+  const router = useRouter()
   const searchParams = useSearchParams()
   const workspaces = useMyWorkspaces()
   const workspaceId = searchParams.get('workspace') ?? workspaces.data?.[0]?.id ?? null
@@ -639,10 +640,11 @@ export function BrowserAccountsPanel() {
   const selected = selectedId ? accounts.find((account) => account.id === selectedId) ?? null : null
   useEffect(() => { setSelectedId(null) }, [workspaceId])
   useEffect(() => { if (!selectedId && accounts[0]) setSelectedId(accounts[0].id); if (selectedId && !accounts.some((account) => account.id === selectedId)) setSelectedId(accounts[0]?.id ?? null) }, [accounts, selectedId])
+  const workspacePicker = <label className="flex items-center gap-2 text-sm"><span>工作区</span><select aria-label="工作区" className="h-9 rounded-md border bg-background px-2" value={workspaceId ?? ''} disabled={workspaces.isLoading} onChange={(event) => { const params = new URLSearchParams(searchParams.toString()); params.set('workspace', event.target.value); router.replace(`/browser-accounts?${params.toString()}`) }}><option value="" disabled>选择工作区</option>{workspaces.data?.filter((item) => item.active).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
   if (!hasBrowserAccountReadPermission) {
     return (
       <Card className="overflow-hidden py-0">
-        <CardHeader className="border-b bg-muted/20 py-4"><CardTitle className="text-base">浏览器账号</CardTitle><CardDescription>账号、登录会话和门户投影都必须在工作区读取权限确认后才能显示。</CardDescription></CardHeader>
+        <CardHeader className="border-b bg-muted/20 py-4"><CardTitle className="text-base">浏览器账号</CardTitle><CardDescription>账号、登录会话和门户投影都必须在工作区读取权限确认后才能显示。</CardDescription><CardAction>{workspacePicker}</CardAction></CardHeader>
         <CardContent>{workspaces.isLoading || membersQuery.isLoading ? <LoadingState /> : membersQuery.error ? <ErrorState message="无法读取工作区权限，请重试。" hint={BACKEND_HINT} /> : <EmptyState title={workspaceId ? '无权访问此工作区' : '尚无可用工作区'} description={workspaceId ? '请切换到有访问权限的工作区，或联系管理员。' : '创建或加入工作区后即可管理浏览器账号。'} />}</CardContent>
       </Card>
     )
@@ -650,7 +652,7 @@ export function BrowserAccountsPanel() {
   const refresh = () => { void queryClient.invalidateQueries({ queryKey: ['browser-accounts', workspaceId] }); if (selected) void queryClient.invalidateQueries({ queryKey: ['browser-account', workspaceId, selected.id] }) }
   return (
     <Card className="overflow-hidden py-0">
-      <CardHeader className="border-b bg-muted/20 py-4"><CardTitle className="text-base">工作区浏览器账号</CardTitle><CardDescription>每个账号拥有独立的认证资料和登录会话；账号认证状态与资源分配分别展示；资源已分配不代表节点健康。</CardDescription><CardAction><Badge variant="outline">{identity?.subject ? '操作员会话' : '工作区上下文'}</Badge></CardAction></CardHeader>
+      <CardHeader className="border-b bg-muted/20 py-4"><CardTitle className="text-base">工作区浏览器账号</CardTitle><CardDescription>每个账号拥有独立的认证资料和登录会话；账号认证状态与资源分配分别展示；资源已分配不代表节点健康。</CardDescription><CardAction>{workspacePicker}</CardAction></CardHeader>
       <CardContent className="grid gap-6 p-4 xl:grid-cols-[minmax(16rem,0.8fr)_minmax(0,1.2fr)]">
         <section className="space-y-4" aria-labelledby="browser-account-create-title"><div><h3 id="browser-account-create-title" className="font-medium">添加账号</h3><p className="mt-1 text-xs text-muted-foreground">普通登录会开启一个真实会话；二维码刷新和原生表单只会在已批准的会话中展示。</p></div><CreateAccountForm workspaceId={workspaceId} canManage={canManageBrowserAccounts} onCreated={(account) => { setSelectedId(account.id); refresh() }} /><div className="border-t pt-4"><div className="flex items-center justify-between gap-2"><h3 className="font-medium">账号</h3><Button size="xs" variant="ghost" onClick={refresh} disabled={accountsQuery.isFetching}><RefreshCw className={accountsQuery.isFetching ? 'size-3 animate-spin' : 'size-3'} /></Button></div>{accountsQuery.isLoading ? <LoadingState /> : accountsQuery.error ? <ErrorState message={errorText(accountsQuery.error)} hint={BACKEND_HINT} /> : accounts.length === 0 ? <EmptyState title="暂无浏览器账号" description="创建工作区账号后即可开始已验证的登录会话。" /> : <div className="mt-2 space-y-2">{accounts.map((account) => <button key={account.id} type="button" onClick={() => setSelectedId(account.id)} className={`w-full rounded-md border p-3 text-left transition-colors ${selected?.id === account.id ? 'border-primary bg-primary/5' : 'hover:bg-muted/40'}`}><div className="flex items-center justify-between gap-2"><span className="truncate font-medium">{account.label}</span><AccountStatus status={account.status} /></div><p className="mt-1 truncate font-mono text-xs text-muted-foreground">{account.site} · {account.id}</p><p className="mt-1 text-xs text-muted-foreground">{account.evidence_source ?? '认证凭据未知'} · revision {account.revision}</p></button>)}</div>}{accountsQuery.hasNextPage ? <Button variant="outline" size="sm" disabled={accountsQuery.isFetchingNextPage} onClick={() => void accountsQuery.fetchNextPage()}>{accountsQuery.isFetchingNextPage ? "加载中…" : "加载更多账号"}</Button> : null}</div></section>
         <section className="min-w-0" aria-labelledby="browser-account-detail-title"><h3 id="browser-account-detail-title" className="sr-only">所选账号详情</h3>{!workspaceId ? <EmptyState title="选择工作区" description="账号操作需要明确的工作区范围。" /> : !selected ? <EmptyState title="选择账号" description="创建或选择工作区账号以查看认证凭据和登录会话。" /> : <AccountDetail key={`${workspaceId}:${selected.id}`} workspaceId={workspaceId} account={selected} canManage={canManageBrowserAccounts} canOperate={canOperateBrowserAccounts} onRefresh={refresh} />}</section>
