@@ -37,8 +37,7 @@ Environment variables:
                             process environment (e.g. same .env) just works without
                             a separate AGENT_API_TOKEN. Ignored if AGENT_API_TOKEN is set.
     OPENCLI_BRIDGE_BIN      Path to opencli 1.0 binary (default: /opt/opencli-bridge/bin/opencli)
-    OPENCLI_CDP_BIN         Path to opencli 0.9 binary (default: /opt/opencli-cdp/bin/opencli)
-    OPENCLI_CDP_ENDPOINT    Default Chrome CDP endpoint (default: http://localhost:19222)
+    OPENCLI_CDP_ENDPOINT    Explicit anonymous Chrome CDP endpoint; unset means capability_missing
     OPENCLI_DAEMON_PORT     Bridge daemon port (default: 19825)
     OPENCLI_TIMEOUT         opencli subprocess timeout in seconds (default: 120)
     AGENT_CODEX_ISOLATED_RUNNER Absolute path to an administrator-owned, externally
@@ -51,6 +50,7 @@ Environment variables:
 import asyncio
 import json
 import logging
+import hmac
 import os
 import re
 import shutil
@@ -59,6 +59,7 @@ import socket
 import subprocess
 import uuid
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlparse
 from urllib.request import proxy_bypass
@@ -67,11 +68,28 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 from backend.agent_runtime_dispatch import (
+    AccountRuntimeContext,
     RuntimeInvokeRequest,
     cleanup_cdp_tabs,
     invoke_runtime,
     parse_output,
+    resolve_account_runtime_context,
     snapshot_tab_ids,
+)
+from backend.browser_account_runtime import (
+    BrowserRuntimeError,
+    EpochStore,
+    ProfileRuntimePaths,
+    RuntimeLeaseAdmission,
+    runtime_lease_book,
+    session_runtime_registry,
+)
+from backend.schemas.browser_account import (
+    DurableCommandV1,
+    NodeClaimV1,
+    NodeIdentityV1,
+    NodeResultV1,
+    SessionEnvelopeV1,
 )
 
 # Imported directly from the registry submodule (not the `backend.agent_runtimes`
@@ -86,7 +104,6 @@ from backend.agent_runtimes.registry import (
     available_runtimes,
     get_runtime,
 )
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger("agent_server")
 
@@ -105,7 +122,7 @@ def _resolve_bin(mode: str) -> str:  # noqa: ARG001
     return shutil.which(configured) or configured
 
 
-_DEFAULT_CDP = os.environ.get("OPENCLI_CDP_ENDPOINT", "http://localhost:19222")
+_DEFAULT_CDP = os.environ.get("OPENCLI_CDP_ENDPOINT", "")
 _BROWSER_PROFILE_KIND = os.environ.get("OPENCLI_BROWSER_PROFILE_KIND", "authenticated")
 _DAEMON_PORT = int(os.environ.get("OPENCLI_DAEMON_PORT", "19825"))
 _AGENT_PORT = int(os.environ.get("AGENT_PORT", "19823"))
@@ -115,8 +132,8 @@ _AGENT_MODE = os.environ.get("AGENT_MODE", "cdp")
 # Deployment/startup type reported to center:
 # "docker" (container) | "shell" (native process).
 _AGENT_DEPLOY_TYPE = os.environ.get("AGENT_DEPLOY_TYPE", "docker")
-# True when the image was built with INSTALL_CHROME=true (Chrome bundled inside container).
-# False → Chrome runs on the host; localhost must be remapped to host.docker.internal.
+# Anonymous collection may use an explicitly supplied endpoint; account
+# dispatch never reaches this legacy host-remapping path.
 _AGENT_HAS_CHROME = os.environ.get("AGENT_HAS_CHROME", "false").lower() == "true"
 _RUNTIME_BUNDLE_MANIFEST = os.environ.get(
     "BROWSER_RUNTIME_BUNDLE_MANIFEST",
@@ -190,6 +207,59 @@ _AGENT_REGISTER = os.environ.get("AGENT_REGISTER", "http").lower()
 _OPENCLI_TIMEOUT = int(os.environ.get("OPENCLI_TIMEOUT", "120"))
 # Outbound proxy for agent → center communication (optional)
 _HTTP_PROXY = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy") or ""
+_AGENT_NODE_ID = os.environ.get("AGENT_NODE_ID", "").strip()
+_AGENT_NODE_CREDENTIAL_ID = os.environ.get("AGENT_NODE_CREDENTIAL_ID", "").strip()
+_AGENT_NODE_CREDENTIAL = os.environ.get("AGENT_NODE_CREDENTIAL", "")
+_AGENT_BOOT_ID = os.environ.get("AGENT_BOOT_ID", "").strip()
+_NODE_IDENTITY: NodeIdentityV1 | None = None
+
+
+def _node_identity(*, required: bool = True) -> NodeIdentityV1 | None:
+    """Return the persistent node identity for this process generation."""
+
+    global _NODE_IDENTITY
+    if _NODE_IDENTITY is not None:
+        return _NODE_IDENTITY
+    if not _AGENT_NODE_ID:
+        if required:
+            raise HTTPException(status_code=503, detail="node identity is not configured")
+        return None
+    try:
+        paths = ProfileRuntimePaths.from_profile_dir(
+            os.environ.get("PROFILE_DIR", "/var/lib/opencli/account-runtime/profile"),
+            os.environ.get("RUNTIME_STATE_DIR"),
+        )
+        boot_id = _AGENT_BOOT_ID or EpochStore(paths).begin_boot()
+        _NODE_IDENTITY = NodeIdentityV1(node_id=_AGENT_NODE_ID, boot_id=boot_id)
+    except (BrowserRuntimeError, ValueError) as exc:
+        if required:
+            raise HTTPException(status_code=503, detail="node identity is unavailable") from exc
+        return None
+    return _NODE_IDENTITY
+
+
+def _require_node_auth(
+    authorization: str | None,
+    node_id: str | None,
+    boot_id: str | None,
+    credential: str | None,
+) -> NodeIdentityV1:
+    """Authenticate a real node credential and exact boot generation."""
+    if not _AGENT_HAS_CHROME or _BROWSER_PROFILE_KIND != "authenticated":
+        raise HTTPException(status_code=503, detail="account runtime capability is unavailable")
+    if not _AGENT_NODE_CREDENTIAL or not _AGENT_NODE_CREDENTIAL_ID:
+        raise HTTPException(status_code=503, detail="account node credential is not configured")
+    identity = _node_identity()
+    if (
+        not credential
+        or not hmac.compare_digest(credential, _AGENT_NODE_CREDENTIAL)
+        or node_id != identity.node_id
+        or boot_id != identity.boot_id
+    ):
+        raise HTTPException(status_code=401, detail="invalid node credential identity")
+    # Global fleet auth remains an independent center-to-node admission gate.
+    _require_collect_auth(authorization)
+    return identity
 _HTTPS_PROXY = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or ""
 # Fleet auth token (ADR-0005): AGENT_API_TOKEN preferred, API_AUTH_TOKEN accepted
 # as a fallback for nodes that share the center's environment.
@@ -207,6 +277,17 @@ def _auth_headers() -> dict[str, str]:
     if not _AGENT_API_TOKEN:
         return {}
     return {"Authorization": f"Bearer {_AGENT_API_TOKEN}"}
+def _node_headers() -> dict[str, str]:
+    identity = _node_identity(required=False)
+    if identity is None or not _AGENT_NODE_CREDENTIAL:
+        return {}
+    return {
+        "X-Node-ID": identity.node_id,
+        "X-Node-Boot-ID": identity.boot_id,
+        "X-Node-Credential": _AGENT_NODE_CREDENTIAL,
+    }
+
+
 
 
 def _require_collect_auth(authorization: str | None) -> None:
@@ -318,6 +399,16 @@ async def _register_with_center(advertise_url: str) -> None:
         "runtimes": _available_agent_runtimes(),
         "runtime_capabilities": available_runtime_capabilities(),
         "profile_kind": _BROWSER_PROFILE_KIND,
+        "node_id": _AGENT_NODE_ID or None,
+        "boot_id": (_node_identity(required=False).boot_id if _node_identity(required=False) else None),
+        "credential_id": _AGENT_NODE_CREDENTIAL_ID or None,
+        "account_capable": bool(
+            _AGENT_HAS_CHROME
+            and _BROWSER_PROFILE_KIND == "authenticated"
+            and _AGENT_NODE_ID
+            and _AGENT_NODE_CREDENTIAL_ID
+            and _AGENT_NODE_CREDENTIAL
+        ),
     }
     proxies = _build_proxies()
 
@@ -325,7 +416,7 @@ async def _register_with_center(advertise_url: str) -> None:
         try:
             # httpx >= 0.28 removed 'proxies'; use 'proxy' (single URL) or mounts
             client_kwargs: dict = {"timeout": 10}
-            headers = _auth_headers()
+            headers = {**_auth_headers(), **_node_headers()}
             if proxies:
                 proxy_url = proxies.get("https://") or proxies.get("http://")
                 try:
@@ -381,16 +472,14 @@ async def _handle_ws_collect(ws, msg: dict) -> None:
         await ws.send(json.dumps(result))
     except Exception as exc:
         logger.error("WS: failed to send result for request_id=%s: %s", request_id, exc)
+async def _handle_ws_agent_task(
+    ws,
+    msg: dict,
+    authenticated_identity: NodeIdentityV1 | None = None,
+) -> None:
+    """Execute an authenticated account task over the reverse channel.
 
-
-async def _handle_ws_agent_task(ws, msg: dict) -> None:
-    """Execute an agent_task received over the WS channel: run the requested
-    runtime adapter, streaming each RuntimeEvent back as an 'agent_event'
-    frame, and finish with exactly one 'agent_result' frame carrying the
-    terminal done/error event.
-
-    Never raises out of this function — a single task crashing must not kill
-    the WS receive loop (the caller fires this via asyncio.create_task).
+    The command/claim/session envelope is validated before adapter side effects.
     """
     request_id = msg.get("request_id", "")
 
@@ -411,8 +500,62 @@ async def _handle_ws_agent_task(ws, msg: dict) -> None:
     runtime_type = msg.get("runtime", "")
     # Everything below is one outer try/except: get_runtime() lookup, adapter
     # construction of AgentTask, and the invoke() stream are all treated the
-    # same way — any exception, of any type, must resolve the center's
-    # pending future with an error result rather than propagate. The caller
+    # same way — any exception must resolve the center's pending future.
+    task_config = dict(msg.get("config") or {})
+    account_fields = ("command", "claim", "session", "node_identity")
+    if any(msg.get(field) is not None for field in account_fields):
+        if authenticated_identity is None:
+            await _send_result(
+                {
+                    "type": "error",
+                    "task_id": request_id,
+                    "message": "WS node identity is unavailable",
+                    "error_type": "NodeIdentityMissing",
+                }
+            )
+            return
+        try:
+            runtime_request = RuntimeInvokeRequest.model_validate(
+                {
+                    "runtime": runtime_type,
+                    "workflow": msg.get("workflow", ""),
+                    "instructions": msg.get("instructions", ""),
+                    "input": msg.get("input") or {},
+                    "config": task_config,
+                    "command": msg.get("command"),
+                    "claim": msg.get("claim"),
+                    "session": msg.get("session"),
+                    "node_identity": msg.get("node_identity"),
+                }
+            )
+            if runtime_request.node_identity != authenticated_identity:
+                raise ValueError("WS node identity is not authenticated")
+            account_context = resolve_account_runtime_context(runtime_request)
+            task_config = account_context.server_config | {
+                key: value
+                for key, value in task_config.items()
+                if key not in {
+                    "remote",
+                    "binary",
+                    "cdp_endpoint",
+                    "endpoint",
+                    "daemon_endpoint",
+                    "profile_dir",
+                    "home_dir",
+                    "cache_dir",
+                    "display",
+                }
+            }
+        except (ValueError, HTTPException) as exc:
+            await _send_result(
+                {
+                    "type": "error",
+                    "task_id": request_id,
+                    "message": str(exc),
+                    "error_type": "RuntimeContextInvalid",
+                }
+            )
+            return
     # fires this coroutine via asyncio.create_task, so an uncaught exception
     # here would otherwise vanish into an unretrieved task exception and the
     # center would hang until its own send_agent_task timeout.
@@ -438,7 +581,7 @@ async def _handle_ws_agent_task(ws, msg: dict) -> None:
             workflow=msg.get("workflow", ""),
             instructions=msg.get("instructions", ""),
             input=msg.get("input") or {},
-            config=msg.get("config") or {},
+            config=task_config,
             session_id=msg.get("session_id"),
             provider=msg.get("provider"),
             model=msg.get("model"),
@@ -526,11 +669,21 @@ def _forget_ws_agent_task(request_id: str, task: asyncio.Task[None]) -> None:
         _ACTIVE_AGENT_TASKS.pop(request_id, None)
 
 
-def _start_ws_agent_task(ws, msg: dict) -> None:
+def _start_ws_agent_task(
+    ws,
+    msg: dict,
+    authenticated_identity: NodeIdentityV1 | None = None,
+) -> None:
     request_id = msg.get("request_id", "")
-    task = asyncio.create_task(_handle_ws_agent_task(ws, msg))
+    task = (
+        asyncio.create_task(_handle_ws_agent_task(ws, msg))
+        if authenticated_identity is None
+        else asyncio.create_task(_handle_ws_agent_task(ws, msg, authenticated_identity))
+    )
     _ACTIVE_AGENT_TASKS[request_id] = task
     task.add_done_callback(lambda completed: _forget_ws_agent_task(request_id, completed))
+
+
 
 
 async def _register_via_ws(advertise_url: str) -> None:
@@ -562,6 +715,15 @@ async def _register_via_ws(advertise_url: str) -> None:
             "runtimes": runtimes,
             "runtime_capabilities": runtime_capabilities,
             "profile_kind": _BROWSER_PROFILE_KIND,
+            "account_capable": bool(
+                _AGENT_HAS_CHROME
+                and _BROWSER_PROFILE_KIND == "authenticated"
+                and _AGENT_NODE_ID
+                and _AGENT_NODE_CREDENTIAL_ID
+                and _AGENT_NODE_CREDENTIAL
+            ),
+            "boot_id": (_node_identity(required=False).boot_id if _node_identity(required=False) else None),
+            "credential_id": _AGENT_NODE_CREDENTIAL_ID or None,
         }
     )
 
@@ -573,7 +735,7 @@ async def _register_via_ws(advertise_url: str) -> None:
             connect_kwargs: dict = {"ping_interval": 30, "ping_timeout": 10}
             if _proxy:
                 connect_kwargs["proxy"] = _proxy
-            headers = _auth_headers()
+            headers = {**_auth_headers(), **_node_headers()}
             if headers:
                 try:
                     # websockets >= 14 renamed extra_headers -> additional_headers.
@@ -605,7 +767,7 @@ async def _register_via_ws(advertise_url: str) -> None:
                     if msg_type == "collect":
                         asyncio.create_task(_handle_ws_collect(ws, msg))
                     elif msg_type == "agent_task":
-                        _start_ws_agent_task(ws, msg)
+                        _start_ws_agent_task(ws, msg, _node_identity(required=False))
                     elif msg_type == "cancel":
                         request_id = msg.get("request_id", "")
                         proc = _ACTIVE_COLLECTS.get(request_id)
@@ -682,11 +844,55 @@ class CollectRequest(BaseModel):
     # Values passed as positional CLI arguments (no --key prefix), inserted
     # right after [site] [command] and before any named --options.
     positional_args: list[str] = []
-    format: str = "json"
-    mode: str = "bridge"
-    # CDP endpoint override; falls back to OPENCLI_CDP_ENDPOINT env var
+    # CDP endpoint override is retained only for legacy anonymous collection.
     cdp_endpoint: str = ""
     execution_id: str = ""
+class RuntimeClaimRequest(BaseModel):
+    command: DurableCommandV1
+    claim: NodeClaimV1
+    session: SessionEnvelopeV1
+    node_identity: NodeIdentityV1
+
+
+class RuntimeRenewRequest(BaseModel):
+    claim: NodeClaimV1
+    node_identity: NodeIdentityV1
+
+
+class RuntimeResultRequest(BaseModel):
+    result: NodeResultV1
+    node_identity: NodeIdentityV1
+
+
+def _admit_claim(
+    body: RuntimeClaimRequest,
+    *,
+    authenticated_identity: NodeIdentityV1,
+) -> RuntimeLeaseAdmission:
+    if body.node_identity != authenticated_identity:
+        raise HTTPException(status_code=401, detail="claim node identity is not authenticated")
+    try:
+        from backend.schemas.browser_account import CommandExecutionGuardV1
+
+        guard = CommandExecutionGuardV1(
+            command=body.command,
+            claim=body.claim,
+            session=body.session,
+        )
+        session_runtime_registry().resolve(
+            session_id=guard.session.session_id,
+            node_id=guard.claim.node_id,
+            boot_id=guard.claim.boot_id,
+            epoch=guard.claim.epoch,
+        )
+        return runtime_lease_book().claim(
+            claim=guard.claim,
+            session=guard.session,
+            node_identity=authenticated_identity,
+        )
+    except (ValueError, BrowserRuntimeError) as exc:
+        code = exc.code if isinstance(exc, BrowserRuntimeError) else "runtime_context_invalid"
+        raise HTTPException(status_code=409, detail=code) from exc
 
 
 @app.get("/health")
@@ -696,15 +902,41 @@ def health() -> dict:
         "status": "ok",
         "opencli_bin": bin_path,
         "opencli_bin_exists": shutil.which(bin_path) is not None or os.path.isfile(bin_path),
-        "default_cdp_endpoint": _DEFAULT_CDP,
+        "account_capable": bool(
+            _AGENT_HAS_CHROME
+            and _BROWSER_PROFILE_KIND == "authenticated"
+            and _AGENT_NODE_ID
+            and _AGENT_NODE_CREDENTIAL_ID
+            and _AGENT_NODE_CREDENTIAL
+        ),
+        "node_identity": (
+            _node_identity(required=False).model_dump(mode="json")
+            if _node_identity(required=False)
+            else None
+        ),
     }
 
 
 @app.post("/runtime/invoke")
 async def invoke_runtime_http(
-    req: RuntimeInvokeRequest, authorization: str | None = Header(default=None)
+    req: RuntimeInvokeRequest,
+    authorization: str | None = Header(default=None),
+    node_id: str | None = Header(default=None, alias="X-Node-ID"),
+    boot_id: str | None = Header(default=None, alias="X-Node-Boot-ID"),
+    node_credential: str | None = Header(default=None, alias="X-Node-Credential"),
 ) -> dict:
-    _require_collect_auth(authorization)
+    account_dispatch = any(
+        value is not None
+        for value in (req.command, req.claim, req.session, req.node_identity)
+    )
+    context: AccountRuntimeContext | None = None
+    if account_dispatch:
+        identity = _require_node_auth(authorization, node_id, boot_id, node_credential)
+        if req.node_identity != identity:
+            raise HTTPException(status_code=401, detail="runtime node identity is not authenticated")
+        context = resolve_account_runtime_context(req)
+    else:
+        _require_collect_auth(authorization)
     if req.runtime == "codex":
         raise HTTPException(
             status_code=403,
@@ -721,11 +953,94 @@ async def invoke_runtime_http(
             status_code=400,
             detail="edge runtime config cannot override: " + ", ".join(unsafe_keys),
         )
-    return await invoke_runtime(str(uuid.uuid4()), req, cdp_endpoint=_DEFAULT_CDP)
+    if context is None and not _DEFAULT_CDP:
+        raise HTTPException(status_code=503, detail="anonymous runtime has no configured endpoint")
+    return await invoke_runtime(
+        str(uuid.uuid4()),
+        req,
+        cdp_endpoint=context.cdp_endpoint if context is not None else _DEFAULT_CDP,
+        account_context=context,
+    )
+
+
+@app.post("/runtime/claim")
+async def claim_runtime(
+    body: RuntimeClaimRequest,
+    authorization: str | None = Header(default=None),
+    node_id: str | None = Header(default=None, alias="X-Node-ID"),
+    boot_id: str | None = Header(default=None, alias="X-Node-Boot-ID"),
+    node_credential: str | None = Header(default=None, alias="X-Node-Credential"),
+) -> dict[str, Any]:
+    identity = _require_node_auth(authorization, node_id, boot_id, node_credential)
+    admission = _admit_claim(body, authenticated_identity=identity)
+    return {
+        "accepted": True,
+        "node_identity": identity.model_dump(mode="json"),
+        "claim": admission.claim.model_dump(mode="json"),
+        "session": admission.session.model_dump(mode="json"),
+    }
+
+
+@app.post("/runtime/renew")
+async def renew_runtime(
+    body: RuntimeRenewRequest,
+    authorization: str | None = Header(default=None),
+    node_id: str | None = Header(default=None, alias="X-Node-ID"),
+    boot_id: str | None = Header(default=None, alias="X-Node-Boot-ID"),
+    node_credential: str | None = Header(default=None, alias="X-Node-Credential"),
+) -> dict[str, Any]:
+    identity = _require_node_auth(authorization, node_id, boot_id, node_credential)
+    if body.node_identity != identity:
+        raise HTTPException(status_code=401, detail="renewal node identity is not authenticated")
+    try:
+        admission = runtime_lease_book().renew(
+            claim=body.claim,
+            node_identity=identity,
+            now=datetime.now(UTC),
+        )
+    except BrowserRuntimeError as exc:
+        raise HTTPException(status_code=409, detail=exc.code) from exc
+    return {
+        "accepted": True,
+        "command_id": admission.claim.command_id,
+        "expires_at": admission.claim.expires_at,
+    }
+
+
+@app.post("/runtime/result")
+async def result_runtime(
+    body: RuntimeResultRequest,
+    authorization: str | None = Header(default=None),
+    node_id: str | None = Header(default=None, alias="X-Node-ID"),
+    boot_id: str | None = Header(default=None, alias="X-Node-Boot-ID"),
+    node_credential: str | None = Header(default=None, alias="X-Node-Credential"),
+) -> dict[str, Any]:
+    identity = _require_node_auth(authorization, node_id, boot_id, node_credential)
+    if body.node_identity != identity:
+        raise HTTPException(status_code=401, detail="result node identity is not authenticated")
+    try:
+        admission = runtime_lease_book().result(
+            result=body.result,
+            node_identity=identity,
+            now=datetime.now(UTC),
+        )
+    except BrowserRuntimeError as exc:
+        raise HTTPException(status_code=409, detail=exc.code) from exc
+    return {
+        "accepted": True,
+        "command_id": admission.claim.command_id,
+        "status": admission.result.status if admission.result is not None else None,
+    }
 
 
 async def collect(req: CollectRequest) -> dict:
     cdp_ep = req.cdp_endpoint.strip() or _DEFAULT_CDP
+    if not cdp_ep:
+        return {
+            "success": False,
+            "items": [],
+            "error": "capability_missing: server-resolved runtime endpoint required",
+        }
     mode = req.mode
 
     bin_path = _resolve_bin(mode)

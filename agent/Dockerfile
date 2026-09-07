@@ -31,7 +31,7 @@ RUN openssl genrsa -out /tmp/browser-bridge-extension-key.pem 2048 \
 
 FROM ${REGISTRY}python:3.13-slim
 
-ARG INSTALL_CHROME=false
+ARG INSTALL_CHROME=true
 ARG BBX_VERSION=1.11.1
 ARG BROWSER_ENGINE=chromium
 ARG CLOAKBROWSER_VERSION=0.5.10
@@ -50,15 +50,14 @@ RUN mkdir -p /etc/chromium/policies/managed \
        > /etc/chromium/policies/managed/opencli-account-runtime.json \
     && chmod 0644 /etc/chromium/policies/managed/opencli-account-runtime.json
 
-# ── Optional: Chromium + VNC + virtual display ────────────────────────────────
-# Set INSTALL_CHROME=true at build time to embed Chrome in the image.
-# Default: false — connect to Chrome running on the host machine instead.
-# With Chrome:    ~1.2 GB image, self-contained (no host Chrome required)
-# Without Chrome: ~200 MB image, host provides Chrome via OPENCLI_CDP_ENDPOINT
+# ── Chromium + VNC + virtual display ────────────────────────────────────────
+# Account-capable nodes require a supervised browser stack in this image.
 RUN if [ "$INSTALL_CHROME" = "true" ]; then \
     apt-get update && apt-get install -y --no-install-recommends \
         chromium xvfb fonts-noto-cjk x11vnc novnc websockify nginx gettext-base \
     && rm -rf /var/lib/apt/lists/*; \
+else \
+    echo "INSTALL_CHROME=false produces an anonymous-only node (account runtime disabled)"; \
 fi
 RUN if [ "$BROWSER_ENGINE" = "cloakbrowser" ]; then \
       mkdir -p /opt/cloakbrowser \
@@ -155,18 +154,18 @@ ENV PYTHONPATH=/app \
     OPENCLI_DAEMON_PORT=19825 \
     # Browser Bridge native host transport stays loopback-only inside the VNC agent.
     BBX_TCP_PORT=19826 \
-    BBX_TCP_HOST=127.0.0.1 \
     BBX_TCP_BIND_HOST=127.0.0.1 \
     # Baked at build time so agent_server knows whether Chrome is bundled.
-    # true  → connect to container-local Chrome (localhost)
-    # false → connect to host Chrome (host.docker.internal)
     AGENT_HAS_CHROME=${INSTALL_CHROME} \
-    BROWSER_ENGINE=${BROWSER_ENGINE} \
+    # Account capability is enabled only when operators provision all three
+    # node identity values; absent values fail closed to anonymous-only mode.
+    AGENT_NODE_ID="" \
+    AGENT_NODE_CREDENTIAL_ID="" \
+    AGENT_NODE_CREDENTIAL="" \
     PROFILE_DIR=/home/agent/.config/chromium \
     RUNTIME_STATE_DIR=/home/agent/.local/state/opencli-account-runtime \
     CHROMIUM_POLICY_FILE=/etc/chromium/policies/managed/opencli-account-runtime.json \
     CLOAKBROWSER_CACHE_DIR=/opt/cloakbrowser/cache
-
 USER agent
 
 # Unified VNC Agent ports: noVNC, CDP proxy, Agent WS/HTTP, and legacy OpenCLI.

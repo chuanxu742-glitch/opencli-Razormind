@@ -55,6 +55,10 @@ async def _upsert_node(
     node_type: str = "chrome",
     runtimes: list[str] | None = None,
     runtime_capabilities: dict[str, list[str]] | None = None,
+    node_id: str | None = None,
+    boot_id: str | None = None,
+    credential_id: str | None = None,
+    account_capable: bool = False,
 ) -> "EdgeNode":
     from backend.models.edge_node import EdgeNode
 
@@ -62,11 +66,16 @@ async def _upsert_node(
     node = result.scalar_one_or_none()
     now = _utcnow()
     if node:
+        if node_id is not None and node.id != node_id:
+            raise HTTPException(status_code=409, detail="node identity does not match registered URL")
         node.status = "online"
         node.last_seen_at = now
         node.protocol = protocol
         node.mode = mode
         node.node_type = node_type
+        node.boot_id = boot_id or node.boot_id
+        node.credential_id = credential_id or node.credential_id
+        node.account_capable = account_capable
         if label:
             node.label = label
         if ip:
@@ -77,6 +86,7 @@ async def _upsert_node(
             node.runtime_capabilities = runtime_capabilities
     else:
         node = EdgeNode(
+            **({"id": node_id} if node_id is not None else {}),
             url=url,
             label=label or url,
             protocol=protocol,
@@ -87,6 +97,9 @@ async def _upsert_node(
             ip=ip,
             runtimes=runtimes,
             runtime_capabilities=runtime_capabilities,
+            boot_id=boot_id,
+            credential_id=credential_id,
+            account_capable=account_capable,
         )
         db.add(node)
     await db.flush()
@@ -164,6 +177,11 @@ class NodeRegisterRequest(BaseModel):
     runtimes: list[str] | None = None
     runtime_capabilities: dict[str, list[str]] | None = None
     profile_kind: str = "authenticated"
+    # Account-runtime identity is server-issued/provisioned; URL is not identity.
+    node_id: str | None = None
+    boot_id: str | None = None
+    credential_id: str | None = None
+    account_capable: bool = False
 
 
 @router.post("/register", response_model=ApiResponse[EdgeNodeRead])
@@ -193,6 +211,13 @@ async def register_node(
             status_code=400,
             detail="profile_kind must be 'anonymous' or 'authenticated'",
         )
+    if body.account_capable and (
+        not body.node_id or not body.boot_id or not body.credential_id
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="account-capable registration requires node_id, boot_id, and credential_id",
+        )
 
     ip = _extract_ip(request)
     node = await _upsert_node(
@@ -205,6 +230,10 @@ async def register_node(
         body.node_type,
         runtimes=body.runtimes,
         runtime_capabilities=body.runtime_capabilities,
+        node_id=body.node_id,
+        boot_id=body.boot_id,
+        credential_id=body.credential_id,
+        account_capable=body.account_capable,
     )
     await _write_event(
         db,
@@ -246,13 +275,14 @@ async def register_node(
     await db.commit()
     await db.refresh(node)
 
-    _pool_add(
-        url,
-        body.mode,
-        body.agent_protocol,
-        body.node_type,
-        body.profile_kind,
-    )
+    if not body.account_capable:
+        _pool_add(
+            url,
+            body.mode,
+            body.agent_protocol,
+            body.node_type,
+            body.profile_kind,
+        )
     logger.info(
         "Node registered (HTTP): %s (node_type=%s mode=%s label=%r)",
         url,
@@ -799,6 +829,10 @@ async def node_ws_endpoint(ws: WebSocket) -> None:
         if data.get("type") != "register":
             await ws.close(code=1008, reason="Expected 'register' message first")
             return
+        node_id = data.get("node_id")
+        boot_id = data.get("boot_id")
+        credential_id = data.get("credential_id")
+        account_capable = bool(data.get("account_capable", False))
 
         agent_url = data.get("agent_url", "").rstrip("/")
         mode = data.get("mode", "bridge")
@@ -843,6 +877,12 @@ async def node_ws_endpoint(ws: WebSocket) -> None:
                 reason="profile_kind must be 'anonymous' or 'authenticated'",
             )
             return
+        if account_capable and (not node_id or not boot_id or not credential_id):
+            await ws.close(
+                code=1008,
+                reason="account-capable registration requires node identity",
+            )
+            return
 
         # ── 2. Upsert node + write event ──────────────────────────────────
         try:
@@ -856,6 +896,10 @@ async def node_ws_endpoint(ws: WebSocket) -> None:
                     node_type=node_type,
                     runtimes=runtimes,
                     runtime_capabilities=runtime_capabilities,
+                    node_id=node_id,
+                    boot_id=boot_id,
+                    credential_id=credential_id,
+                    account_capable=account_capable,
                 )
                 await _write_event(
                     db,
@@ -896,7 +940,8 @@ async def node_ws_endpoint(ws: WebSocket) -> None:
         except Exception as exc:
             logger.warning("WS node %s: DB upsert failed (non-fatal): %s", agent_url, exc)
 
-        _pool_add(agent_url, mode, "ws", node_type, profile_kind)
+        if not account_capable:
+            _pool_add(agent_url, mode, "ws", node_type, profile_kind)
         ws_agent_manager.register_connection(agent_url, ws)
         await ws.send_json({"type": "registered", "agent_url": agent_url})
         logger.info(

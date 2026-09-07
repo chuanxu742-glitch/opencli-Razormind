@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 
 _RUNTIME_VERSION = "1.0"
@@ -1533,6 +1533,223 @@ def _read_pointer(path: Path) -> str | None:
     except OSError as exc:
         raise BrowserRuntimeError("profile_manifest_invalid", "snapshot pointer cannot be read") from exc
     return value or None
+
+
+@dataclass(frozen=True)
+class SessionRuntimeBinding:
+    """Server-owned endpoints for one isolated account session.
+
+    A binding is deliberately not part of the wire request.  The center/runtime
+    supervisor installs it after allocating the isolated stack; dispatch only
+    resolves an exact session/node/epoch tuple from this registry.
+    """
+
+    session_id: str
+    node_id: str
+    boot_id: str
+    epoch: int
+    cdp_endpoint: str
+    bbx_remote: str
+    daemon_endpoint: str
+    profile_dir: Path
+    home_dir: Path
+    cache_dir: Path
+    display: str
+    cdp_port: int
+    bbx_port: int
+    daemon_port: int
+
+    def validate(self) -> None:
+        for field_name, value in (
+            ("session_id", self.session_id),
+            ("node_id", self.node_id),
+            ("boot_id", self.boot_id),
+        ):
+            _validate_id(value, field_name, max_length=255)
+        if self.epoch < 0:
+            raise BrowserRuntimeError("epoch_invalid", "session epoch must be non-negative")
+        stack = StackIsolation(
+            display=self.display,
+            cdp_port=self.cdp_port,
+            bbx_port=self.bbx_port,
+            daemon_port=self.daemon_port,
+            home_dir=self.home_dir,
+            cache_dir=self.cache_dir,
+            profile_dir=self.profile_dir,
+        )
+        stack.validate()
+        for name, endpoint in (
+            ("cdp_endpoint", self.cdp_endpoint),
+            ("bbx_remote", self.bbx_remote),
+            ("daemon_endpoint", self.daemon_endpoint),
+        ):
+            parsed = urlparse(endpoint)
+            if parsed.scheme not in {"http", "https", "ws", "wss"} or parsed.hostname not in {
+                "127.0.0.1",
+                "localhost",
+                "::1",
+            }:
+                raise BrowserRuntimeError(
+                    "runtime_endpoint_invalid",
+                    f"{name} must resolve to the isolated local runtime",
+                )
+        expected_cdp = f"http://127.0.0.1:{self.cdp_port}"
+        if self.cdp_endpoint.rstrip("/") != expected_cdp:
+            raise BrowserRuntimeError("runtime_endpoint_invalid", "CDP endpoint does not match session port")
+
+    def environment(self, base: Mapping[str, str] | None = None) -> dict[str, str]:
+        self.validate()
+        isolation = StackIsolation(
+            display=self.display,
+            cdp_port=self.cdp_port,
+            bbx_port=self.bbx_port,
+            daemon_port=self.daemon_port,
+            home_dir=self.home_dir,
+            cache_dir=self.cache_dir,
+            profile_dir=self.profile_dir,
+        )
+        env = isolation.environment(base)
+        env["BBX_REMOTE"] = self.bbx_remote
+        env["OPENCLI_DAEMON_ENDPOINT"] = self.daemon_endpoint
+        return env
+
+
+class SessionRuntimeRegistry:
+    """In-memory server-side binding registry with exact-generation fencing."""
+
+    def __init__(self) -> None:
+        self._bindings: dict[str, SessionRuntimeBinding] = {}
+        self._lock = threading.RLock()
+
+    def register(self, binding: SessionRuntimeBinding) -> None:
+        binding.validate()
+        with self._lock:
+            existing = self._bindings.get(binding.session_id)
+            if existing is not None and (
+                existing.node_id != binding.node_id
+                or existing.boot_id != binding.boot_id
+                or existing.epoch != binding.epoch
+            ):
+                raise BrowserRuntimeError("stale_runtime_binding", "session runtime generation is already fenced")
+            self._bindings[binding.session_id] = binding
+
+    def resolve(
+        self,
+        *,
+        session_id: str,
+        node_id: str,
+        boot_id: str,
+        epoch: int,
+    ) -> SessionRuntimeBinding:
+        with self._lock:
+            binding = self._bindings.get(session_id)
+        if binding is None:
+            raise BrowserRuntimeError("capability_missing", "session runtime binding is unavailable")
+        if (
+            binding.node_id != node_id
+            or binding.boot_id != boot_id
+            or binding.epoch != epoch
+        ):
+            raise BrowserRuntimeError("stale_runtime_binding", "session runtime generation is no longer current")
+        binding.validate()
+        return binding
+
+    def revoke(self, *, session_id: str, node_id: str, boot_id: str, epoch: int) -> None:
+        with self._lock:
+            binding = self._bindings.get(session_id)
+            if binding is None:
+                return
+            if (
+                binding.node_id != node_id
+                or binding.boot_id != boot_id
+                or binding.epoch != epoch
+            ):
+                raise BrowserRuntimeError("stale_runtime_binding", "cannot revoke a newer runtime generation")
+            self._bindings.pop(session_id, None)
+
+
+@dataclass(frozen=True)
+class RuntimeLeaseAdmission:
+    """Local authenticated claim/renew/result admission, never a scheduler."""
+
+    claim: Any
+    session: Any
+    node_identity: Any
+    result: Any | None = None
+
+
+class AuthenticatedRuntimeLeaseBook:
+    """Fail-closed local fencing for commands accepted by an edge node."""
+
+    def __init__(self) -> None:
+        self._claims: dict[str, RuntimeLeaseAdmission] = {}
+        self._lock = threading.RLock()
+
+    def claim(self, *, claim: Any, session: Any, node_identity: Any, now: datetime | None = None) -> RuntimeLeaseAdmission:
+        current = now or _now()
+        if node_identity.node_id != claim.node_id or node_identity.boot_id != claim.boot_id:
+            raise BrowserRuntimeError("node_identity_mismatch", "claim identity does not match authenticated node")
+        if current >= claim.expires_at:
+            raise BrowserRuntimeError("claim_expired", "claim deadline has passed")
+        if session.session_id != claim.session_id or session.node_id != claim.node_id:
+            raise BrowserRuntimeError("session_claim_mismatch", "session is not owned by claim")
+        if session.node_boot_id != claim.boot_id or session.epoch != claim.epoch:
+            raise BrowserRuntimeError("session_claim_mismatch", "session generation is not owned by claim")
+        admission = RuntimeLeaseAdmission(claim, session, node_identity)
+        with self._lock:
+            existing = self._claims.get(claim.command_id)
+            if existing is not None and existing.claim != claim:
+                raise BrowserRuntimeError("duplicate_claim", "command is already claimed by another generation")
+            self._claims[claim.command_id] = admission
+        return admission
+
+    def renew(self, *, claim: Any, node_identity: Any, now: datetime | None = None) -> RuntimeLeaseAdmission:
+        current = now or _now()
+        if node_identity.node_id != claim.node_id or node_identity.boot_id != claim.boot_id:
+            raise BrowserRuntimeError("node_identity_mismatch", "renewal identity does not match authenticated node")
+        with self._lock:
+            admission = self._claims.get(claim.command_id)
+        if admission is None or admission.claim != claim:
+            raise BrowserRuntimeError("stale_claim", "renewal does not match the admitted claim")
+        if current >= claim.expires_at:
+            raise BrowserRuntimeError("claim_expired", "claim deadline has passed")
+        return admission
+
+    def result(self, *, result: Any, node_identity: Any, now: datetime | None = None) -> RuntimeLeaseAdmission:
+        if node_identity.node_id != result.node_id or node_identity.boot_id != result.boot_id:
+            raise BrowserRuntimeError("node_identity_mismatch", "result identity does not match authenticated node")
+        with self._lock:
+            admission = self._claims.get(result.command_id)
+            if admission is None:
+                raise BrowserRuntimeError("stale_claim", "result has no admitted claim")
+            claim = admission.claim
+            if (
+                result.workspace_id != claim.workspace_id
+                or result.account_id != claim.account_id
+                or result.session_id != claim.session_id
+                or result.epoch != claim.epoch
+                or result.expected_revision != claim.expected_revision
+            ):
+                raise BrowserRuntimeError("result_claim_mismatch", "result does not match its claim")
+            updated = RuntimeLeaseAdmission(admission.claim, admission.session, admission.node_identity, result)
+            self._claims[result.command_id] = updated
+            return updated
+
+    def revoke(self, command_id: str) -> None:
+        with self._lock:
+            self._claims.pop(command_id, None)
+
+
+_SESSION_RUNTIME_REGISTRY = SessionRuntimeRegistry()
+_RUNTIME_LEASE_BOOK = AuthenticatedRuntimeLeaseBook()
+
+
+def session_runtime_registry() -> SessionRuntimeRegistry:
+    return _SESSION_RUNTIME_REGISTRY
+
+
+def runtime_lease_book() -> AuthenticatedRuntimeLeaseBook:
+    return _RUNTIME_LEASE_BOOK
 
 
 def _cli(argv: Sequence[str]) -> int:

@@ -5,15 +5,30 @@ import csv
 import io
 import json
 import logging
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 import yaml
 from fastapi import HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from backend.agent_runtimes.base import AgentTask, RuntimeInvocationError
 from backend.agent_runtimes.registry import get_runtime
+from backend.browser_account_runtime import (
+    BrowserRuntimeError,
+    SessionRuntimeBinding,
+    runtime_lease_book,
+    session_runtime_registry,
+)
+from backend.schemas.browser_account import (
+    CommandExecutionGuardV1,
+    DurableCommandV1,
+    NodeClaimV1,
+    NodeIdentityV1,
+    SessionEnvelopeV1,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -21,12 +36,92 @@ logger = logging.getLogger(__name__)
 class RuntimeInvokeRequest(BaseModel):
     """Structured runtime action forwarded only from an allowlisted bundle."""
 
+    model_config = ConfigDict(extra="forbid")
+
     runtime: str
     workflow: str
-    instructions: str
+    instructions: str = ""
     input: dict[str, Any] = {}
     config: dict[str, Any] = {}
+    # Account dispatch is admitted only with the existing typed claim/session
+    # envelope.  The edge never accepts a client endpoint as a substitute.
+    command: DurableCommandV1 | None = None
+    claim: NodeClaimV1 | None = None
+    session: SessionEnvelopeV1 | None = None
+    node_identity: NodeIdentityV1 | None = None
 
+
+@dataclass(frozen=True)
+class AccountRuntimeContext:
+    guard: CommandExecutionGuardV1
+    binding: SessionRuntimeBinding
+
+    @property
+    def cdp_endpoint(self) -> str:
+        return self.binding.cdp_endpoint
+
+    @property
+    def server_config(self) -> dict[str, Any]:
+        # Only non-secret process routing facts are projected into the adapter.
+        # The caller's config is never allowed to override these values.
+        return {
+            "remote": self.binding.bbx_remote,
+            "daemon_endpoint": self.binding.daemon_endpoint,
+            "profile_dir": str(self.binding.profile_dir),
+            "home_dir": str(self.binding.home_dir),
+            "cache_dir": str(self.binding.cache_dir),
+            "display": self.binding.display,
+            "cdp_endpoint": self.binding.cdp_endpoint,
+        }
+
+
+def resolve_account_runtime_context(req: RuntimeInvokeRequest) -> AccountRuntimeContext:
+    """Validate a server-resolved command/claim/session tuple before side effects."""
+
+    if req.command is None or req.claim is None or req.session is None or req.node_identity is None:
+        raise HTTPException(
+            status_code=409,
+            detail="account runtime dispatch requires command, claim, session, and node identity",
+        )
+    try:
+        guard = CommandExecutionGuardV1(
+            command=req.command,
+            claim=req.claim,
+            session=req.session,
+        )
+        binding = session_runtime_registry().resolve(
+            session_id=guard.session.session_id,
+            node_id=guard.claim.node_id,
+            boot_id=guard.claim.boot_id,
+            epoch=guard.claim.epoch,
+        )
+        runtime_lease_book().renew(
+            claim=guard.claim,
+            node_identity=req.node_identity,
+            now=datetime.now(UTC),
+        )
+    except (ValueError, BrowserRuntimeError) as exc:
+        code = exc.code if isinstance(exc, BrowserRuntimeError) else "runtime_context_invalid"
+        raise HTTPException(status_code=409, detail=code) from exc
+    if (
+        req.node_identity.node_id != guard.claim.node_id
+        or req.node_identity.boot_id != guard.claim.boot_id
+    ):
+        raise HTTPException(status_code=401, detail="authenticated node identity does not own claim")
+    forbidden = {
+        "remote",
+        "binary",
+        "cdp_endpoint",
+        "endpoint",
+        "daemon_endpoint",
+        "profile_dir",
+        "home_dir",
+        "cache_dir",
+        "display",
+    }
+    if forbidden.intersection(req.config):
+        raise HTTPException(status_code=400, detail="client runtime routing override is forbidden")
+    return AccountRuntimeContext(guard=guard, binding=binding)
 
 async def snapshot_tab_ids(cdp_endpoint: str) -> set[str]:
     """Return the set of tab IDs currently open in Chrome."""
@@ -184,13 +279,35 @@ async def invoke_runtime(
     request_id: str,
     req: RuntimeInvokeRequest,
     *,
-    cdp_endpoint: str,
+    cdp_endpoint: str | None = None,
+    account_context: AccountRuntimeContext | None = None,
 ) -> dict:
     if req.runtime == "codex":
         raise HTTPException(
             status_code=403,
             detail="Codex runtime is only available through controller WS dispatch",
         )
+    if account_context is not None:
+        cdp_endpoint = account_context.cdp_endpoint
+        server_config = account_context.server_config
+        # The account binding is the only authority for process routing.  The
+        # client request can carry action arguments but never endpoint/binary
+        # selection or BBX remote targets.
+        merged_config = dict(server_config)
+        merged_config.update({key: value for key, value in req.config.items() if key not in {
+            "remote",
+            "binary",
+            "cdp_endpoint",
+            "endpoint",
+            "daemon_endpoint",
+            "profile_dir",
+            "home_dir",
+            "cache_dir",
+            "display",
+        }})
+        req = req.model_copy(update={"config": merged_config})
+    if not cdp_endpoint:
+        raise HTTPException(status_code=503, detail="runtime session has no server-resolved CDP binding")
     if req.runtime == "script-host":
         return await invoke_script_host(req, cdp_endpoint=cdp_endpoint)
     try:

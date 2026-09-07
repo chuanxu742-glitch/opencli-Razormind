@@ -60,6 +60,13 @@ from typing import Any
 
 from fastapi import WebSocket
 
+from backend.schemas.browser_account import (
+    CommandExecutionGuardV1,
+    DurableCommandV1,
+    NodeClaimV1,
+    NodeIdentityV1,
+    SessionEnvelopeV1,
+)
 logger = logging.getLogger(__name__)
 
 # agent_url → active WebSocket connection
@@ -179,35 +186,53 @@ def resolve_response(request_id: str, result: dict[str, Any]) -> None:
         return
     fut.set_result(result)
 
-
-# ── Streaming agent-task dispatch ───────────────────────────────────────────
-# Alongside the collect/result single-shot path above: agent_task/agent_event/
-# agent_result support a long-running streaming task with N intermediate
-# events before the terminal result.
-
-
 async def send_agent_task(
     agent_url: str,
     task: dict[str, Any],
     on_event: Callable[[dict[str, Any]], Any],
     timeout: float = 600.0,
 ) -> dict[str, Any]:
-    """Send an agent_task to a WS agent, streaming events to *on_event* as
-    they arrive, and return the terminal result dict once received.
+    """Send one server-resolved runtime envelope over the reverse channel."""
 
-    *on_event* is called once per ``agent_event`` frame with that frame's
-    ``event`` payload. It may be a plain sync callable or an async callable
-    (coroutine function) — both are supported, matching the flexibility the
-    edge side (adapters) already assumes for callers.
-
-    Raises:
-        RuntimeError: agent is not connected.
-        TimeoutError: agent did not respond within *timeout* seconds. Pending
-            bookkeeping (the callback registration) is cleaned up either way.
-    """
     ws = _connections.get(agent_url)
     if ws is None:
         raise RuntimeError(f"No active WS connection for agent: {agent_url}")
+
+    payload = dict(task)
+    account_fields = ("command", "claim", "session", "node_identity")
+    if any(payload.get(field) is not None for field in account_fields):
+        try:
+            command = DurableCommandV1.model_validate(payload.get("command"))
+            claim = NodeClaimV1.model_validate(payload.get("claim"))
+            session = SessionEnvelopeV1.model_validate(payload.get("session"))
+            identity = NodeIdentityV1.model_validate(payload.get("node_identity"))
+            if identity.node_id != claim.node_id or identity.boot_id != claim.boot_id:
+                raise ValueError("runtime node identity does not match claim")
+            CommandExecutionGuardV1(command=command, claim=claim, session=session)
+        except ValueError as exc:
+            raise ValueError("invalid account runtime envelope") from exc
+        config = payload.get("config") or {}
+        forbidden = {
+            "remote",
+            "binary",
+            "cdp_endpoint",
+            "endpoint",
+            "daemon_endpoint",
+            "profile_dir",
+            "home_dir",
+            "cache_dir",
+            "display",
+        }
+        if forbidden.intersection(config):
+            raise ValueError("client runtime routing override is forbidden")
+        payload.update(
+            {
+                "command": command.model_dump(mode="json"),
+                "claim": claim.model_dump(mode="json"),
+                "session": session.model_dump(mode="json"),
+                "node_identity": identity.model_dump(mode="json"),
+            }
+        )
 
     request_id = str(uuid.uuid4())
     loop = asyncio.get_running_loop()
@@ -216,9 +241,13 @@ async def send_agent_task(
     _agent_task_callbacks[request_id] = (on_event, agent_url)
 
     try:
-        await ws.send_json({"type": "agent_task", "request_id": request_id, **task})
-        logger.debug("WS agent_task dispatch | agent=%s request_id=%s runtime=%s",
-                     agent_url, request_id, task.get("runtime"))
+        await ws.send_json({"type": "agent_task", "request_id": request_id, **payload})
+        logger.debug(
+            "WS agent_task dispatch | agent=%s request_id=%s runtime=%s",
+            agent_url,
+            request_id,
+            payload.get("runtime"),
+        )
         return await asyncio.wait_for(fut, timeout=timeout)
     except TimeoutError:
         await _cancel_agent_task(ws, request_id)

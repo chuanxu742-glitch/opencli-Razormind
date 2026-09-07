@@ -87,13 +87,17 @@ async def add_chrome_instance(
     if clean_agent_protocol and clean_agent_protocol not in ("http", "ws"):
         raise HTTPException(status_code=400, detail="agent_protocol must be 'http' or 'ws'")
     clean_profile_name = profile_name.strip() or None
+    if runtime_bundle_id and (clean_agent_url or clean_agent_protocol):
+        raise HTTPException(
+            status_code=409,
+            detail="account runtime endpoints are server-resolved; agent routing override is forbidden",
+        )
+    selected_bundle = None
     if count > 1 and clean_profile_name:
         raise HTTPException(
             status_code=400,
             detail="profile_name can only be used when creating one instance",
         )
-
-    selected_bundle = None
     if runtime_bundle_id:
         selected_bundle = await browser_service.get_runtime_bundle(db, runtime_bundle_id)
         if selected_bundle is None:
