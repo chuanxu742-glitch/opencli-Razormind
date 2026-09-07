@@ -343,3 +343,17 @@ export const redeemBrowserPortalTicket = (
       },
     )
     .then((response) => response.data.data)
+export interface BrowserWorkspaceMember {
+  user_id: string
+  subject: string
+  email: string | null
+  display_name: string | null
+  disabled: boolean
+  role: 'admin' | 'maintainer' | 'operator' | 'viewer'
+  created_at: string
+}
+
+export const listBrowserWorkspaceMembers = (workspaceId: string) =>
+  apiClient
+    .get<ApiResponse<BrowserWorkspaceMember[]>>(`/workspaces/${encodeURIComponent(workspaceId)}/members`)
+    .then((response) => response.data.data)
