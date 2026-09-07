@@ -8,6 +8,10 @@ on:
       - codex/**
   pull_request:
   workflow_dispatch:
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
 
 permissions:
   contents: read
@@ -15,6 +19,7 @@ permissions:
 jobs:
   extension:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     name: Browser Extension
     defaults:
       run:
@@ -48,6 +53,7 @@ jobs:
 
   frontend:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     name: Next Frontend
     defaults:
       run:
@@ -98,6 +104,7 @@ jobs:
 
   release-contract:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     name: Source Recovery Smoke
     env:
       API_AUTH_TOKEN: ci-release-token
@@ -144,6 +151,7 @@ jobs:
 
   backend:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     name: Backend Quality
     steps:
       - name: Checkout
@@ -178,6 +186,9 @@ jobs:
       - name: Backend syntax check
         run: uv run python -m compileall backend
 
+      - name: Managed runtime lifecycle regressions
+        run: uv run pytest tests/unit/test_browser_account_runtime_allocator.py --no-cov -q
+
       # Coverage visibility, not a gate: pyproject.toml bakes in
       # `--cov-fail-under=80` via [tool.pytest.ini_options].addopts, but the
       # current suite sits at ~70% total. Enforcing 80% here would turn CI red
@@ -197,6 +208,7 @@ jobs:
 
   frontend-workflow-checks:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     name: Frontend Workflow Checks
     defaults:
       run:
@@ -232,6 +244,7 @@ jobs:
 
   migrations:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     name: Alembic Migrations
     services:
       postgres:
@@ -305,6 +318,7 @@ jobs:
 
   cargo:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     name: ODP Rust (odp-rs)
     defaults:
       run:
@@ -339,3 +353,67 @@ jobs:
 
       - name: cargo clippy --workspace -- -D warnings
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+  ci-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    name: CI Gate
+    if: ${{ always() }}
+    needs:
+      - extension
+      - frontend
+      - release-contract
+      - backend
+      - frontend-workflow-checks
+      - migrations
+      - cargo
+    steps:
+      - name: Reject incomplete CI
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import sys
+
+          required = {
+              "extension",
+              "frontend",
+              "release-contract",
+              "backend",
+              "frontend-workflow-checks",
+              "migrations",
+              "cargo",
+          }
+          try:
+              needs = json.loads(os.environ["NEEDS_JSON"])
+          except (KeyError, json.JSONDecodeError):
+              print("CI Gate requires a valid needs payload.", file=sys.stderr)
+              raise SystemExit(1)
+
+          if (
+              not isinstance(needs, dict)
+              or set(needs) != required
+              or any(
+                  not isinstance(needs[job], dict)
+                  or needs[job].get("result") != "success"
+                  for job in required
+              )
+          ):
+              print("CI Gate requires every required CI job to succeed.", file=sys.stderr)
+              raise SystemExit(1)
+          PY
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Run release gate offline tests
+        run: node --test .github/scripts/require-release-ci.test.cjs
