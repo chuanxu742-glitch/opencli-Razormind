@@ -15,6 +15,8 @@ from backend.models.source import DataSource
 from backend.pipeline import events
 from backend.pipeline.error_taxonomy import effective_error_type, is_captcha, is_retryable
 
+from backend.pipeline.sinks.base import RunContext
+from backend.pipeline.sinks.strategy import select_sink
 logger = logging.getLogger(__name__)
 
 
@@ -112,6 +114,96 @@ class PipelineResult:
     duration_ms: int = 0
     metadata: dict[str, Any] = field(default_factory=dict)
 
+def _display_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
+    """Return log-safe execution parameters without session object reprs."""
+    displayed: dict[str, Any] = {}
+    for key, value in parameters.items():
+        if key in {"_account_session", "_execution_context", "_account_ref"}:
+            continue
+        displayed[key] = value
+    account_ref = parameters.get("_account_ref")
+    if account_ref is not None and hasattr(account_ref, "to_wire"):
+        displayed["account_ref"] = account_ref.to_wire()
+    return displayed
+
+
+def _account_execution_inputs(
+    source: DataSource, parameters: dict[str, Any]
+) -> tuple[Any, Any] | None:
+    """Build the explicit account reference/context; never infer from site."""
+    from backend.schemas.browser_account import AccountRef, ExecutionContextV1
+
+    raw_ref = parameters.get("account_ref") or parameters.get("accountRef")
+    config = source.channel_config or {}
+    if raw_ref is None:
+        raw_account_id = (
+            parameters.get("account_id")
+            or parameters.get("accountId")
+            or config.get("account_id")
+            or config.get("accountId")
+        )
+        raw_workspace_id = (
+            parameters.get("workspace_id")
+            or parameters.get("workspaceId")
+            or config.get("workspace_id")
+            or config.get("workspaceId")
+        )
+        if raw_account_id is None and raw_workspace_id is None:
+            return None
+        raw_ref = {
+            "workspace_id": raw_workspace_id,
+            "account_id": raw_account_id,
+            "source_binding_revision_id": (
+                parameters.get("source_binding_revision_id")
+                or parameters.get("sourceBindingRevisionId")
+                or config.get("source_binding_revision_id")
+                or config.get("sourceBindingRevisionId")
+            ),
+        }
+    ref = raw_ref if isinstance(raw_ref, AccountRef) else AccountRef.from_wire(raw_ref)
+    execution_id = parameters.get("execution_id") or parameters.get("executionId") or ""
+    caller_id = parameters.get("caller_id") or parameters.get("callerId") or ""
+    if not execution_id or not caller_id:
+        raise ValueError("account execution requires execution_id and caller_id")
+    context = ExecutionContextV1(
+        account_ref=ref,
+        execution_id=str(execution_id),
+        run_id=str(parameters.get("run_id") or parameters.get("runId"))
+        if parameters.get("run_id") or parameters.get("runId")
+        else None,
+        caller_id=str(caller_id),
+        source_binding_revision_id=(
+            parameters.get("source_binding_revision_id")
+            or parameters.get("sourceBindingRevisionId")
+            or ref.source_binding_revision_id
+        ),
+    )
+    return ref, context
+
+
+async def _resolve_account_execution(
+    source: DataSource, parameters: dict[str, Any]
+) -> tuple[Any, Any] | None:
+    inputs = _account_execution_inputs(source, parameters)
+    if inputs is None:
+        return None
+    ref, context = inputs
+    from backend.database import AsyncSessionLocal, commit_session
+    from backend.services.browser_account_service import resolve_account_session
+    from backend.schemas.browser_account import SessionEnvelopeV1
+
+    async with AsyncSessionLocal() as session:
+        resolution = await resolve_account_session(session, ref, context)
+        # Resolution may enqueue wake/restore work and may update the session
+        # fence. Commit while the owned session is still open so waiting does
+        # not roll back the progress needed by the next scheduler pass.
+        await commit_session(session)
+    if isinstance(resolution, SessionEnvelopeV1):
+        return ref, resolution
+    status = getattr(resolution, "status", "blocked")
+    code = getattr(resolution, "error_code", None) or getattr(resolution, "reason", None)
+    raise RuntimeError(f"account session {status}: {code or 'unavailable'}")
+
 
 async def _notify_task_failed(
     task_id: str, source_id: str, *, error: str, error_type: str | None
@@ -160,85 +252,100 @@ async def run_pipeline(
     from backend.pipeline import ai_processor, collector, notifier_dispatch
 
     started = datetime.now(timezone.utc)
-    params = parameters or {}
-    # Pre-step: auto-resolve chrome endpoint from a browser binding. Channels that
-    # declare capabilities.session_affinity (opencli, skill) drive a real Chrome
-    # from the shared pool, so a site-keyed binding lets them attach to a
-    # logged-in browser. Best-effort: a missing binding is not an error
-    # (browser_pool.acquire(endpoint=None) picks a default), so we only override
-    # chrome_endpoint when a binding exists. Gated by the capability rather than a
-    # hardcoded channel list, so a new session-bound channel needs no change here.
-    from backend.channels.registry import get_channel
-
+    params = dict(parameters or {})
+    account_ref = None
+    account_session = None
     try:
-        _affinity_channel = get_channel(source.channel_type)
-    except Exception:
-        _affinity_channel = None  # unknown channel_type surfaces in the collect step
-    if (
-        _affinity_channel is not None
-        and _affinity_channel.capabilities.session_affinity
-        and not params.get("chrome_endpoint")
+        resolved_account = await _resolve_account_execution(source, params)
+    except ValueError as exc:
+        return PipelineResult(
+            success=False,
+            source_id=source.id,
+            error=str(exc),
+            metadata={"account_resolution": "blocked", "error_code": "invalid_account_context"},
+        )
+    except Exception as exc:
+        logger.warning("[task:%s] account session resolution failed: %s", task_id, exc)
+        return PipelineResult(
+            success=False,
+            source_id=source.id,
+            error=str(exc),
+            metadata={"account_resolution": "blocked", "error_code": "account_session_unavailable"},
+        )
+    if resolved_account is not None:
+        account_ref, account_session = resolved_account
+        params["_account_ref"] = account_ref
+        params["_account_session"] = account_session
+        params["_execution_context"] = _account_execution_inputs(source, params)[1]
+    account_bound = account_session is not None
+    for key in (
+        "account_ref", "accountRef", "account_id", "accountId",
+        "workspace_id", "workspaceId", "source_binding_revision_id",
+        "sourceBindingRevisionId", "caller_id", "callerId",
     ):
-        site = source.channel_config.get("site", "")
-        if site:
-            from backend.services import browser_service
-            async with AsyncSessionLocal() as session:
-                binding = await browser_service.get_binding_by_site(session, site)
-                if binding:
-                    params = {**params, "chrome_endpoint": binding.browser_endpoint}
-                    logger.info("[task:%s] auto-binding | site=%s → %s",
-                                task_id, site, binding.browser_endpoint)
-
-    # Step 1: Collect
-    logger.info("[task:%s] step1/collect start | source=%s channel=%s params=%s",
-                task_id, source.name, source.channel_type, params)
+        params.pop(key, None)
+    if account_bound:
+        # A resolved lease, not a user-supplied endpoint, determines routing.
+        params.pop("chrome_endpoint", None)
+        params.pop("required_profile_kind", None)
+    logger.info(
+        "[task:%s] step1/collect start | source=%s channel=%s params=%s",
+        task_id,
+        source.name,
+        source.channel_type,
+        _display_parameters(params),
+    )
     step1_start = datetime.now(timezone.utc)
 
     if run_id:
-        # Skill channel: inject run_id into params BEFORE dispatch so the loop can
-        # emit per-step events via events.emit(run_id, ...). Scoped to "skill" —
-        # other channels don't expect a run_id param. (chrome_endpoint, if any,
-        # was already injected by the pre-step binding above.)
+        # Skill channel receives the same immutable account envelope as OpenCLI.
         if source.channel_type == "skill":
             params = {**params, "run_id": run_id}
-        collect_detail: dict = {"channel_type": source.channel_type, "params": params}
+        collect_detail: dict = {"channel_type": source.channel_type}
+        if account_ref is not None:
+            collect_detail["account_ref"] = account_ref.to_wire()
+            collect_detail["source_binding_revision_id"] = account_ref.source_binding_revision_id
+        else:
+            collect_detail["params"] = _display_parameters(params)
         if source.channel_type == "skill":
             _skill_md = source.channel_config.get("skill_md") or ""
             collect_detail["skill"] = {
                 "skill_chars": len(_skill_md),
+                "has_account_session": account_bound,
                 "has_chrome_endpoint": bool(params.get("chrome_endpoint")),
                 "auto_confirm": bool(source.channel_config.get("auto_confirm", False)),
             }
         if source.channel_type == "opencli":
             from backend.channels.opencli_channel import _OPENCLI_BIN, _peek_named_options
             cfg = source.channel_config
-            _site = cfg.get("site", "")
-            _cmd = cfg.get("command", "")
-            _raw_args = {**cfg.get("args", {}), **{k: v for k, v in params.items() if k != "chrome_endpoint"}}
-            _pos = [str(v) for v in cfg.get("positional_args", [])]
+            _raw_args = {
+                **cfg.get("args", {}),
+                **{
+                    k: v
+                    for k, v in _display_parameters(params).items()
+                    if k != "chrome_endpoint"
+                },
+            }
             _fmt = cfg.get("format", "json")
-            # Apply same positional-resolution logic as the channel, but this
-            # detail string is display-only (the channel's own collect() call
-            # re-derives named options for real dispatch) — so peek the cache
-            # instead of spawning an opencli --help subprocess on the
-            # collection hot path just to format a log line (C17). A cache
-            # miss here behaves exactly like a failed --help fetch always
-            # did: fall through and treat every raw arg as a named option.
-            _named_opts = _peek_named_options(_OPENCLI_BIN, _site, _cmd) or frozenset()
+            _named_opts = _peek_named_options(
+                _OPENCLI_BIN, cfg.get("site", ""), cfg.get("command", "")
+            ) or frozenset()
             _named_args, _extra_pos = {}, []
             for k, v in _raw_args.items():
                 if _named_opts and k not in _named_opts:
                     _extra_pos.append(str(v))
                 else:
                     _named_args[k] = v
-            _all_pos = _extra_pos + _pos
-            _parts = ["opencli", _site, _cmd] + _all_pos
+            _all_pos = _extra_pos + [str(v) for v in cfg.get("positional_args", [])]
+            _parts = ["opencli", cfg.get("site", ""), cfg.get("command", "")]
+            _parts += _all_pos
             for k, v in _named_args.items():
                 _parts += [f"--{k}", str(v)]
             _parts += ["-f", _fmt]
             collect_detail["command"] = " ".join(_parts)
         await events.emit(
-            run_id, "collect",
+            run_id,
+            "collect",
             f"开始采集 | 渠道={source.channel_type} 数据源={source.name}",
             detail=collect_detail,
         )
@@ -274,6 +381,13 @@ async def run_pipeline(
                 task_id, source.id, error=str(exc), error_type=error_type
             )
         return PipelineResult(success=False, source_id=source.id, error=str(exc))
+    if account_ref is not None:
+        # Preserve the fixed binding revision in the original result lineage.
+        channel_result.metadata.setdefault("account_ref", account_ref.to_wire())
+        channel_result.metadata.setdefault(
+            "source_binding_revision_id", account_ref.source_binding_revision_id
+        )
+        channel_result.metadata.setdefault("session_envelope", account_session.to_wire())
 
     if not channel_result.success:
         logger.error(
@@ -360,20 +474,17 @@ async def run_pipeline(
             elapsed_ms=step1_elapsed,
         )
 
+    active_sink = sink or select_sink(getattr(source, "write_strategy", None))
     # Steps 2+3: Normalize + Store, behind the write seam. The sink owns its own
     # normalization, dedup, and persistence; the orchestrator stays
-    # destination-agnostic. An explicitly injected sink wins (tests, callers);
-    # otherwise the source's write_strategy selects it (default 'legacy' →
-    # LegacyDbSink, the original inline path).
-    from backend.pipeline.sinks.base import RunContext
-    from backend.pipeline.sinks.strategy import select_sink
-
-    active_sink = sink or select_sink(getattr(source, "write_strategy", None))
     sink_ctx = RunContext(
         task_id=task_id,
         source_id=source.id,
         provider=source.channel_type,
         run_id=run_id,
+        source_binding_revision_id=(
+            account_ref.source_binding_revision_id if account_ref is not None else None
+        ),
         lineage=collection_lineage,
     )
     logger.info("[task:%s] step2-3/sink start | sink=%s items=%d",

@@ -182,6 +182,12 @@ def canonical_collection_payload(collection: IIICollectionRequestV1) -> tuple[di
     }
     if collection.mode is not None:
         payload["mode"] = collection.mode
+    if collection.source_binding_id is not None:
+        payload["source_binding_id"] = collection.source_binding_id
+    if collection.source_binding_revision_id is not None:
+        payload["source_binding_revision_id"] = collection.source_binding_revision_id
+    if collection.source_binding_revision_number is not None:
+        payload["source_binding_revision_number"] = collection.source_binding_revision_number
     return payload, source_id
 
 

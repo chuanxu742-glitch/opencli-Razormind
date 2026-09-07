@@ -248,6 +248,7 @@ def opencli_snapshot_handler(payload: dict[str, Any]) -> dict[str, Any]:
         output_format=str(payload.get("format") or "json"),
         mode=payload.get("mode"),
         chrome_endpoint=payload.get("chrome_endpoint"),
+        account_session=payload.get("account_session"),
     )
     items = collect_result.get("items") or []
     events = opencli_items_to_events(

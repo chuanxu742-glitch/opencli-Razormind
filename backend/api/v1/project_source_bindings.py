@@ -9,6 +9,7 @@ from backend.models.source_binding import (
     SourceBindingRevision,
     SourceRevision,
 )
+from backend.models.browser import BrowserAccount
 from backend.models.workflow import Project
 from backend.schemas.common import ApiResponse
 from backend.schemas.source_binding import (
@@ -38,6 +39,23 @@ async def _get_project(db: AsyncSession, workspace_id: str, project_id: str) -> 
     if project is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Project not found")
     return project
+
+
+async def _account_for_binding(
+    db: AsyncSession, workspace_id: str, account_id: str | None
+) -> BrowserAccount | None:
+    """Validate account selection against the project workspace."""
+    if account_id is None:
+        return None
+    account = await db.scalar(
+        select(BrowserAccount).where(
+            BrowserAccount.workspace_id == workspace_id,
+            BrowserAccount.id == account_id,
+        )
+    )
+    if account is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Browser account not found")
+    return account
 
 
 async def _get_source_in_workspace(db: AsyncSession, workspace_id: str, source_id: str) -> Source:
@@ -113,6 +131,10 @@ async def create_source_binding(
     await _get_project(db, workspace_id, project_id)
     source = await _get_source_in_workspace(db, workspace_id, body.source_id)
     pinned_revision = await _get_source_revision(db, source.id, body.source_revision_number)
+    account_id = body.scope_config.get("account_id") or body.scope_config.get("accountId")
+    if account_id is not None and not isinstance(account_id, str):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "account_id must be a string")
+    await _account_for_binding(db, workspace_id, account_id)
 
     binding = SourceBinding(
         project_id=project_id,
@@ -130,6 +152,8 @@ async def create_source_binding(
             revision_number=1,
             pinned_source_revision_id=pinned_revision.id,
             scope_config=body.scope_config,
+            workspace_id=workspace_id if account_id is not None else None,
+            account_id=account_id,
             created_by_user_id=access.user_id,
         )
     )
@@ -211,6 +235,7 @@ async def create_source_binding_revision(
     await _get_project(db, workspace_id, project_id)
     binding = await _get_binding(db, project_id, binding_id, for_update=True)
     pinned_revision = await _get_source_revision(db, binding.source_id, body.source_revision_number)
+    await _account_for_binding(db, workspace_id, body.account_id)
 
     next_revision = binding.current_revision_number + 1
     revision = SourceBindingRevision(
@@ -218,6 +243,8 @@ async def create_source_binding_revision(
         revision_number=next_revision,
         pinned_source_revision_id=pinned_revision.id,
         scope_config=body.scope_config,
+        workspace_id=workspace_id if body.account_id is not None else None,
+        account_id=body.account_id,
         created_by_user_id=access.user_id,
     )
     db.add(revision)

@@ -64,6 +64,27 @@ if TYPE_CHECKING:  # typing only — keep the LoopResult import out of the cycle
 
 logger = logging.getLogger(__name__)
 
+
+def _account_session_from_parameters(parameters: dict[str, Any]) -> Any | None:
+    value = parameters.get("_account_session") or parameters.get("account_session")
+    if value is None:
+        return None
+    from backend.schemas.browser_account import SessionEnvelopeV1
+
+    return value if isinstance(value, SessionEnvelopeV1) else SessionEnvelopeV1.from_wire(value)
+
+
+async def _set_account_sensitive_guard(session_id: str, enabled: bool) -> None:
+    """Delegate sensitive collection gating to the L-owned implementation."""
+    from backend.skills import perception, record
+
+    guard = getattr(perception, "set_session_sensitive", None)
+    record_guard = getattr(record, "set_session_sensitive", None)
+    if guard is None or record_guard is None:
+        raise RuntimeError("sensitive account-session guard is unavailable")
+    await guard(session_id, enabled)
+    await record_guard(session_id, enabled)
+
 # Step names emitted into TaskRunEvent.step (free-text String(50)). The run-events
 # UI / acceptance tests key on these exact strings (PRD §6; ``self_eval`` is
 # issue 06). ``awaiting_confirm`` is emitted by the loop itself when the gate
@@ -570,13 +591,10 @@ class SkillChannel(AbstractChannel):
             return ChannelResult.fail(err)
 
         run_id = parameters.get("run_id")
+        account_session = _account_session_from_parameters(parameters)
         task = parameters.get("task") or config.get("task") or ""
-        # Cheap executor model (distinct from the distill model). Shape matches
-        # backend.skills.distill provider config.
         provider = config.get("provider", {})
         model = provider.get("model") or "qwen3:4b"
-        # Guardrail: writes (clicks/typing/submits) require explicit confirm
-        # unless the source opts a trusted skill into unattended running.
         auto_confirm = bool(config.get("auto_confirm", False))
 
         try:
@@ -585,12 +603,25 @@ class SkillChannel(AbstractChannel):
             return ChannelResult.fail(str(exc), error_type="SSRFValidationError")
 
         from backend.browser_pool import get_pool
-        from backend.skills.loop import run_skill_loop  # lazy: breaks import cycle
+        from backend.skills.loop import run_skill_loop
         from backend.skills.page import open_skill_page
 
         pool = get_pool()
-        endpoint = parameters.get("chrome_endpoint") or None
-
+        if account_session is not None and parameters.get("chrome_endpoint"):
+            return ChannelResult.fail(
+                "account sessions reject caller-supplied browser endpoints",
+                error_type="AccountRoutingError",
+            )
+        endpoint = (
+            parameters.get("_account_cdp_endpoint")
+            if account_session is not None
+            else parameters.get("chrome_endpoint")
+        ) or None
+        if account_session is not None and not endpoint:
+            return ChannelResult.fail(
+                "account session has no injected runtime endpoint",
+                error_type="NodeUnavailable",
+            )
         try:
             async with pool.acquire(endpoint=endpoint) as cdp_endpoint:
                 mode = pool.get_mode(cdp_endpoint)
@@ -598,13 +629,14 @@ class SkillChannel(AbstractChannel):
                     "skill channel | task=%r mode=%s cdp=%s model=%s confirm=%s run_id=%s",
                     task[:80], mode, cdp_endpoint, model, auto_confirm, run_id,
                 )
-
-                skill_page = await open_skill_page(cdp_endpoint)
+                guard_enabled = False
+                if account_session is not None:
+                    await _set_account_sensitive_guard(account_session.session_id, True)
+                    guard_enabled = True
+                skill_page = None
                 try:
+                    skill_page = await open_skill_page(cdp_endpoint)
                     page = _PerceivingPage(skill_page)
-                    # Drive the perceive → gate → act loop (issues 03/04). The loop
-                    # self-emits the awaiting_confirm event (it has run_id); per-step
-                    # spine events are emitted by this channel below.
                     result = await run_skill_loop(
                         page=page,
                         model_call=model_call,
@@ -618,7 +650,10 @@ class SkillChannel(AbstractChannel):
                         emit=events.emit,
                     )
                 finally:
-                    await skill_page.aclose()
+                    if skill_page is not None:
+                        await skill_page.aclose()
+                    if guard_enabled:
+                        await _set_account_sensitive_guard(account_session.session_id, False)
 
                 # Emit per-step events (best-effort; no-op when no run_id).
                 # AUDIT C24: one session + bulk insert + one commit for the
@@ -688,6 +723,12 @@ class SkillChannel(AbstractChannel):
                 }
                 if result.awaiting_confirm and result.proposed_action is not None:
                     metadata[PROPOSED_ACTION] = result.proposed_action
+                if account_session is not None:
+                    ref = parameters.get("_account_ref")
+                    metadata["account_ref"] = (
+                        ref.to_wire() if hasattr(ref, "to_wire") else ref
+                    )
+                    metadata["session_envelope"] = account_session.to_wire()
                 return ChannelResult.ok(items, **metadata)
         except Exception as exc:
             logger.error("skill channel | browser acquire/exec failed: %s", exc)

@@ -5,6 +5,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.browser import (
+    BrowserAccount,
     BrowserBinding,
     BrowserInstance,
     BrowserRuntimeBundle,
@@ -192,6 +193,49 @@ async def get_binding(session: AsyncSession, binding_id: str) -> BrowserBinding 
 async def get_binding_by_site(session: AsyncSession, site: str) -> BrowserBinding | None:
     result = await session.execute(select(BrowserBinding).where(BrowserBinding.site == site))
     return result.scalar_one_or_none()
+
+
+async def inspect_legacy_binding_migration(session: AsyncSession) -> list[dict[str, object]]:
+    """Report legacy site mappings without guessing account ownership.
+
+    The old rows and physical profile names remain untouched.  A binding is
+    importable only when exactly one existing BrowserAccount owns that profile;
+    otherwise operators receive an explicit migration block.
+    """
+    rows = (
+        await session.execute(select(BrowserBinding).order_by(BrowserBinding.site))
+    ).scalars().all()
+    accounts = (
+        await session.execute(select(BrowserAccount).order_by(BrowserAccount.profile_id))
+    ).scalars().all()
+    by_profile: dict[str, list[BrowserAccount]] = {}
+    for account in accounts:
+        if account.profile_id:
+            by_profile.setdefault(account.profile_id, []).append(account)
+    instances = (
+        await session.execute(select(BrowserInstance))
+    ).scalars().all()
+    profile_by_endpoint = {
+        instance.endpoint: (instance.profile_name or instance.endpoint)
+        for instance in instances
+    }
+    result: list[dict[str, object]] = []
+    for binding in rows:
+        profile_name = profile_by_endpoint.get(binding.browser_endpoint, binding.browser_endpoint)
+        matches = by_profile.get(profile_name, [])
+        result.append(
+            {
+                "binding_id": binding.id,
+                "site": binding.site,
+                "browser_endpoint": binding.browser_endpoint,
+                "profile_name": profile_name,
+                "status": "ready" if len(matches) == 1 else "account_migration_required",
+                "ambiguity": len(matches) != 1,
+                "account_ids": [account.id for account in matches],
+                "preserved": True,
+            }
+        )
+    return result
 
 
 async def create_binding(

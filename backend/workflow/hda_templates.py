@@ -737,8 +737,15 @@ def _optional_source_runtime_params(source: dict[str, Any]) -> dict[str, Any]:
         "source_binding_revision_id",
         "sourceBindingRevisionNumber",
         "source_binding_revision_number",
+        "accountId",
+        "account_id",
+        "workspaceId",
+        "workspace_id",
+        "executionId",
+        "execution_id",
+        "callerId",
+        "caller_id",
     ):
-        if key in source:
             optional[key] = source[key]
     return optional
 
