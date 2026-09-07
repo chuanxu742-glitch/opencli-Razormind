@@ -108,7 +108,9 @@ test('工作台初始显示工作区名称并保持窄卡片内可访问', async
   await workspaceSelect.click()
   const secondWorkspaceOption = page.getByRole('option', { name: secondWorkspace.name })
   await expect(secondWorkspaceOption).toBeVisible()
-  await secondWorkspaceOption.press('Enter')
+  await page.keyboard.press('End')
+  await page.keyboard.press('Enter')
+  await expect(workspaceSelect).toContainText(secondWorkspace.name)
 })
 
 test('图谱工具栏在窄视口显示选中项目且不横向溢出', async ({ page }) => {
@@ -132,5 +134,7 @@ test('图谱工具栏在窄视口显示选中项目且不横向溢出', async ({
   await projectSelect.click()
   const secondProjectOption = page.getByRole('option', { name: projects[1].name })
   await expect(secondProjectOption).toBeVisible()
-  await secondProjectOption.press('Enter')
+  await page.keyboard.press('End')
+  await page.keyboard.press('Enter')
+  await expect(projectSelect).toContainText(projects[1].name)
 })
