@@ -73,6 +73,25 @@ async def test_account_crud_session_portal_ticket_and_close_use_real_http_contra
         fetched = _data(await client.get(_route(account_id)))
         assert fetched["id"] == account_id
 
+        expected_ids = {account_id}
+        for label in ("Second account", "Third account"):
+            created = _data(await client.post(_route(), json={
+                "workspace_id": _WORKSPACE_ID, "site": "fixture.test", "label": label,
+            }))
+            expected_ids.add(created["id"])
+        seen_ids = []
+        cursor = None
+        for _ in range(3):
+            params = {"limit": 1}
+            if cursor is not None:
+                params["after_id"] = cursor
+            page = _data(await client.get(_route(), params=params))
+            seen_ids.extend(row["id"] for row in page["items"])
+            cursor = page["next_cursor"]
+        assert len(seen_ids) == 3
+        assert set(seen_ids) == expected_ids
+        assert cursor is None
+
         paused = _data(
             await client.patch(
                 _route(account_id),

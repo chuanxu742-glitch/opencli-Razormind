@@ -8,6 +8,7 @@ import secrets
 from datetime import UTC, datetime
 from typing import Literal
 
+import anyio
 from fastapi import (
     APIRouter,
     Depends,
@@ -956,14 +957,17 @@ async def account_portal_websocket(
         # Transient controls and pixels must never enter exception logs.
         await _close_portal_socket(key, state, reason="Portal connection ended")
     finally:
-        for relay in relays:
-            relay.cancel()
-        if relays:
-            await asyncio.gather(*relays, return_exceptions=True)
-        if transport is not None:
-            await transport.close(reason="portal_closed")
-        if _ACTIVE_PORTAL_SOCKETS.get(key) is state:
-            await _close_portal_socket(key, state, reason="Portal connection ended")
+        # ASGI cancellation must not interrupt transient-buffer/route release.
+        with anyio.CancelScope(shield=True):
+            for relay in relays:
+                relay.cancel()
+            if relays:
+                await asyncio.gather(*relays, return_exceptions=True)
+            if transport is not None:
+                with anyio.move_on_after(2):
+                    await transport.close(reason="portal_closed")
+            if _ACTIVE_PORTAL_SOCKETS.get(key) is state:
+                await _close_portal_socket(key, state, reason="Portal connection ended")
 
 
 __all__ = ["router"]

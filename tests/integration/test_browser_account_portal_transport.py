@@ -13,7 +13,9 @@ from starlette.testclient import TestClient
 
 from backend.api.v1 import browser_accounts
 from backend.main import app
-from backend.models.browser import BrowserAccount, BrowserAccountLease, BrowserLoginSession
+from backend.models.browser import (
+    BrowserAccount, BrowserAccountLease, BrowserLoginSession, BrowserRuntimeBundle,
+)
 from backend.models.edge_node import EdgeNode
 from backend.models.browser_portal import BrowserPortalOwner
 from backend.models.identity import User, Workspace, WorkspaceMembership, WorkspaceRole
@@ -31,7 +33,6 @@ from backend.schemas.browser_account import (
     PortalWireFrameV1,
     PortalWireLayoutV1,
     SensitiveSessionBindingV1,
-    SessionEnvelopeV1,
     SessionTargetV1,
 )
 from backend.services.browser_portal_contract import (
@@ -103,12 +104,15 @@ async def test_asgi_portal_websocket_relays_canonical_pixels_and_input_with_db_o
                 account_capable=True,
                 status="online",
             ),
+            BrowserRuntimeBundle(id="bundle", name="fixture", version="1", manifest={}),
             BrowserAccount(
                 id=_ACCOUNT,
                 workspace_id=_WORKSPACE,
                 site="fixture.test",
                 label="Fixture",
                 node_id="portal-transport-node",
+                runtime_bundle_id="bundle",
+                runtime_bundle_version="1",
             ),
             BrowserLoginSession(
                 id=_SESSION,
@@ -118,6 +122,12 @@ async def test_asgi_portal_websocket_relays_canonical_pixels_and_input_with_db_o
                 node_boot_id="boot",
                 lease_id="portal-transport-lease",
                 epoch=7,
+                command_id="command",
+                tab_id="tab",
+                frame_id="frame",
+                document_id="document",
+                origin="https://fixture.test",
+                view_generation=2,
                 revision=3,
                 purpose="login",
                 status="presenting",
@@ -150,6 +160,14 @@ async def test_asgi_portal_websocket_relays_canonical_pixels_and_input_with_db_o
         )
     )
     await db_session.commit()
+    endpoint, actual_envelope, revision = (
+        await browser_accounts.browser_account_service.get_portal_session_envelope(
+            db_session, _WORKSPACE, _ACCOUNT, _SESSION
+        )
+    )
+    assert endpoint == "https://node.test"
+    assert actual_envelope.node_id == "portal-transport-node"
+    assert revision == 3
 
     target = SessionTargetV1(tab_id="tab", frame_id="frame", document_id="document", origin="https://fixture.test")
     binding = SensitiveSessionBindingV1(
@@ -163,7 +181,7 @@ async def test_asgi_portal_websocket_relays_canonical_pixels_and_input_with_db_o
     clip = PortalClipV1(x=0, y=0, width=8, height=8)
     route = PortalOwnerRouteV1(
         binding=binding,
-        node_identity=NodeIdentityV1(node_id="node", boot_id="boot"),
+        node_identity=NodeIdentityV1(node_id="portal-transport-node", boot_id="boot"),
         owner_endpoint="https://node.test",
         tunnel_handle="portal-tunnel",
         tunnel_auth_digest="a" * 64,
@@ -190,15 +208,6 @@ async def test_asgi_portal_websocket_relays_canonical_pixels_and_input_with_db_o
     ), len(raw_pixels))
     transport = _NodeTransportDouble(pixel_wire)
     session_factory = async_sessionmaker(db_engine, class_=AsyncSession, expire_on_commit=False)
-    envelope = SessionEnvelopeV1(
-        workspace_id=_WORKSPACE, account_id=_ACCOUNT, session_id=_SESSION, node_id="node", node_boot_id="boot",
-        lease_id="lease", epoch=7, lease_expires_at=now + timedelta(minutes=1), runtime_bundle_id="bundle",
-        runtime_bundle_version="1", target=target, view_generation=2, purpose="login", command_id="command",
-    )
-
-    async def session_envelope(*_args):
-        return "https://node.test", envelope, 3
-
     async def prepare_route(*_args, **_kwargs):
         return route
 
@@ -206,7 +215,6 @@ async def test_asgi_portal_websocket_relays_canonical_pixels_and_input_with_db_o
         return transport
 
     monkeypatch.setattr(browser_accounts, "AsyncSessionLocal", session_factory)
-    monkeypatch.setattr(browser_accounts.browser_account_service, "get_portal_session_envelope", session_envelope)
     monkeypatch.setattr("backend.ws_agent_manager.prepare_portal_route", prepare_route)
     monkeypatch.setattr("backend.ws_agent_manager.open_portal_route", open_route)
 
