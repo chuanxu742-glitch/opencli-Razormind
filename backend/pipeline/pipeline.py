@@ -188,16 +188,12 @@ async def _resolve_account_execution(
     if inputs is None:
         return None
     ref, context = inputs
-    from backend.database import AsyncSessionLocal, commit_session
+    from backend.database import AsyncSessionLocal
     from backend.services.browser_account_service import resolve_account_session
     from backend.schemas.browser_account import SessionEnvelopeV1
 
     async with AsyncSessionLocal() as session:
         resolution = await resolve_account_session(session, ref, context)
-        # Resolution may enqueue wake/restore work and may update the session
-        # fence. Commit while the owned session is still open so waiting does
-        # not roll back the progress needed by the next scheduler pass.
-        await commit_session(session)
     if isinstance(resolution, SessionEnvelopeV1):
         return ref, resolution
     status = getattr(resolution, "status", "blocked")

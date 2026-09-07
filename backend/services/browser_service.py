@@ -1,7 +1,7 @@
 from pathlib import PurePosixPath
 
 from jsonschema import Draft202012Validator
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.browser import (
@@ -195,47 +195,52 @@ async def get_binding_by_site(session: AsyncSession, site: str) -> BrowserBindin
     return result.scalar_one_or_none()
 
 
-async def inspect_legacy_binding_migration(session: AsyncSession) -> list[dict[str, object]]:
+async def inspect_legacy_binding_migration(
+    session: AsyncSession, *, limit: int = 50, after_id: str | None = None
+) -> dict[str, object]:
     """Report legacy site mappings without guessing account ownership.
 
     The old rows and physical profile names remain untouched.  A binding is
     importable only when exactly one existing BrowserAccount owns that profile;
     otherwise operators receive an explicit migration block.
     """
-    rows = (
-        await session.execute(select(BrowserBinding).order_by(BrowserBinding.site))
-    ).scalars().all()
-    accounts = (
-        await session.execute(select(BrowserAccount).order_by(BrowserAccount.profile_id))
-    ).scalars().all()
-    by_profile: dict[str, list[BrowserAccount]] = {}
-    for account in accounts:
-        if account.profile_id:
-            by_profile.setdefault(account.profile_id, []).append(account)
-    instances = (
-        await session.execute(select(BrowserInstance))
-    ).scalars().all()
-    profile_by_endpoint = {
-        instance.endpoint: (instance.profile_name or instance.endpoint)
-        for instance in instances
-    }
+    if not 1 <= limit <= 200:
+        raise ValueError("migration page limit must be between 1 and 200")
+    profile = func.coalesce(
+        func.nullif(BrowserInstance.profile_name, ""), BrowserBinding.browser_endpoint
+    )
+    statement = (
+        select(BrowserBinding, profile.label("profile_name"), BrowserAccount.id)
+        .outerjoin(BrowserInstance, BrowserInstance.endpoint == BrowserBinding.browser_endpoint)
+        .outerjoin(BrowserAccount, BrowserAccount.profile_id == profile)
+        .order_by(BrowserBinding.id)
+        .limit(limit + 1)
+    )
+    if after_id is not None:
+        statement = statement.where(BrowserBinding.id > after_id)
+    # profile_id and endpoint are unique indexed keys. Neither the account
+    # inventory nor the instance inventory is materialized for this page.
+    rows = (await session.execute(statement)).all()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
     result: list[dict[str, object]] = []
-    for binding in rows:
-        profile_name = profile_by_endpoint.get(binding.browser_endpoint, binding.browser_endpoint)
-        matches = by_profile.get(profile_name, [])
+    for binding, profile_name, account_id in rows:
         result.append(
             {
                 "binding_id": binding.id,
                 "site": binding.site,
                 "browser_endpoint": binding.browser_endpoint,
                 "profile_name": profile_name,
-                "status": "ready" if len(matches) == 1 else "account_migration_required",
-                "ambiguity": len(matches) != 1,
-                "account_ids": [account.id for account in matches],
+                "status": "ready" if account_id is not None else "account_migration_required",
+                "ambiguity": account_id is None,
+                "account_ids": [account_id] if account_id is not None else [],
                 "preserved": True,
             }
         )
-    return result
+    return {
+        "items": result,
+        "next_cursor": rows[-1][0].id if has_more else None,
+    }
 
 
 async def create_binding(
