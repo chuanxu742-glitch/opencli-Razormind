@@ -337,10 +337,10 @@ def test_source_and_release_smokes_gate_daemon_recovery_before_release() -> None
     assert "db_revision_before" in gate
     assert "/data/local-admin-password.hash" in gate
     assert "/data/local-admin-password.hash.initialized" in gate
-    assert "/home/chrome/.config/chromium/.ci-daemon-restart-sentinel" in gate
+    assert '"$PROFILE_DIR/.ci-daemon-restart-sentinel"' in gate
     assert "agent_profile_volume_before" in gate
     assert "agent_profile_volume_after" in gate
-    assert "test -r /home/chrome/.config/chromium" in gate
+    assert 'test -r "$PROFILE_DIR"' in gate
     assert "database, authentication, and browser-profile sentinels persisted" in gate
     assert "state={{.State.Status}}" in gate
     assert "health={{if .State.Health}}" in gate

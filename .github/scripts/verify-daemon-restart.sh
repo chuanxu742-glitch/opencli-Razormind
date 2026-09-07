@@ -101,17 +101,19 @@ stage "inspect browser profile volume"
 
 # Browser-profile sentinel: write through the running container into the
 # agent_profile_1 named volume, then read the same marker after daemon restart.
-agent_profile_volume_before="$(
-  docker inspect --format \
-    '{{range .Mounts}}{{if eq .Destination "/home/chrome/.config/chromium"}}{{.Name}}{{end}}{{end}}' \
-    "$agent_id"
-)"
+agent_profile_dir="$(docker exec "$agent_id" printenv PROFILE_DIR)"
+[[ "$agent_profile_dir" == /* && "$agent_profile_dir" != / ]]
+profile_volume_name() {
+  docker inspect --format '{{json .Mounts}}' "$agent_id" |
+    python -c 'import json,sys; mounts=[m for m in json.load(sys.stdin) if m["Destination"] == sys.argv[1] and m["Type"] == "volume" and m["RW"]]; assert len(mounts) == 1, "Expected one writable persistent profile volume"; print(mounts[0]["Name"])' "$agent_profile_dir"
+}
+agent_profile_volume_before="$(profile_volume_name)"
 [[ -n "$agent_profile_volume_before" ]]
 stage "write browser profile sentinel"
 docker exec "$agent_id" sh -c \
-  'test -d /home/chrome/.config/chromium && test -r /home/chrome/.config/chromium && test -w /home/chrome/.config/chromium'
+  'test -d "$PROFILE_DIR" && test -r "$PROFILE_DIR" && test -w "$PROFILE_DIR"'
 docker exec "$agent_id" sh -c \
-  'mkdir -p /home/chrome/.config/chromium && printf %s "$1" > /home/chrome/.config/chromium/.ci-daemon-restart-sentinel' \
+  'printf %s "$1" > "$PROFILE_DIR/.ci-daemon-restart-sentinel"' \
   sh "$sentinel"
 stage "restart Docker daemon"
 
@@ -181,15 +183,12 @@ curl --fail --silent --show-error \
   -H "X-API-Token: $api_token" \
   http://localhost:8031/api/v1/auth/me >/dev/null
 
-agent_profile_volume_after="$(
-  docker inspect --format \
-    '{{range .Mounts}}{{if eq .Destination "/home/chrome/.config/chromium"}}{{.Name}}{{end}}{{end}}' \
-    "$agent_id"
-)"
+[[ "$(docker exec "$agent_id" printenv PROFILE_DIR)" == "$agent_profile_dir" ]]
+agent_profile_volume_after="$(profile_volume_name)"
 [[ "$agent_profile_volume_after" == "$agent_profile_volume_before" ]]
 docker exec "$agent_id" sh -c \
-  'test -d /home/chrome/.config/chromium && test -r /home/chrome/.config/chromium'
-[[ "$(docker exec "$agent_id" sh -c 'cat /home/chrome/.config/chromium/.ci-daemon-restart-sentinel')" == "$sentinel" ]]
+  'test -d "$PROFILE_DIR" && test -r "$PROFILE_DIR"'
+[[ "$(docker exec "$agent_id" sh -c 'cat "$PROFILE_DIR/.ci-daemon-restart-sentinel"')" == "$sentinel" ]]
 
 trap - EXIT
 echo "Docker daemon restart gate passed: services recovered and database, authentication, and browser-profile sentinels persisted."
