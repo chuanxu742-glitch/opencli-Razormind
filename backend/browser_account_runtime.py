@@ -2806,6 +2806,11 @@ class BrowserAccountRuntimeAllocator:
             evidence = running.lease_supervisor.shutdown_evidence
             stopped = evidence is not None and evidence.confirmed
         else:
+            # Chromium only removes its singleton files on an orderly browser
+            # shutdown.  Ask the owned browser to close before terminating the
+            # remaining process groups; a failed request still falls through
+            # to the existing confirmed-stop/quarantine path.
+            await _request_browser_shutdown(running.binding.cdp_port)
             stopped = await running.process_supervisor.stop_async()
         if not stopped:
             running.paths.mark_stopped(
@@ -3314,6 +3319,40 @@ def _read_cdp_browser_version(port: int) -> str | None:
         return None
     browser = payload.get("Browser") if isinstance(payload, dict) else None
     return browser if isinstance(browser, str) and 0 < len(browser) <= 100 else None
+
+
+def _read_cdp_browser_websocket_url(port: int) -> str | None:
+    try:
+        with urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1.0) as response:
+            if response.status != 200:
+                return None
+            payload = json.loads(response.read(65_536))
+    except (OSError, ValueError):
+        return None
+    websocket_url = payload.get("webSocketDebuggerUrl") if isinstance(payload, dict) else None
+    if not isinstance(websocket_url, str) or not websocket_url.startswith(("ws://", "wss://")):
+        return None
+    return websocket_url
+
+
+async def _request_browser_shutdown(port: int) -> bool:
+    """Request Chromium's orderly shutdown before the process tree is terminated."""
+    websocket_url = await asyncio.to_thread(_read_cdp_browser_websocket_url, port)
+    if websocket_url is None:
+        return False
+    try:
+        import websockets
+
+        async with websockets.connect(websocket_url, open_timeout=5, close_timeout=5) as websocket:
+            await websocket.send(json.dumps({"id": 1, "method": "Browser.close"}))
+            try:
+                await asyncio.wait_for(websocket.recv(), timeout=5)
+            except (asyncio.TimeoutError, EOFError, OSError):
+                # Browser.close commonly closes the socket before replying.
+                pass
+    except Exception:
+        return False
+    return True
 
 
 _ACCOUNT_RUNTIME_ALLOCATOR: BrowserAccountRuntimeAllocator | None = None

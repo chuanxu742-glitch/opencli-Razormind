@@ -444,6 +444,45 @@ async def test_lease_loss_stops_stack_before_releasing_profile(tmp_path: Path) -
     assert not running.paths.dirty_marker.exists()
 
 
+
+
+@pytest.mark.asyncio
+async def test_stop_requests_orderly_browser_shutdown_before_profile_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allocator = BrowserAccountRuntimeAllocator(_configuration(tmp_path))
+    command, claim, session, identity = _contracts()
+    running = await allocator.start(
+        command=command,
+        claim=claim,
+        session=session,
+        node_identity=identity,
+    )
+    singleton = running.paths.profile_dir / "SingletonLock"
+    singleton.write_text("chromium-owned\n", encoding="utf-8")
+    requested_ports: list[int] = []
+
+    async def orderly_shutdown(port: int) -> bool:
+        requested_ports.append(port)
+        singleton.unlink()
+        return True
+
+    monkeypatch.setattr(
+        "backend.browser_account_runtime._request_browser_shutdown",
+        orderly_shutdown,
+    )
+    await allocator.stop(
+        session_id=session.session_id,
+        node_id=identity.node_id,
+        boot_id=identity.boot_id,
+        epoch=claim.epoch,
+    )
+
+    assert requested_ports == [running.binding.cdp_port]
+    assert running.paths.read_state()["state"] == "stopped"
+    assert not running.paths.dirty_marker.exists()
+
+
 def test_missing_trusted_bundle_id_fails_before_process_start(tmp_path: Path) -> None:
     configuration = _configuration(tmp_path)
     configuration = AccountRuntimeConfiguration(**{**configuration.__dict__, "bundle_id": ""})
