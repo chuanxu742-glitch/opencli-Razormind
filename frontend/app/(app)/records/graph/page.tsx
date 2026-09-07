@@ -175,8 +175,8 @@ export default function RecordRelationshipGraphPage() {
       className="max-w-none"
     >
       <section className="overflow-hidden rounded-xl border bg-card">
-        <header className="flex flex-wrap items-center justify-between gap-3 border-b px-4 py-3">
-          <div className="flex flex-wrap items-center gap-2">
+        <header className="flex min-w-0 flex-col gap-3 border-b px-4 py-3 lg:flex-row lg:items-center lg:justify-between">
+          <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
             <Select
               value={selectedProjectId ?? ''}
               onValueChange={(value) => {
@@ -185,9 +185,9 @@ export default function RecordRelationshipGraphPage() {
                 setSearch('')
               }}
             >
-              <SelectTrigger className="w-60">
+              <SelectTrigger className="w-full min-w-0 sm:w-60">
                 <SelectValue placeholder="选择要预览的项目">
-                  {projects.find((project) => project.id === selectedProjectId)?.name}
+                  {(value: string | null) => projects.find((project) => project.id === value)?.name ?? '选择要预览的项目'}
                 </SelectValue>
               </SelectTrigger>
               <SelectContent>
@@ -206,9 +206,9 @@ export default function RecordRelationshipGraphPage() {
                 setSelectedNodeId(null)
               }}
             >
-              <SelectTrigger className="w-44">
+              <SelectTrigger className="w-full min-w-0 sm:w-44">
                 <SelectValue>
-                  {DENSITY_OPTIONS.find((option) => option.value === maxNodes)?.label}
+                  {(value: string | null) => DENSITY_OPTIONS.find((option) => option.value === Number(value))?.label ?? '标准 · 700 节点'}
                 </SelectValue>
               </SelectTrigger>
               <SelectContent>
@@ -220,7 +220,7 @@ export default function RecordRelationshipGraphPage() {
               </SelectContent>
             </Select>
 
-            <div className="relative w-64">
+            <div className="relative w-full min-w-0 sm:w-64">
               <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
               <Input
                 value={search}
@@ -257,7 +257,7 @@ export default function RecordRelationshipGraphPage() {
           </div>
 
           {preview ? (
-            <div className="flex flex-wrap items-center gap-4 font-mono text-xs text-muted-foreground">
+            <div className="flex shrink-0 flex-wrap items-center gap-4 font-mono text-xs text-muted-foreground">
               <span>{preview.stats.visible_nodes.toLocaleString('zh-CN')} 可见节点</span>
               <span>{preview.stats.visible_edges.toLocaleString('zh-CN')} 双向连接</span>
               <span>{preview.stats.total_records.toLocaleString('zh-CN')} 项目记录</span>
