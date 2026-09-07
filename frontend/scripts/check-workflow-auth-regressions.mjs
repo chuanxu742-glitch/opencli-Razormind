@@ -274,6 +274,129 @@ test('插件目录不可用时保留后端提供的错误信息', async () => {
   }
 })
 
+test('节点能力目录请求在三种登录状态下发送共享鉴权头', async () => {
+  const stores = installStorage()
+  const originalNodeEnv = process.env.NODE_ENV
+  const originalBuildToken = process.env.NEXT_PUBLIC_API_AUTH_TOKEN
+  const originalDevelopmentFlag = process.env.NEXT_PUBLIC_ALLOW_UNAUTHENTICATED_DEV
+  process.env.NODE_ENV = 'production'
+  process.env.NEXT_PUBLIC_API_AUTH_TOKEN = ''
+  process.env.NEXT_PUBLIC_ALLOW_UNAUTHENTICATED_DEV = ''
+
+  const { clearIdentityToken, setRuntimeIdentityToken } = await importTypeScript('lib/auth/session.ts')
+  const { API_AUTH_TOKEN_KEY } = await importTypeScript('lib/api/auth-token.ts')
+  const { fetchBackendNodeCapabilityCatalog } = await importTypeScript(
+    'lib/plugins/backend-node-capabilities.ts',
+  )
+
+  const exerciseCapabilityRequests = async () => {
+    const requests = installFetchSpy({
+      responseFactory: (input) => String(input).includes('/capabilities')
+        ? {
+            ok: true,
+            status: 200,
+            json: async () => ({ success: true, data: {} }),
+          }
+        : null,
+    })
+    await fetchBackendNodeCapabilityCatalog()
+    await fetchBackendNodeCapabilityCatalog('team/one')
+    return requests
+  }
+
+  const assertCapabilityRequests = (requests, expectedAuthorization, expectedFleet) => {
+    assert.equal(requests.length, 2, 'unexpected node capability request count')
+    assert.deepEqual(
+      requests.map((request) => request.method),
+      ['GET', 'GET'],
+      'node capability operation methods changed',
+    )
+    assert.deepEqual(
+      requests.map((request) => request.url),
+      [
+        'http://workflow.test/api/v1/plugins/capabilities',
+        'http://workflow.test/api/v1/workspaces/team%2Fone/plugins/capabilities',
+      ],
+      'node capability paths changed',
+    )
+    for (const request of requests) {
+      assert.equal(
+        request.headers.get('authorization'),
+        expectedAuthorization,
+        'node capability identity Authorization header mismatch',
+      )
+      assert.equal(
+        request.headers.get('x-api-token'),
+        expectedFleet,
+        'node capability fleet transport credential mismatch',
+      )
+    }
+  }
+
+  try {
+    setRuntimeIdentityToken(identityToken)
+    const identityOnlyRequests = await exerciseCapabilityRequests()
+    assertCapabilityRequests(identityOnlyRequests, `Bearer ${identityToken}`, null)
+
+    stores.local.set(API_AUTH_TOKEN_KEY, fleetToken)
+    const identityAndFleetRequests = await exerciseCapabilityRequests()
+    assertCapabilityRequests(identityAndFleetRequests, `Bearer ${identityToken}`, fleetToken)
+
+    stores.local.delete(API_AUTH_TOKEN_KEY)
+    clearIdentityToken()
+    const unauthenticatedRequests = await exerciseCapabilityRequests()
+    assertCapabilityRequests(unauthenticatedRequests, null, null)
+  } finally {
+    clearIdentityToken()
+    stores.local.clear()
+    stores.session.clear()
+    if (originalNodeEnv === undefined) delete process.env.NODE_ENV
+    else process.env.NODE_ENV = originalNodeEnv
+    if (originalBuildToken === undefined) delete process.env.NEXT_PUBLIC_API_AUTH_TOKEN
+    else process.env.NEXT_PUBLIC_API_AUTH_TOKEN = originalBuildToken
+    if (originalDevelopmentFlag === undefined) delete process.env.NEXT_PUBLIC_ALLOW_UNAUTHENTICATED_DEV
+    else process.env.NEXT_PUBLIC_ALLOW_UNAUTHENTICATED_DEV = originalDevelopmentFlag
+  }
+})
+
+test('节点能力目录不可用时保留后端提供的错误信息', async () => {
+  const stores = installStorage()
+  const originalBuildToken = process.env.NEXT_PUBLIC_API_AUTH_TOKEN
+  process.env.NEXT_PUBLIC_API_AUTH_TOKEN = ''
+  const { clearIdentityToken } = await importTypeScript('lib/auth/session.ts')
+  const { fetchBackendNodeCapabilityCatalog } = await importTypeScript(
+    'lib/plugins/backend-node-capabilities.ts',
+  )
+
+  try {
+    clearIdentityToken()
+    const requests = installFetchSpy({
+      responseFactory: () => ({
+        ok: false,
+        status: 503,
+        json: async () => ({
+          success: false,
+          detail: { code: 'NODE_CAPABILITY_CATALOG_UNAVAILABLE', message: '节点能力目录暂不可用' },
+        }),
+      }),
+    })
+    await assert.rejects(
+      () => fetchBackendNodeCapabilityCatalog('team/one'),
+      (error) => {
+        assert.equal(error.message, '节点能力目录暂不可用')
+        return true
+      },
+    )
+    assert.equal(requests.length, 1)
+  } finally {
+    clearIdentityToken()
+    stores.local.clear()
+    stores.session.clear()
+    if (originalBuildToken === undefined) delete process.env.NEXT_PUBLIC_API_AUTH_TOKEN
+    else process.env.NEXT_PUBLIC_API_AUTH_TOKEN = originalBuildToken
+  }
+})
+
 test('development bypass requires an exact non-production flag', async () => {
   const stores = installStorage()
   const { clearIdentityToken, isDevelopmentLoginAllowed, setDevelopmentSession, setRuntimeIdentityToken } =
