@@ -138,7 +138,17 @@ try:
             conn, _ = listener.accept()
         except TimeoutError:
             continue
-        conn.close()
+        try:
+            # Drain the probe until the client closes first.  Otherwise the
+            # fixture actively closes an accepted connection and can leave the
+            # fixed daemon port in TIME_WAIT on Linux.
+            conn.settimeout(0.5)
+            while conn.recv(4096):
+                pass
+        except (TimeoutError, OSError):
+            pass
+        finally:
+            conn.close()
 finally:
     listener.close()
 """
