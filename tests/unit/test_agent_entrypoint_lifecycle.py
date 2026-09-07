@@ -12,7 +12,6 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ENTRYPOINT = REPO_ROOT / "agent" / "entrypoint.sh"
 
@@ -53,7 +52,11 @@ case "$1" in
   */daemon.js)
     printf '%s\n' "$$" > "$FAKE_STATE/daemon.pid"
     printf '%s\n' "$PPID" > "$FAKE_STATE/daemon-supervisor.pid"
-    trap '[ -f "$FAKE_STATE/chromium.exited" ] || printf early > "$FAKE_STATE/daemon.before-chromium"; printf term > "$FAKE_STATE/daemon.term"; exit 0' TERM INT
+    trap '
+      [ -f "$FAKE_STATE/chromium.exited" ] || printf early > "$FAKE_STATE/daemon.before-chromium"
+      printf term > "$FAKE_STATE/daemon.term"
+      exit 0
+    ' TERM INT
     while :; do sleep 0.05; done
 esac
 exit 0
@@ -104,7 +107,11 @@ exit 0
                 f"""#!/bin/bash
 printf '%s\\n' "$$" > "$FAKE_STATE/{name}.pid"
 printf '%s\\n' "$PPID" > "$FAKE_STATE/{name}-supervisor.pid"
-trap '[ -f "$FAKE_STATE/chromium.exited" ] || printf early > "$FAKE_STATE/{name}.before-chromium"; printf term > "$FAKE_STATE/{name}.term"; exit 0' TERM INT
+trap '
+  [ -f "$FAKE_STATE/chromium.exited" ] || printf early > "$FAKE_STATE/{name}.before-chromium"
+  printf term > "$FAKE_STATE/{name}.term"
+  exit 0
+' TERM INT
 while :; do sleep 0.05; done
 """,
             )
@@ -114,7 +121,11 @@ while :; do sleep 0.05; done
 printf '%s\n' "$$" >> "$FAKE_STATE/chromium.starts"
 printf '%s\n' "$$" > "$FAKE_STATE/chromium.pid"
 printf '%s\n' "$PPID" > "$FAKE_STATE/chrome-supervisor.pid"
-trap 'printf term > "$FAKE_STATE/chromium.term"; printf exited > "$FAKE_STATE/chromium.exited"; exit 0' TERM INT
+trap '
+  printf term > "$FAKE_STATE/chromium.term"
+  printf exited > "$FAKE_STATE/chromium.exited"
+  exit 0
+' TERM INT
 while [ ! -f "$FAKE_STATE/browser-close.requested" ]; do sleep 0.05; done
 printf graceful > "$FAKE_STATE/chromium.graceful"
 printf exited > "$FAKE_STATE/chromium.exited"
