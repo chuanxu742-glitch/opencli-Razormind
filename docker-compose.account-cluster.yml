@@ -1,11 +1,16 @@
-# One managed browser-account runtime per container and network namespace.
+# One simultaneously live managed account stack per container and network namespace.
 #
-# Before starting, create ACCOUNT_CLUSTER_CONTROL_NETWORK on the same Docker
-# engine as the control plane. This file deliberately publishes no ports.
+# Build this checkout into a content-addressed local image before starting:
+# docker build --pull --file agent/Dockerfile --build-arg INSTALL_CHROME=true \
+#   --iidfile .account-cluster-agent.iid --tag opencli-account-agent:"$(git rev-parse HEAD)" .
+# export ACCOUNT_CLUSTER_AGENT_IMAGE="$(cat .account-cluster-agent.iid)"
+# Also create ACCOUNT_CLUSTER_CONTROL_NETWORK on the control-plane Docker engine.
+# This file deliberately publishes no ports and never pulls a fallback image.
 name: opencli-account-cluster
 
 x-account-agent: &account-agent
-  image: ${DOCKER_REGISTRY:-ghcr.io/}${DOCKER_IMAGE_NAMESPACE:-2233admin}/opencli-admin-agent:${IMAGE_TAG:-0.4.1}${CHROME_SUFFIX:-}
+  image: ${ACCOUNT_CLUSTER_AGENT_IMAGE:?Build the current checkout and set its immutable image ID}
+  pull_policy: never
   init: true
   restart: unless-stopped
   networks: [account-control]

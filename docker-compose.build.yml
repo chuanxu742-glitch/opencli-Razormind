@@ -59,9 +59,15 @@ services:
 
   agent-1:
     <<: *agent-build
-    volumes:
-      - agent_profile_1:${CHROME_PROFILE_DIR:-/home/chrome/.config/chromium}
-      - agent_runtime_state_1:${CHROME_RUNTIME_STATE_DIR:-/var/lib/opencli/account-runtime}
+    environment:
+      PROFILE_DIR: /home/agent/.config/chromium
+      RUNTIME_HOME: /home/agent
+      RUNTIME_CACHE_DIR: /home/agent/.cache
+    # Replace inherited /home/chrome targets while retaining the existing
+    # named volumes and their data for the uid-1000 agent image.
+    volumes: !override
+      - agent_profile_1:/home/agent/.config/chromium
+      - agent_runtime_state_1:/var/lib/opencli/account-runtime
   # Remote edge agent: same image, same default (no embedded Chrome).
   agent:
     <<: *agent-build

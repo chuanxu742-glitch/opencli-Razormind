@@ -1,5 +1,10 @@
+import json
+import os
+import shutil
 import subprocess
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -231,3 +236,53 @@ def test_vnc_agent_image_is_the_registered_browser_bridge_runtime():
     assert "agent_profile:${AGENT_PROFILE_DIR:-/home/agent/.config/chromium}" in compose
     assert "${AGENT_PORT:-19823}:19823" in compose
     assert "agent-1:\n    <<: *agent-build" in build
+
+
+@pytest.mark.skipif(shutil.which("docker") is None, reason="Docker Compose CLI is unavailable")
+def test_source_build_override_uses_agent_owned_runtime_paths():
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "API_AUTH_TOKEN": "packaging-test-token",
+            "BOOTSTRAP_ADMIN_TOKEN": "packaging-test-bootstrap-token",
+            "SECRET_KEY": "packaging-test-secret",
+        }
+    )
+    result = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "--env-file",
+            ".env.docker.example",
+            "-f",
+            "docker-compose.yml",
+            "-f",
+            "docker-compose.build.yml",
+            "config",
+            "--format",
+            "json",
+        ],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+    agent = json.loads(result.stdout)["services"]["agent-1"]
+    assert {
+        key: agent["environment"][key]
+        for key in ("PROFILE_DIR", "RUNTIME_HOME", "RUNTIME_CACHE_DIR")
+    } == {
+        "PROFILE_DIR": "/home/agent/.config/chromium",
+        "RUNTIME_HOME": "/home/agent",
+        "RUNTIME_CACHE_DIR": "/home/agent/.cache",
+    }
+    assert {
+        mount["target"]: mount["source"] for mount in agent["volumes"]
+    } == {
+        "/home/agent/.config/chromium": "agent_profile_1",
+        "/var/lib/opencli/account-runtime": "agent_runtime_state_1",
+    }
