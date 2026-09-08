@@ -9,8 +9,11 @@ reimplemented per source.
 
 import asyncio
 import logging
+import math
 import random
 import time
+from datetime import UTC
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
@@ -38,8 +41,11 @@ def parse_rate(rate: str) -> float:
         "sec": 1.0, "second": 1.0,
         "min": 60.0, "minute": 60.0,
         "hour": 3600.0,
-    }.get(unit.strip().lower(), 60.0)
-    return count / per if per else count
+    }.get(unit.strip().lower())
+    if per is None or not math.isfinite(count) or count <= 0:
+        return 1.0
+    result = count / per
+    return result if math.isfinite(result) and result > 0 else 1.0
 
 
 class TokenBucket:
@@ -48,8 +54,24 @@ class TokenBucket:
     bucket is empty, so steady traffic under the rate never waits."""
 
     def __init__(self, rate: float, capacity: float | None = None) -> None:
-        self.rate = max(rate, 1e-6)
-        self.capacity = capacity if capacity is not None else max(1.0, rate)
+        try:
+            rate_value = float(rate)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("rate must be a finite positive number") from exc
+        if not math.isfinite(rate_value) or rate_value <= 0:
+            raise ValueError("rate must be a finite positive number")
+        if capacity is None:
+            capacity_value = max(1.0, rate_value)
+        else:
+            try:
+                capacity_value = float(capacity)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("capacity must be a finite number at least 1") from exc
+            if not math.isfinite(capacity_value) or capacity_value < 1:
+                raise ValueError("capacity must be a finite number at least 1")
+        # Preserve the existing floor so tiny positive rates cannot overflow waits.
+        self.rate = max(rate_value, 1e-6)
+        self.capacity = capacity_value
         self._tokens = self.capacity
         self._updated = time.monotonic()
         self._lock = asyncio.Lock()
@@ -69,9 +91,9 @@ class TokenBucket:
 
 class RateLimitedClient:
     """Wraps an ``httpx.AsyncClient``: every request first waits on the token
-    bucket, then retries on 429/5xx with exponential backoff + jitter, honoring a
-    numeric ``Retry-After``. A channel sees a plain get/post; the cross-cutting
-    policy lives here, once."""
+    bucket, then retries on 429/5xx with exponential backoff + jitter, honoring
+    delta-seconds or HTTP-date ``Retry-After`` values. A channel sees a plain
+    get/post; the cross-cutting policy lives here, once."""
 
     def __init__(
         self,
@@ -119,6 +141,17 @@ class RateLimitedClient:
         if not value:
             return None
         try:
-            return float(value)  # delta-seconds form
-        except ValueError:
-            return None  # HTTP-date form: ignore, fall back to exponential backoff
+            delay = float(value)  # delta-seconds form
+        except (TypeError, ValueError, OverflowError):
+            delay = None
+        if delay is not None:
+            return delay if math.isfinite(delay) and delay >= 0 else None
+
+        try:
+            retry_at = parsedate_to_datetime(value)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=UTC)
+            delay = retry_at.timestamp() - time.time()
+        except (TypeError, ValueError, OverflowError, OSError):
+            return None
+        return max(0.0, delay) if math.isfinite(delay) else None
