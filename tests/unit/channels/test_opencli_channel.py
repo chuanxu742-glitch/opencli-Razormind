@@ -613,7 +613,10 @@ async def test_validate_config_missing_both(channel):
 
 @pytest.mark.asyncio
 async def test_health_check_binary_exists(channel):
-    with patch("os.path.isfile", return_value=True):
+    with (
+        patch("os.path.isfile", return_value=True),
+        patch("backend.browser_pool.get_pool", side_effect=RuntimeError("pool not initialized")),
+    ):
         result = await channel.health_check()
     assert result is True
 

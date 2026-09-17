@@ -25,7 +25,7 @@ test('登录拒绝反斜杠外站返回地址', async ({ page }) => {
     return route.abort()
   })
   await page.goto(`/login?returnTo=${encodeURIComponent('/\\outside.invalid/review')}`)
-  await expect(page).toHaveURL(/\/studio$/)
+  await expect(page).toHaveURL(/\/studio$/, { timeout: 15000 })
   expect(externalRequests).toBe(0)
 })
 

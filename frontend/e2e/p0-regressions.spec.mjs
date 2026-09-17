@@ -227,6 +227,7 @@ test('pending queue keyboard search changes selection and opens only visible wor
 test('pending queue keeps a no-match search stable without navigation timing', async ({ page }) => {
   await installActionCenterFixtures(page)
   await goAuthed(page, '/inbox?tab=pending')
+  await expect(page.locator('#inbox-row-task-task-failed-e2e')).toHaveAttribute('aria-selected', 'true')
 
   const search = page.getByRole('textbox', { name: '搜索当前队列' })
   await page.keyboard.press('Control+f')
