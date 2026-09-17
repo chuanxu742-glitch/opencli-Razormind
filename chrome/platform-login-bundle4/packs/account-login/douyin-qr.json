@@ -1,0 +1,31 @@
+{
+  "id": "douyin-qr",
+  "version": "0.1.0",
+  "platform": "douyin",
+  "allowed_origins": [
+    "https://creator.douyin.com"
+  ],
+  "allowed_redirect_origins": [
+    "https://creator.douyin.com"
+  ],
+  "login_url": "/",
+  "modes": [
+    "qr"
+  ],
+  "authentication_verified": false,
+  "selectors": [
+    {
+      "id": "qr",
+      "selector": "img[aria-label=\"二维码\"]",
+      "kind": "qr",
+      "frame": "main"
+    }
+  ],
+  "refresh": {
+    "trigger": "qr_expired",
+    "interval": 30,
+    "max_attempts": 3
+  },
+  "identity_probe_supported": true,
+  "interaction_supported": true
+}

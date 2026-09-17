@@ -1,0 +1,27 @@
+{
+  "id": "official-ke",
+  "version": "0.1.0",
+  "platform": "ke",
+  "allowed_origins": [
+    "https://clogin.ke.com"
+  ],
+  "allowed_redirect_origins": [
+    "https://clogin.ke.com"
+  ],
+  "login_url": "/login/?service=https%3A%2F%2Fwww.ke.com",
+  "modes": [
+    "form"
+  ],
+  "qr_supported": false,
+  "interaction_supported": true,
+  "identity_probe_supported": false,
+  "authentication_verified": false,
+  "selectors": [
+    {
+      "id": "form",
+      "selector": "body",
+      "kind": "form",
+      "frame": "main"
+    }
+  ]
+}

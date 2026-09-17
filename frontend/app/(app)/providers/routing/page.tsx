@@ -21,7 +21,7 @@ export default function ModelRoutingPage() {
           description="模型路由需要至少一个可用供应商。"
         />
         <div>
-          <Button render={<Link href="/providers/catalog" />}>
+          <Button nativeButton={false} render={<Link href="/providers/catalog" />}>
             前往供应商设置
           </Button>
         </div>

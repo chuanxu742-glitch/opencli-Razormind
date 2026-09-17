@@ -157,7 +157,7 @@ class ExecutionContextV1(_ContractModel):
 class BrowserLoginSessionCreateV1(_ContractModel):
     """Body for creating one leased login or execution session."""
 
-    purpose: Literal["login", "execution"]
+    purpose: Literal["login", "execution", "browser"]
     execution_id: str | None = Field(default=None, min_length=1, max_length=128)
     source_binding_revision_id: str | None = Field(
         default=None, min_length=1, max_length=36
@@ -201,7 +201,7 @@ class SessionEnvelopeV1(_ContractModel):
     login_rule_version: str | None = Field(default=None, min_length=1, max_length=64)
     target: SessionTargetV1 = Field(default_factory=SessionTargetV1)
     view_generation: int = Field(ge=0)
-    purpose: Literal["login", "execution"]
+    purpose: Literal["login", "execution", "browser"]
     execution_id: str | None = Field(default=None, min_length=1, max_length=128)
     command_id: str = Field(min_length=1, max_length=36)
     profile_state: Literal["new", "uncommitted", "committed"] = "new"
@@ -584,6 +584,8 @@ class LoginObservationV1(_ContractModel):
         "error",
     ]
     evidence_kind: BrowserAuthEvidence
+    # Page appearance only: never establishes authentication or an external identity.
+    browser_session_state: Literal["unknown", "signed_in_visible", "session_authenticated"] = "unknown"
     external_identity: ExternalIdentityV1 | None = None
     observed_at: datetime
     error_code: BrowserAccountErrorCode | None = None
@@ -758,8 +760,9 @@ class PortalSensitivePayloadV1(_ContractModel):
 
     value: SecretStr | None = Field(default=None)
     key: str | None = Field(default=None, min_length=1, max_length=32)
-    x: int | None = Field(default=None, ge=0, le=4096)
-    y: int | None = Field(default=None, ge=0, le=4096)
+    x: int | None = Field(default=None, ge=0, le=12288)
+    y: int | None = Field(default=None, ge=0, le=12288)
+    pointer_action: Literal["down", "move", "up"] | None = None
 
     @field_validator("value")
     @classmethod
@@ -976,6 +979,7 @@ class PortalPixelFrameV1(_ContractModel):
     view_generation: int = Field(ge=0)
     sequence: int = Field(ge=1)
     region_kind: Literal["qr", "form", "approved"]
+    focused_field_ref: str | None = Field(default=None, min_length=1, max_length=128)
     mime_type: Literal["image/png", "image/jpeg", "image/webp"]
     expires_at: datetime
     clip: PortalClipV1
@@ -1476,11 +1480,19 @@ class BrowserAccountRevisionCASV1(_ContractModel):
 
 
 class BrowserAccountUpdate(_ContractModel):
+    label: str | None = Field(default=None, min_length=1, max_length=255)
     auth_required: bool | None = None
     paused: bool | None = None
     status: BrowserAccountStatus | None = None
     status_reason_code: BrowserAccountErrorCode | None = None
     expected_revision: int = Field(ge=0)
+
+    @field_validator("label", mode="before")
+    @classmethod
+    def normalize_label(cls, value: Any) -> Any:
+        if value is None:
+            raise ValueError("account name cannot be null")
+        return value.strip() if isinstance(value, str) else value
 
 
 class BrowserLoginSessionRead(_ContractModel):
@@ -1501,12 +1513,12 @@ class BrowserLoginSessionRead(_ContractModel):
     profile_state: Literal["new", "uncommitted", "committed"]
     login_rule_id: str | None
     login_rule_version: str | None
-    tab_id: str | None
-    frame_id: str | None
+    tab_id: int | str | None
+    frame_id: int | str | None
     document_id: str | None
     origin: str | None
     view_generation: int
-    purpose: Literal["login", "execution"]
+    purpose: Literal["login", "execution", "browser"]
     execution_id: str | None
     command_id: str | None
     status: BrowserAccountStatus

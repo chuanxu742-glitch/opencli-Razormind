@@ -60,6 +60,12 @@ from typing import Any
 
 from fastapi import WebSocket
 
+from backend.browser_desktop_protocol import (
+    DESKTOP_MAX_BUFFERED_FRAMES,
+    BrowserDesktopRouteV1,
+    decode_desktop_frame,
+    encode_desktop_frame,
+)
 from backend.schemas.browser_account import (
     CommandExecutionGuardV1,
     DurableCommandV1,
@@ -125,6 +131,7 @@ class PortalTransport:
             maxsize=_PORTAL_QUEUE_MAX
         )
         self._closed = False
+        self._close_notified = False
         self._sequence = 0
 
     def _enqueue(self, frame: PortalWireFrameV1) -> None:
@@ -200,6 +207,234 @@ _portal_transports: dict[str, PortalTransport] = {}
 _portal_ready: dict[str, asyncio.Future[None]] = {}
 
 
+class BrowserDesktopTransport:
+    """Bounded bidirectional RFB relay over one authenticated node socket."""
+
+    def __init__(self, *, agent_url: str, websocket: WebSocket, route: BrowserDesktopRouteV1):
+        self.agent_url = agent_url
+        self.websocket = websocket
+        self.route = route
+        self._frames: asyncio.Queue[bytes | None] = asyncio.Queue(
+            maxsize=DESKTOP_MAX_BUFFERED_FRAMES
+        )
+        self._closed = False
+        self._close_notified = False
+        self._send_sequence = 0
+        self._receive_sequence = 0
+
+    def _enqueue(self, sequence: int, payload: bytes) -> None:
+        if self._closed:
+            return
+        if sequence <= self._receive_sequence:
+            raise RuntimeError("desktop output sequence did not increase")
+        try:
+            self._frames.put_nowait(payload)
+        except asyncio.QueueFull as exc:
+            self._finish()
+            raise RuntimeError("desktop receive buffer is full") from exc
+        self._receive_sequence = sequence
+
+    def _finish(self) -> None:
+        self._closed = True
+        while not self._frames.empty():
+            try:
+                self._frames.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        try:
+            self._frames.put_nowait(None)
+        except asyncio.QueueFull:
+            pass
+
+    async def receive(self) -> bytes | None:
+        if self._closed and self._frames.empty():
+            return None
+        return await self._frames.get()
+
+    async def send(self, payload: bytes) -> None:
+        if self._closed:
+            raise RuntimeError("desktop transport is closed")
+        self._send_sequence += 1
+        await self.websocket.send_bytes(
+            encode_desktop_frame(self.route.route_id, 0, self._send_sequence, payload)
+        )
+
+    async def close(self, *, reason: str = "closed") -> None:
+        if _desktop_transports.get(self.route.route_id) is self:
+            _desktop_transports.pop(self.route.route_id, None)
+        if _desktop_sessions.get(self.route.session_id) == self.route.route_id:
+            _desktop_sessions.pop(self.route.session_id, None)
+        ready = _desktop_ready.pop(self.route.route_id, None)
+        if ready is not None and not ready.done():
+            ready.set_exception(RuntimeError("desktop route closed before opening"))
+        self._finish()
+        if self._close_notified:
+            return
+        self._close_notified = True
+        try:
+            await self.websocket.send_json(
+                {
+                    "type": "browser_desktop_close",
+                    "route_id": self.route.route_id,
+                    "reason": reason[:128],
+                }
+            )
+        except Exception:
+            logger.debug("desktop close send failed", exc_info=True)
+
+
+_desktop_transports: dict[str, BrowserDesktopTransport] = {}
+_desktop_sessions: dict[str, str] = {}
+_desktop_ready: dict[str, asyncio.Future[None]] = {}
+
+
+async def open_browser_desktop_route(
+    agent_url: str,
+    session: SessionEnvelopeV1,
+    *,
+    expires_at,
+    timeout: float = 15.0,
+) -> BrowserDesktopTransport:
+    """Open a VNC route whose destination can only be resolved by the edge binding."""
+
+    envelope = SessionEnvelopeV1.model_validate(session)
+    if envelope.purpose != "browser" or envelope.profile_id is None:
+        raise ValueError("desktop routes require a live browser profile")
+    websocket = _connections.get(agent_url)
+    identity = _connection_identities.get(agent_url)
+    tunnel = _connection_tunnels.get(agent_url)
+    if websocket is None or identity is None or tunnel is None:
+        raise RuntimeError("desktop node is not connected through an authenticated tunnel")
+    if (identity.node_id, identity.boot_id) != (envelope.node_id, envelope.node_boot_id):
+        raise RuntimeError("desktop node identity does not own the session")
+    scope = getattr(websocket, "scope", None)
+    if isinstance(scope, dict) and scope.get("scheme") not in {"https", "wss"}:
+        raise RuntimeError("desktop node transport requires TLS WebSocket")
+    if envelope.session_id in _desktop_sessions:
+        raise RuntimeError("desktop session already has an active viewer")
+    route = BrowserDesktopRouteV1(
+        route_id=str(uuid.uuid4()),
+        workspace_id=envelope.workspace_id,
+        account_id=envelope.account_id,
+        session_id=envelope.session_id,
+        profile_id=envelope.profile_id,
+        node_id=envelope.node_id,
+        boot_id=envelope.node_boot_id,
+        lease_id=envelope.lease_id,
+        command_id=envelope.command_id,
+        epoch=envelope.epoch,
+        tunnel_handle=tunnel[0],
+        tunnel_auth_digest=tunnel[1],
+        expires_at=expires_at,
+    )
+    transport = BrowserDesktopTransport(agent_url=agent_url, websocket=websocket, route=route)
+    ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    _desktop_transports[route.route_id] = transport
+    _desktop_sessions[route.session_id] = route.route_id
+    _desktop_ready[route.route_id] = ready
+    try:
+        await websocket.send_json(
+            {"type": "browser_desktop_open", "route": route.model_dump(mode="json")}
+        )
+        await asyncio.wait_for(ready, timeout=timeout)
+        return transport
+    except BaseException:
+        _desktop_transports.pop(route.route_id, None)
+        _desktop_sessions.pop(route.session_id, None)
+        _desktop_ready.pop(route.route_id, None)
+        transport._finish()
+        try:
+            await websocket.send_json(
+                {
+                    "type": "browser_desktop_close",
+                    "route_id": route.route_id,
+                    "reason": "desktop_open_failed",
+                }
+            )
+        except Exception:
+            logger.debug("desktop open rollback send failed", exc_info=True)
+        raise
+
+
+def resolve_browser_desktop_ready(
+    agent_url: str, msg: dict[str, Any], source_ws: WebSocket | None = None
+) -> None:
+    route_id = msg.get("route_id", "")
+    transport = _desktop_transports.get(route_id)
+    if (
+        transport is None
+        or transport.agent_url != agent_url
+        or (source_ws is not None and transport.websocket is not source_ws)
+    ):
+        logger.warning("WS: unexpected desktop acknowledgement")
+        return
+    ready = _desktop_ready.get(route_id)
+    message_type = msg.get("type")
+    if message_type == "browser_desktop_closed":
+        transport._finish()
+        if _desktop_transports.get(route_id) is transport:
+            _desktop_transports.pop(route_id, None)
+        if _desktop_sessions.get(transport.route.session_id) == route_id:
+            _desktop_sessions.pop(transport.route.session_id, None)
+        _desktop_ready.pop(route_id, None)
+        if ready is not None and not ready.done():
+            ready.set_exception(RuntimeError("desktop route ended before opening"))
+        return
+    if ready is None or ready.done():
+        return
+    if message_type == "browser_desktop_ready":
+        ready.set_result(None)
+    else:
+        error = RuntimeError(str(msg.get("error") or "desktop route admission failed"))
+        transport._finish()
+        _desktop_transports.pop(route_id, None)
+        _desktop_sessions.pop(transport.route.session_id, None)
+        _desktop_ready.pop(route_id, None)
+        ready.set_exception(error)
+
+
+async def resolve_browser_desktop_binary(
+    agent_url: str, data: bytes, source_ws: WebSocket | None = None
+) -> None:
+    if source_ws is not None and _connections.get(agent_url) is not source_ws:
+        return
+    transport: BrowserDesktopTransport | None = None
+    try:
+        route_id, direction, sequence, payload = decode_desktop_frame(data)
+        if direction != 1:
+            raise ValueError("edge desktop frames must flow toward the center")
+        transport = _desktop_transports.get(route_id)
+        if (
+            transport is None
+            or transport.agent_url != agent_url
+            or (source_ws is not None and transport.websocket is not source_ws)
+        ):
+            return
+        transport._enqueue(sequence, payload)
+    except (ValueError, RuntimeError) as exc:
+        logger.warning("WS: desktop frame rejected: %s", exc)
+        if transport is not None:
+            await transport.close(reason="desktop_frame_rejected")
+        else:
+            await _abort_desktops_for_agent(agent_url, source_ws)
+
+
+async def _abort_desktops_for_agent(
+    agent_url: str,
+    source_ws: WebSocket | None = None,
+) -> None:
+    transports = [
+        transport
+        for transport in tuple(_desktop_transports.values())
+        if transport.agent_url == agent_url
+        and (source_ws is None or transport.websocket is source_ws)
+    ]
+    await asyncio.gather(
+        *(transport.close(reason="desktop_transport_aborted") for transport in transports),
+        return_exceptions=True,
+    )
+
+
 def register_connection(
     agent_url: str,
     ws: WebSocket,
@@ -253,6 +488,15 @@ def unregister_connection(agent_url: str, source_ws: WebSocket | None = None) ->
         ready = _portal_ready.pop(portal_id, None)
         if ready is not None and not ready.done():
             ready.set_exception(RuntimeError("portal owner disconnected before opening"))
+    for route_id, transport in tuple(_desktop_transports.items()):
+        if transport.websocket is not current:
+            continue
+        transport._finish()
+        _desktop_transports.pop(route_id, None)
+        _desktop_sessions.pop(transport.route.session_id, None)
+        ready = _desktop_ready.pop(route_id, None)
+        if ready is not None and not ready.done():
+            ready.set_exception(RuntimeError("desktop owner disconnected before opening"))
     logger.info("WS agent disconnected: %s (remaining=%d)", agent_url, len(_connections))
 
     dead_request_ids = [
@@ -487,6 +731,27 @@ def list_connected() -> list[str]:
     return list(_connections.keys())
 
 
+def account_connection_identity(agent_url: str) -> NodeIdentityV1 | None:
+    return _connection_identities.get(agent_url) if agent_url in _connections else None
+
+
+async def send_account_lease_renewal(
+    agent_url: str, claim: NodeClaimV1, session: SessionEnvelopeV1,
+) -> None:
+    identity = NodeIdentityV1(node_id=claim.node_id, boot_id=claim.boot_id)
+    ws = _connections.get(agent_url)
+    if ws is None or _connection_identities.get(agent_url) != identity:
+        raise RuntimeError("account connection generation changed")
+    if (session.node_id, session.node_boot_id, session.command_id) != (
+        claim.node_id, claim.boot_id, claim.command_id,
+    ):
+        raise ValueError("lease renewal session mismatch")
+    await ws.send_json({
+        "type": "account_lease_renewed", "claim": claim.to_wire(),
+        "session": session.to_wire(), "node_identity": identity.to_wire(),
+    })
+
+
 async def dispatch_collect(
     agent_url: str,
     site: str,
@@ -599,6 +864,8 @@ async def send_agent_task(
             identity = NodeIdentityV1.model_validate(payload.get("node_identity"))
             if identity.node_id != claim.node_id or identity.boot_id != claim.boot_id:
                 raise ValueError("runtime node identity does not match claim")
+            if _connection_identities.get(agent_url) != identity:
+                raise ValueError("runtime node identity does not match authenticated socket")
             CommandExecutionGuardV1(command=command, claim=claim, session=session)
         except ValueError as exc:
             raise ValueError("invalid account runtime envelope") from exc

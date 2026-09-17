@@ -52,6 +52,7 @@ from backend.models.gaojixing_collection import (
     GaojixingQuestionStatus,
     GaojixingRuntimeLease,
 )
+from backend.models.geo_observation import GeoAnswerObservation
 from backend.models.feed_provider import FeedProvider
 from backend.models.identity import (
     LocalAdmin,
@@ -165,6 +166,7 @@ __all__ = [
     "AgentConversationTurn",
     "AgentConversationTurnStatus",
     "Automation",
+    "GeoAnswerObservation",
     "BrowserAccount",
     "BrowserAccountLease",
     "BrowserAccountStatus",

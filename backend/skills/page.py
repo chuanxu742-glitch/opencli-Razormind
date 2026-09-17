@@ -107,9 +107,7 @@ class SkillPage:
         exposed to the model (ADR-0003 D3 forbids a model-facing ``evaluate``).
         """
         sign = -1 if str(direction).lower() in ("up", "top", "-1") else 1
-        await self.page.evaluate(
-            "(s) => window.scrollBy(0, s * window.innerHeight)", sign
-        )
+        await self.page.evaluate("(s) => window.scrollBy(0, s * window.innerHeight)", sign)
 
     async def inner_text(self) -> str:
         """Return the page's visible text (for the ``extract`` verb). Text, not HTML."""
@@ -120,7 +118,24 @@ class SkillPage:
         return await self.inner_text()
 
 
-async def open_skill_page(cdp_endpoint: str) -> SkillPage:
+async def _page_for_cdp_target(browser: Any, target_id: str) -> Any:
+    """Match Chrome's opaque CDP target id, never a URL or page position."""
+    matches = []
+    for context in browser.contexts:
+        for page in context.pages:
+            channel = await context.new_cdp_session(page)
+            try:
+                info = await channel.send("Target.getTargetInfo")
+                if info.get("targetInfo", {}).get("targetId") == target_id:
+                    matches.append(page)
+            finally:
+                await channel.detach()
+    if len(matches) != 1:
+        raise RuntimeError("authorized CDP page target is missing or ambiguous")
+    return matches[0]
+
+
+async def open_skill_page(cdp_endpoint: str, *, target_id: str | None = None) -> SkillPage:
     """Connect to an already-running Chrome over CDP and return a ``SkillPage``.
 
     ``cdp_endpoint`` is exactly the value
@@ -135,8 +150,15 @@ async def open_skill_page(cdp_endpoint: str) -> SkillPage:
     pw = await async_playwright().start()
     browser = await pw.chromium.connect_over_cdp(cdp_endpoint)
 
-    context = browser.contexts[0] if browser.contexts else await browser.new_context()
-    page = context.pages[0] if context.pages else await context.new_page()
+    try:
+        if target_id is not None:
+            page = await _page_for_cdp_target(browser, target_id)
+        else:
+            context = browser.contexts[0] if browser.contexts else await browser.new_context()
+            page = context.pages[0] if context.pages else await context.new_page()
+    except BaseException:
+        await SkillPage(pw, browser, None).aclose()
+        raise
 
     logger.info("SkillPage: connected over CDP to %s", cdp_endpoint)
     return SkillPage(pw, browser, page)

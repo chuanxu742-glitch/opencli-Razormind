@@ -1,0 +1,27 @@
+{
+  "id": "official-taobao",
+  "version": "0.1.0",
+  "platform": "taobao",
+  "allowed_origins": [
+    "https://login.taobao.com"
+  ],
+  "allowed_redirect_origins": [
+    "https://login.taobao.com"
+  ],
+  "login_url": "/member/login.jhtml",
+  "modes": [
+    "form"
+  ],
+  "qr_supported": false,
+  "interaction_supported": true,
+  "identity_probe_supported": false,
+  "authentication_verified": false,
+  "selectors": [
+    {
+      "id": "form",
+      "selector": "body",
+      "kind": "form",
+      "frame": "main"
+    }
+  ]
+}

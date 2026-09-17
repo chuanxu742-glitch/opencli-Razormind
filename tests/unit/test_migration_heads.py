@@ -22,7 +22,7 @@ def test_alembic_has_one_head():
     config = Config()
     config.set_main_option("script_location", "backend/migrations")
 
-    assert ScriptDirectory.from_config(config).get_heads() == ["add_workflow_run_actor"]
+    assert ScriptDirectory.from_config(config).get_heads() == ["add_browser_session_purpose"]
 
 
 def test_ci_downgrade_target_is_unambiguous():
@@ -97,6 +97,7 @@ def test_upgrade_head_creates_identity_and_operations_tables(monkeypatch):
         "browser_profile_manifests",
         "browser_portal_tickets",
         "browser_portal_owners",
+        "geo_answer_observations",
     } <= tables
     assert "requested_by_user_id" in task_columns
     assert any(

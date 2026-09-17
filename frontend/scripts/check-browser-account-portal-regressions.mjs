@@ -42,6 +42,7 @@ const {
   encodePortalControlFrame,
   isNewPortalSequence,
   portalWebSocketUrl,
+  portalPointerCoordinates,
 } = await import(pathToFileURL(path.join(frontendRoot, 'lib/browser-accounts/portal-protocol.ts')).href)
 
 const { useBrowserAccountPortal } = await import(pathToFileURL(path.join(frontendRoot, 'hooks/use-browser-account-portal.ts')).href)
@@ -78,7 +79,7 @@ function binaryFrame({ metadata = {}, payload = new Uint8Array(), encoding = 1, 
   return result.buffer
 }
 
-function validPixelFrame({ sequence = 1, ...overrides } = {}) {
+function validPixelFrame({ sequence = 1, pixel = {}, ...overrides } = {}) {
   const payload = new Uint8Array([137, 80, 78, 71])
   return binaryFrame({
     payload,
@@ -91,6 +92,8 @@ function validPixelFrame({ sequence = 1, ...overrides } = {}) {
         region_kind: 'qr',
         byte_length: payload.byteLength,
         expires_at: new Date(Date.now() + 60_000).toISOString(),
+        clip: { x: 40, y: 60, width: 800, height: 600 },
+        ...pixel,
       },
       ...overrides,
     },
@@ -104,6 +107,7 @@ class HookRunner {
     this.stateCursor = 0
     this.refCursor = 0
     this.cleanup = null
+    this.effectDependencies = null
   }
 
   useState(initial) {
@@ -124,7 +128,10 @@ class HookRunner {
     return this.refs[index]
   }
 
-  useEffect(effect) {
+  useEffect(effect, dependencies) {
+    if (this.effectDependencies && dependencies.every((value, index) => Object.is(value, this.effectDependencies[index]))) return
+    this.cleanup?.()
+    this.effectDependencies = dependencies
     this.cleanup = effect()
   }
 
@@ -286,6 +293,7 @@ test('valid binary portal control and pixel frames decode with payload and bindi
   assert.deepEqual([...decoded.bytes], [137, 80, 78, 71])
   assert.equal(decoded.pixel.region_kind, 'qr')
   assert.equal(decoded.pixel.mime_type, 'image/png')
+  assert.deepEqual(decoded.pixel.clip, { x: 40, y: 60, width: 800, height: 600 })
   assert.deepEqual(decoded.binding, binding)
 
   const control = decodePortalBinaryFrame(binaryFrame({
@@ -294,6 +302,83 @@ test('valid binary portal control and pixel frames decode with payload and bindi
   }), binding)
   assert.equal(control?.kind, 'control')
   assert.equal(control.control.kind, 'request_view')
+  const nullableControl = decodePortalBinaryFrame(binaryFrame({
+    encoding: 0,
+    metadata: { message: { ...binding, sequence: 1, kind: 'request_view', field_ref: null, focused_field_ref: null } },
+  }), binding)
+  assert.equal(nullableControl?.kind, 'control')
+  assert.equal(nullableControl.control.focused_field_ref, null)
+  const nullablePixel = decodePortalBinaryFrame(validPixelFrame({ pixel: { focused_field_ref: null } }), binding)
+  assert.equal(nullablePixel?.kind, 'pixel')
+  assert.equal(nullablePixel.pixel.focused_field_ref, null)
+})
+
+test('portal coordinates use the actual rendered bounds and approved clip', () => {
+  const clip = { x: 300, y: 100, width: 1200, height: 600 }
+  const bounds = { left: 20, top: 40, width: 300, height: 150 }
+  assert.deepEqual(portalPointerCoordinates(clip, bounds, 170, 115), { x: 900, y: 400 })
+  assert.deepEqual(portalPointerCoordinates(clip, bounds, -50, 900), { x: 300, y: 699 })
+  assert.equal(portalPointerCoordinates(clip, { ...bounds, width: 0 }, 170, 115), null)
+  for (const invalid of [null, {}, { ...clip, width: 0 }, { ...clip, x: -1 }, { ...clip, y: 9000 }]) {
+    assert.equal(decodePortalBinaryFrame(validPixelFrame({ pixel: { clip: invalid } }), binding), null)
+  }
+})
+
+function outgoingControl(frame) {
+  const view = new DataView(frame)
+  return JSON.parse(new TextDecoder().decode(new Uint8Array(frame).slice(16, 16 + view.getUint16(8)))).message
+}
+
+test('QR takeover and form pointer/key controls preserve sequence and transient payloads', async () => {
+  const harness = installPortalHarness()
+  harness.runner.render()
+  await flushAsyncWork()
+  const socket = MockWebSocket.instances[0]
+  socket.open()
+  socket.message(validPixelFrame({ sequence: 2 }))
+  let state = harness.runner.render()
+  state.sendPointer('down', 100, 100)
+  state.sendKey('Enter')
+  assert.equal(socket.sent.length, 1, 'QR image must remain display-only')
+  state.requestTakeover()
+  assert.equal(outgoingControl(socket.sent.at(-1)).kind, 'takeover')
+  socket.message(validPixelFrame({ sequence: 3, pixel: { region_kind: 'form', focused_field_ref: 'field-1' } }))
+  state = harness.runner.render()
+  assert.deepEqual(state.frameClip, { x: 40, y: 60, width: 800, height: 600 })
+  state.sendPointer('down', 100, 100)
+  state.sendPointer('move', 200, 100)
+  state.sendPointer('up', 300, 100)
+  for (const key of ['Tab', 'Enter', 'Backspace', 'Escape']) state.sendKey(key)
+  const controls = socket.sent.map(outgoingControl)
+  assert.deepEqual(controls.slice(2, 5).map((control) => control.sensitive_payload), [
+    { value_present: false, key: null, x: 100, y: 100, pointer_action: 'down' },
+    { value_present: false, key: null, x: 200, y: 100, pointer_action: 'move' },
+    { value_present: false, key: null, x: 300, y: 100, pointer_action: 'up' },
+  ])
+  assert.deepEqual(controls.slice(5).map((control) => control.sensitive_payload.key), ['Tab', 'Enter', 'Backspace', 'Escape'])
+  assert.deepEqual(controls[5].sensitive_payload, { value_present: false, key: 'Tab', x: null, y: null })
+  assert.deepEqual(controls.map((control) => control.sequence), controls.map((_, index) => index + 1))
+  const sent = socket.sent.length
+  state.sendPointer('down', 1, 1)
+  state.sendPointer('down', 100.5, 100)
+  state.sendKey('a')
+  assert.equal(socket.sent.length, sent)
+  state.setInput('temporary-code')
+  state = harness.runner.render()
+  state.sendInput()
+  assert.equal(outgoingControl(socket.sent.at(-1)).field_ref, 'field-1')
+  assert.equal(harness.runner.render().input, '')
+  const frame = socket.sent.at(-1)
+  const offset = 16 + new DataView(frame).getUint16(8)
+  assert.equal(new TextDecoder().decode(new Uint8Array(frame).slice(offset)), 'temporary-code')
+  socket.message(validPixelFrame({ sequence: 4, pixel: { region_kind: 'approved' } }))
+  harness.runner.render().sendKey('Tab')
+  assert.equal(outgoingControl(socket.sent.at(-1)).sensitive_payload.key, 'Tab')
+  harness.runner.unmount()
+  const afterUnmount = socket.sent.length
+  state.sendKey('Enter')
+  state.sendPointer('down', 100, 100)
+  assert.equal(socket.sent.length, afterUnmount)
 })
 
 test('malformed, header, and declared-length frames are rejected', () => {
@@ -423,6 +508,49 @@ test('authorization finishing after unmount never redeems a ticket', async () =>
   await flushAsyncWork()
   assert.equal(harness.api.redeemCalls, 0)
   assert.equal(MockWebSocket.instances.length, 0)
+})
+
+test('only explicit normal route expiry schedules fresh authorization', async () => {
+  const harness = installPortalHarness()
+  harness.runner.render()
+  await flushAsyncWork()
+  const socket = MockWebSocket.instances[0]
+  socket.open()
+  socket.message(validPixelFrame({ sequence: 2 }))
+  socket.onclose({ code: 1000, reason: 'Portal route expired' })
+  assert.equal(harness.runner.states[2], null)
+  assert.equal(harness.timers.active.size, 1)
+  const timer = [...harness.timers.active.values()][0]
+  assert.equal(timer.delay, 500)
+  timer.callback()
+  harness.runner.cleanup()
+  harness.runner.render()
+  await flushAsyncWork()
+  assert.equal(harness.api.issueCalls, 2)
+  assert.equal(harness.api.redeemCalls, 2)
+  assert.equal(MockWebSocket.instances.length, 2)
+  MockWebSocket.instances[1].onclose({ code: 4403, reason: 'Portal route expired' })
+  assert.equal(harness.timers.active.size, 0)
+  harness.runner.unmount()
+})
+
+test('pixel refresh requests a new view without extending the old pixel lifetime', async () => {
+  const harness = installPortalHarness()
+  harness.runner.render()
+  await flushAsyncWork()
+  const socket = MockWebSocket.instances[0]
+  socket.open()
+  socket.message(validPixelFrame({ sequence: 2 }))
+  const [timerId, timer] = [...harness.timers.active][0]
+  assert.ok(timer.delay <= 2000)
+  harness.timers.active.delete(timerId)
+  timer.callback()
+  assert.equal(socket.sent.length, 2)
+  assert.equal(decodePortalBinaryFrame(socket.sent[1], binding).control.kind, 'request_view')
+  const expiry = [...harness.timers.active.values()][0]
+  expiry.callback()
+  assert.equal(harness.runner.states[2], null)
+  harness.runner.unmount()
 })
 
 test('redemption finishing after unmount never opens a socket', async () => {

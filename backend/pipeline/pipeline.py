@@ -269,6 +269,23 @@ async def run_pipeline(
 
     started = datetime.now(timezone.utc)
     params = dict(parameters or {})
+    from backend.pipeline.geo_observations import geo_observation_capture_enabled
+
+    try:
+        geo_observation_capture = geo_observation_capture_enabled(
+            source.channel_type, source.channel_config
+        )
+    except ValueError as exc:
+        return PipelineResult(success=False, source_id=source.id, error=str(exc))
+    if geo_observation_capture and getattr(source, "write_strategy", None) == "odp_only":
+        return PipelineResult(
+            success=False,
+            source_id=source.id,
+            error=(
+                "GEO observation capture requires a local record sink; "
+                "write_strategy=odp_only is unsupported"
+            ),
+        )
     account_ref = None
     account_session = None
     try:
@@ -504,6 +521,8 @@ async def run_pipeline(
             account_ref.source_binding_revision_id if account_ref is not None else None
         ),
         lineage=collection_lineage,
+        geo_observation_capture=geo_observation_capture,
+        observed_at=datetime.now(timezone.utc),
     )
     logger.info("[task:%s] step2-3/sink start | sink=%s items=%d",
                 task_id, type(active_sink).__name__, channel_result.count)

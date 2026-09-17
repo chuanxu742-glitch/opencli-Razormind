@@ -1,0 +1,51 @@
+{
+  "name": "opencli-default",
+  "version": "4",
+  "components": [
+    {
+      "kind": "extension",
+      "id": "opencli-browser-bridge",
+      "version": "0.1.0",
+      "path": "extensions/opencli-browser-bridge",
+      "required": true,
+      "capabilities": []
+    },
+    {
+      "kind": "extension",
+      "id": "opencli-script-host",
+      "version": "1.4.3",
+      "path": "extensions/opencli-script-host",
+      "required": true,
+      "capabilities": [
+        "page.metadata"
+      ]
+    },
+    {
+      "kind": "extension",
+      "id": "violentmonkey",
+      "version": "2.48.0",
+      "path": "extensions/violentmonkey",
+      "required": true,
+      "capabilities": []
+    }
+  ],
+  "capabilities": [
+    {
+      "name": "page.metadata",
+      "component_id": "opencli-script-host",
+      "action": "page.metadata",
+      "runtime": "script-host",
+      "args_schema": {
+        "type": "object",
+        "additionalProperties": false
+      },
+      "allowed_hosts": [],
+      "risk": "low",
+      "required_gate": null,
+      "config": {
+        "pack": "page-basics"
+      }
+    }
+  ],
+  "act_pack_ids": []
+}

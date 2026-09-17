@@ -257,7 +257,7 @@ class BrowserLoginSession(TimestampMixin):
     __table_args__ = (
         UniqueConstraint("workspace_id", "id", name="uq_browser_login_sessions_workspace_id"),
         CheckConstraint(
-            "purpose IN ('login', 'execution')",
+            "purpose IN ('login', 'execution', 'browser')",
             name="ck_browser_login_sessions_purpose",
         ),
         CheckConstraint(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import secrets
 from datetime import UTC, datetime
 from typing import Literal
@@ -26,7 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.database import AsyncSessionLocal, get_db
+from backend.database import AsyncSessionLocal, commit_session, get_db
 from backend.models.browser import BrowserAccount, BrowserAccountStatus, BrowserLoginSession
 from backend.models.browser_portal import BrowserPortalOwner
 from backend.schemas.browser_account import (
@@ -56,11 +57,16 @@ from backend.security.workspace_rbac import (
     require_permission,
 )
 from backend.services import browser_account_service
+from backend.services.browser_account_login_options import (
+    get_login_readiness,
+    workspace_login_options,
+)
 
 router = APIRouter(
     prefix="/workspaces/{workspace_id}/browser-accounts",
     tags=["browser-accounts"],
 )
+logger = logging.getLogger(__name__)
 
 
 class LoginSessionRefresh(BaseModel):
@@ -82,6 +88,33 @@ class LoginSessionClose(BaseModel):
 
     expected_revision: int | None = Field(default=None, ge=0)
     reason: Literal["completed", "cancelled", "expired", "error"] = "cancelled"
+
+
+class BrowserDesktopGrantResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["granted"] = "granted"
+    websocket_path: str
+    expires_at: datetime
+    hard_expires_at: datetime
+    session_id: str
+    session_revision: int
+    max_session_seconds: Literal[1800] = 1800
+
+
+class BrowserNativeWindowSupportResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    available: bool
+    message: str
+
+
+class BrowserNativeWindowResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["opened", "already_open"]
+    session_id: str
+    message: str
 
 
 def _operation_response(
@@ -122,7 +155,15 @@ def _account_read(account: object) -> BrowserAccountRead:
 
 
 def _session_read(session: object) -> BrowserLoginSessionRead:
-    return BrowserLoginSessionRead.model_validate(session)
+    parsed = BrowserLoginSessionRead.model_validate(session)
+    # Persisted Chrome IDs are strings; expose their canonical numeric wire form.
+    return parsed.model_copy(
+        update={
+            field: int(value)
+            for field in ("tab_id", "frame_id")
+            if isinstance(value := getattr(parsed, field), str) and value.isdecimal()
+        }
+    )
 
 
 def _require_operator_or_manager(access: WorkspaceAccess) -> None:
@@ -202,6 +243,57 @@ async def create_browser_account(
     return ApiResponse.ok(_account_read(account))
 
 
+@router.get("/login-options", response_model=ApiResponse)
+async def get_browser_account_login_options(
+    workspace_id: str,
+    identity: RequestIdentity = Depends(get_request_identity),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse:
+    access = await get_workspace_access(db, workspace_id, identity)
+    require_permission(access, WorkspacePermission.READ)
+    return ApiResponse.ok(await workspace_login_options(db))
+
+
+@router.get(
+    "/native-window-support",
+    response_model=ApiResponse[BrowserNativeWindowSupportResponse],
+)
+async def get_browser_native_window_support(
+    workspace_id: str,
+    request: Request,
+    identity: RequestIdentity = Depends(get_request_identity),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse:
+    """Report whether this API host can launch the configured native viewer."""
+
+    from backend.services.browser_native_window import native_window_manager
+
+    # Same-origin browser GET requests need not carry Origin. This endpoint is
+    # read-only and still requires authenticated workspace operator permission.
+    if request.headers.get("origin"):
+        _require_same_origin(request)
+    access = await get_workspace_access(db, workspace_id, identity)
+    _require_operator_or_manager(access)
+    support = native_window_manager.support()
+    return ApiResponse.ok(BrowserNativeWindowSupportResponse(**support.__dict__))
+
+
+@router.get("/{account_id}/login-readiness", response_model=ApiResponse)
+async def get_browser_account_login_readiness(
+    workspace_id: str,
+    account_id: str,
+    identity: RequestIdentity = Depends(get_request_identity),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse:
+    access = await get_workspace_access(db, workspace_id, identity)
+    require_permission(access, WorkspacePermission.READ)
+    try:
+        readiness = await get_login_readiness(db, workspace_id, account_id)
+    except browser_account_service.BrowserAccountError as exc:
+        raise _http_error(exc) from exc
+    return ApiResponse.ok(readiness)
+
+
 @router.get("/{account_id}", response_model=ApiResponse[BrowserAccountRead])
 async def get_browser_account(
     workspace_id: str,
@@ -216,6 +308,27 @@ async def get_browser_account(
     except browser_account_service.BrowserAccountError as exc:
         raise _http_error(exc) from exc
     return ApiResponse.ok(_account_read(account))
+
+
+@router.delete("/{account_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_browser_account(
+    workspace_id: str,
+    account_id: str,
+    if_match: str | None = Header(default=None, alias="If-Match"),
+    identity: RequestIdentity = Depends(get_request_identity),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    access = await get_workspace_access(db, workspace_id, identity)
+    require_permission(access, WorkspacePermission.MANAGE_CONFIGURATION)
+    revision = _effective_revision(if_match, None)
+    if revision is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "revision precondition is required")
+    try:
+        await browser_account_service.delete_browser_account(db, workspace_id, account_id, revision)
+        await commit_session(db)
+    except browser_account_service.BrowserAccountError as exc:
+        raise _http_error(exc) from exc
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.patch("/{account_id}", response_model=ApiResponse[BrowserAccountRead])
@@ -395,6 +508,62 @@ async def create_account_login_session(
     access = await get_workspace_access(db, workspace_id, identity)
     _require_operator_or_manager(access)
     try:
+        if body.purpose in {"login", "browser"}:
+            account = await browser_account_service.get_browser_account(
+                db, workspace_id, account_id, for_update=True
+            )
+            active = await db.scalar(
+                select(BrowserLoginSession).where(
+                    BrowserLoginSession.workspace_id == workspace_id,
+                    BrowserLoginSession.account_id == account_id,
+                    BrowserLoginSession.status.in_(
+                        browser_account_service.ACTIVE_BROWSER_SESSION_STATUSES
+                    ),
+                )
+            )
+            # Reusing/promoting a live stack must not depend on a fresh capacity
+            # or readiness cache. New stacks still pass the complete matching
+            # and runtime-readiness gate for both login and browser purposes.
+            if active is None:
+                if (
+                    not account.node_id
+                    and not account.runtime_bundle_id
+                    and not (
+                        account.profile_id
+                        or account.profile_version
+                        or account.profile_manifest_id
+                    )
+                ):
+                    from backend.services.browser_account_login_options import (
+                        match_new_account_login,
+                    )
+
+                    if account.revision != body.expected_revision:
+                        raise browser_account_service.BrowserAccountError(
+                            "stale_generation", "account revision is stale", 409
+                        )
+                    matched = await match_new_account_login(
+                        db, account.site, require_free_slot=False
+                    )
+                    if matched and matched.get("node_id"):
+                        for key, value in matched.items():
+                            setattr(account, key, value)
+                        from backend.models.browser import BrowserRuntimeBundle
+
+                        bundle = await db.get(
+                            BrowserRuntimeBundle, account.runtime_bundle_id
+                        )
+                        account.runtime_bundle_version = bundle.version
+                        await db.flush()
+                readiness = await get_login_readiness(db, workspace_id, account_id)
+                if not readiness.ready and readiness.code not in {
+                    "capacity_full",
+                    "session_queued",
+                    "pool_pending",
+                }:
+                    raise browser_account_service.BrowserAccountError(
+                        readiness.code, readiness.message, 409
+                    )
         session = await browser_account_service.create_login_session(
             db,
             workspace_id,
@@ -406,7 +575,10 @@ async def create_account_login_session(
         )
     except browser_account_service.BrowserAccountError as exc:
         raise _http_error(exc) from exc
-    return ApiResponse.ok(_session_read(session))
+    response = ApiResponse.ok(_session_read(session))
+    # The next request may use another connection before dependency cleanup runs.
+    await commit_session(db)
+    return response
 
 
 @router.get(
@@ -605,11 +777,33 @@ def _http_origin(scheme: str, netloc: str) -> str:
     return f"{scheme}://{netloc}"
 
 
+def _portal_expected_origin(scheme: str, netloc: str) -> str:
+    from urllib.parse import urlsplit
+
+    from backend.config import get_settings
+
+    configured = get_settings().browser_portal_public_origin
+    if not configured:
+        return _http_origin(scheme, netloc)
+    parsed = urlsplit(configured)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("browser portal public origin must be an exact HTTP origin")
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
 def _require_same_origin(request: Request) -> None:
     origin = request.headers.get("origin")
     if not origin:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Origin header required")
-    expected = _http_origin(request.url.scheme, request.url.netloc)
+    expected = _portal_expected_origin(request.url.scheme, request.url.netloc)
     if origin.rstrip("/") != expected.rstrip("/"):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Origin is not allowed")
 
@@ -630,11 +824,12 @@ async def _close_portal_socket(
     state: dict[str, object],
     *,
     reason: str,
+    code: int = 4403,
 ) -> None:
     _ACTIVE_PORTAL_SOCKETS.pop(key, None)
     websocket = state["websocket"]
     try:
-        await websocket.close(code=4403, reason=reason)  # type: ignore[union-attr]
+        await websocket.close(code=code, reason=reason)  # type: ignore[union-attr]
     except Exception:
         # The peer may already have disconnected; revocation remains fail-closed.
         pass
@@ -695,7 +890,10 @@ async def _portal_authorization_monitor() -> None:
                     or snapshot.facts.role not in {"admin", "maintainer", "operator"}
                     or snapshot.facts.session_revoked
                     or snapshot.account_paused
-                    or (snapshot.account_auth_required and snapshot.session_purpose != "login")
+                    or (
+                        snapshot.account_auth_required
+                        and snapshot.session_purpose == "execution"
+                    )
                     or snapshot.facts.session_revision != state["session_revision"]
                     or checked_at >= owner_expires_at
                     or checked_at >= owner_hard_expires_at
@@ -789,6 +987,245 @@ async def redeem_account_portal_ticket(
     return ApiResponse.ok(outcome)
 
 
+@router.post(
+    "/{account_id}/login-sessions/{session_id}/native-window",
+    response_model=ApiResponse[BrowserNativeWindowResponse],
+)
+async def open_account_browser_native_window(
+    workspace_id: str,
+    account_id: str,
+    session_id: str,
+    request: Request,
+    identity: RequestIdentity = Depends(get_request_identity),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse:
+    """Launch the configured local viewer for one authorized browser session."""
+
+    from backend.services.browser_desktop_service import authorize_browser_desktop
+    from backend.services.browser_native_window import (
+        BrowserNativeWindowError,
+        native_window_manager,
+    )
+
+    _require_same_origin(request)
+    access = await get_workspace_access(db, workspace_id, identity)
+    _require_operator_or_manager(access)
+    support = native_window_manager.support()
+    if not support.available:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, support.message)
+    authorization = await authorize_browser_desktop(
+        db,
+        workspace_id,
+        account_id,
+        session_id,
+        subject=identity.subject,
+    )
+    if authorization is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "隔离浏览器尚未就绪或授权已失效"
+        )
+    try:
+        account = await browser_account_service.get_browser_account(
+            db, workspace_id, account_id
+        )
+        result = await native_window_manager.open(
+            authorization,
+            subject=identity.subject,
+            account_label=account.label,
+        )
+    except BrowserNativeWindowError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
+    return ApiResponse.ok(BrowserNativeWindowResponse(**result.__dict__))
+
+
+@router.post(
+    "/{account_id}/login-sessions/{session_id}/browser-grant",
+    response_model=ApiResponse[BrowserDesktopGrantResponse],
+)
+async def issue_browser_desktop_grant(
+    workspace_id: str,
+    account_id: str,
+    session_id: str,
+    request: Request,
+    response: Response,
+    identity: RequestIdentity = Depends(get_request_identity),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse:
+    """Exchange current API authorization for a short-lived HttpOnly desktop cookie."""
+
+    from backend.services.browser_desktop_service import (
+        DESKTOP_COOKIE_NAME,
+        authorize_browser_desktop,
+        grant_store,
+    )
+
+    _require_same_origin(request)
+    access = await get_workspace_access(db, workspace_id, identity)
+    _require_operator_or_manager(access)
+    authorization = await authorize_browser_desktop(
+        db, workspace_id, account_id, session_id, subject=identity.subject
+    )
+    if authorization is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "隔离浏览器尚未就绪或授权已失效")
+    token, grant = grant_store.issue(authorization, subject=identity.subject)
+    websocket_path = (
+        f"/api/v1/workspaces/{workspace_id}/browser-accounts/{account_id}"
+        f"/login-sessions/{session_id}/browser"
+    )
+    response.set_cookie(
+        key=DESKTOP_COOKIE_NAME,
+        value=token,
+        max_age=max(1, int((grant.expires_at - datetime.now(UTC)).total_seconds())),
+        httponly=True,
+        secure=True,
+        samesite="strict",
+        path=websocket_path,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return ApiResponse.ok(
+        BrowserDesktopGrantResponse(
+            websocket_path=websocket_path,
+            expires_at=grant.expires_at,
+            hard_expires_at=grant.hard_expires_at,
+            session_id=session_id,
+            session_revision=authorization.session_revision,
+        )
+    )
+
+
+@router.websocket("/{account_id}/login-sessions/{session_id}/browser")
+async def account_browser_desktop_websocket(
+    websocket: WebSocket,
+    workspace_id: str,
+    account_id: str,
+    session_id: str,
+) -> None:
+    """Relay a raw noVNC/RFB stream without exposing the node VNC endpoint."""
+
+    from backend import ws_agent_manager
+    from backend.browser_desktop_protocol import DESKTOP_MAX_PAYLOAD_BYTES
+    from backend.services.browser_desktop_service import (
+        DESKTOP_COOKIE_NAME,
+        authorize_browser_desktop,
+        grant_matches_authorization,
+        grant_store,
+    )
+
+    origin = websocket.headers.get("origin")
+    expected_origin = _portal_expected_origin(websocket.url.scheme, websocket.url.netloc)
+    cookie = websocket.cookies.get(DESKTOP_COOKIE_NAME)
+    grant = grant_store.resolve(cookie) if cookie else None
+    if (
+        grant is None
+        or not origin
+        or origin.rstrip("/") != expected_origin.rstrip("/")
+        or (grant.workspace_id, grant.account_id, grant.session_id)
+        != (workspace_id, account_id, session_id)
+    ):
+        await websocket.close(code=4403, reason="Desktop origin or cookie authentication failed")
+        return
+    async with AsyncSessionLocal() as db:
+        authorization = await authorize_browser_desktop(
+            db, workspace_id, account_id, session_id, subject=grant.subject
+        )
+    if authorization is None or not grant_matches_authorization(grant, authorization):
+        grant_store.revoke(grant.digest)
+        await websocket.close(code=4403, reason="Desktop authorization is no longer current")
+        return
+
+    await websocket.accept()
+    transport = None
+    stop = asyncio.Event()
+    relay_tasks: list[asyncio.Task[None]] = []
+
+    async def monitor_authorization() -> None:
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=0.5)
+                return
+            except TimeoutError:
+                pass
+            current = grant_store.resolve(cookie)
+            if current is None or datetime.now(UTC) >= grant.hard_expires_at:
+                break
+            try:
+                async with asyncio.timeout(0.5):
+                    async with AsyncSessionLocal() as monitor_db:
+                        snapshot = await authorize_browser_desktop(
+                            monitor_db,
+                            workspace_id,
+                            account_id,
+                            session_id,
+                            subject=grant.subject,
+                        )
+            except Exception:
+                snapshot = None
+            if snapshot is None or not grant_matches_authorization(grant, snapshot):
+                break
+        stop.set()
+        try:
+            await websocket.close(code=4403, reason="Desktop authorization was revoked")
+        except Exception:
+            pass
+
+    try:
+        monitor_task = asyncio.create_task(monitor_authorization())
+        relay_tasks.append(monitor_task)
+        transport = await ws_agent_manager.open_browser_desktop_route(
+            authorization.endpoint,
+            authorization.envelope,
+            expires_at=grant.hard_expires_at,
+        )
+        if stop.is_set() or grant_store.resolve(cookie) is None:
+            raise RuntimeError("desktop authorization ended while opening the node route")
+
+        async def relay_input() -> None:
+            while not stop.is_set():
+                message = await websocket.receive()
+                if message["type"] == "websocket.disconnect":
+                    return
+                payload = message.get("bytes")
+                if payload is None:
+                    raise ValueError("desktop transport accepts binary RFB frames only")
+                if not payload or len(payload) > DESKTOP_MAX_PAYLOAD_BYTES:
+                    raise ValueError("desktop RFB frame exceeds the transport limit")
+                await transport.send(payload)
+
+        async def relay_output() -> None:
+            while not stop.is_set():
+                payload = await transport.receive()
+                if payload is None:
+                    return
+                await websocket.send_bytes(payload)
+
+        relay_tasks.extend([
+            asyncio.create_task(relay_input()),
+            asyncio.create_task(relay_output()),
+        ])
+        done, pending = await asyncio.wait(
+            relay_tasks, return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*done, *pending, return_exceptions=True)
+    except Exception:
+        logger.info("Browser desktop connection ended", exc_info=True)
+    finally:
+        stop.set()
+        for task in relay_tasks:
+            if not task.done():
+                task.cancel()
+        if relay_tasks:
+            await asyncio.gather(*relay_tasks, return_exceptions=True)
+        if transport is not None:
+            await asyncio.shield(transport.close(reason="viewer_disconnected"))
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
 @router.websocket("/{account_id}/login-sessions/{session_id}/portal")
 async def account_portal_websocket(
     websocket: WebSocket,
@@ -797,7 +1234,7 @@ async def account_portal_websocket(
     session_id: str,
 ) -> None:
     origin = websocket.headers.get("origin")
-    expected = _http_origin(websocket.url.scheme, websocket.url.netloc)
+    expected = _portal_expected_origin(websocket.url.scheme, websocket.url.netloc)
     cookie = websocket.cookies.get("qrac2_portal")
     if not cookie or not origin or origin.rstrip("/") != expected.rstrip("/"):
         await websocket.close(code=4403, reason="Portal origin or cookie authentication failed")
@@ -854,7 +1291,7 @@ async def account_portal_websocket(
         or _as_utc(owner.hard_expires_at) <= now
         or owner.session_revision != session.revision
         or account.paused
-        or (account.auth_required and session.purpose != "login")
+        or (account.auth_required and session.purpose == "execution")
         or session.status in {"closed", "expired", "error"}
     ):
         await websocket.close(code=4403, reason="Portal owner credential is invalid")
@@ -873,11 +1310,13 @@ async def account_portal_websocket(
     _ensure_portal_authorization_monitor()
     transport = None
     relays: list[asyncio.Task[None]] = []
+    portal_stage = "session_envelope"
     try:
         from backend import ws_agent_manager
         from backend.services.browser_portal_contract import (
             decode_portal_wire_frame,
             encode_portal_wire_frame,
+            portal_wire_metadata_length,
             validate_portal_frame_binding,
         )
 
@@ -889,9 +1328,11 @@ async def account_portal_websocket(
             ) = await browser_account_service.get_portal_session_envelope(
                 db, workspace_id, account_id, session_id
             )
+        portal_stage = "prepare_route"
         route = await ws_agent_manager.prepare_portal_route(
             endpoint, envelope, session_revision=revision, timeout=15
         )
+        portal_stage = "validate_route"
         binding = route.binding
         if (
             binding.account_ref.workspace_id != workspace_id
@@ -909,13 +1350,17 @@ async def account_portal_websocket(
             or _ACTIVE_PORTAL_SOCKETS.get(key) is not state
         ):
             raise ValueError("portal route no longer matches its authorized session")
+        portal_stage = "open_route"
         transport = await ws_agent_manager.open_portal_route(endpoint, route)
+        portal_stage = "relay"
 
         async def relay_input() -> None:
             sequence = -1
             while _ACTIVE_PORTAL_SOCKETS.get(key) is state:
                 message = await websocket.receive()
                 if message["type"] == "websocket.disconnect":
+                    return
+                if datetime.now(UTC) >= route.route_expires_at:
                     return
                 wire = message.get("bytes")
                 if wire is None:
@@ -925,6 +1370,16 @@ async def account_portal_websocket(
                     raise ValueError("portal control framing or sequence is invalid")
                 validate_portal_frame_binding(route, frame)
                 sequence = frame.sequence
+                # JS omits optional defaults which Pydantic materializes. The
+                # received header was validated by the decoder; forwarding uses
+                # the canonical model's byte length, not the original JSON size.
+                frame = frame.model_copy(
+                    update={
+                        "layout": frame.layout.model_copy(
+                            update={"metadata_bytes": portal_wire_metadata_length(frame)}
+                        )
+                    }
+                )
                 await transport.send(frame)
 
         async def relay_pixels() -> None:
@@ -939,6 +1394,8 @@ async def account_portal_websocket(
                     continue
                 if frame is None:
                     return
+                if datetime.now(UTC) >= route.route_expires_at:
+                    return
                 if frame.encoding != "pixel-binary" or frame.sequence <= sequence:
                     raise ValueError("portal pixel framing or sequence is invalid")
                 validate_portal_frame_binding(route, frame)
@@ -951,10 +1408,15 @@ async def account_portal_websocket(
         finished, _ = await asyncio.wait(relays, return_when=asyncio.FIRST_COMPLETED)
         for relay in finished:
             relay.result()
+        if _ACTIVE_PORTAL_SOCKETS.get(key) is state and datetime.now(UTC) >= route.route_expires_at:
+            await _close_portal_socket(key, state, reason="Portal route expired", code=1000)
     except WebSocketDisconnect:
         return
-    except Exception:
+    except Exception as exc:
         # Transient controls and pixels must never enter exception logs.
+        logging.getLogger(__name__).warning(
+            "Portal connection ended stage=%s error_type=%s", portal_stage, type(exc).__name__
+        )
         await _close_portal_socket(key, state, reason="Portal connection ended")
     finally:
         # ASGI cancellation must not interrupt transient-buffer/route release.

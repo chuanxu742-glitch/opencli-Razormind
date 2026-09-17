@@ -2,6 +2,7 @@
 
 import logging
 import os
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import select
@@ -9,6 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.record import CollectedRecord
+from backend.models.geo_observation import GeoAnswerObservation
 from backend.pipeline import odp_client
 from backend.pipeline.sinks.base import CollectionLineage
 logger = logging.getLogger(__name__)
@@ -75,6 +77,9 @@ async def store_records(
     workflow_run_id: str | None = None,
     identities: list[str | None] | None = None,
     lineage: CollectionLineage | dict[str, Any] | None = None,
+    capture_geo_observations: bool = False,
+    task_run_id: str | None = None,
+    observed_at: datetime | None = None,
 ) -> tuple[list[CollectedRecord], int]:
     """Insert new records; skip existing ones by content_hash.
 
@@ -112,6 +117,8 @@ async def store_records(
 
     Returns (new_records, skipped_count).
     """
+    if capture_geo_observations and not task_run_id:
+        raise ValueError("GEO observation capture requires a task run identity")
     if isinstance(lineage, CollectionLineage):
         lineage_payload = lineage.to_dict()
     elif lineage is None:
@@ -258,5 +265,35 @@ async def store_records(
             except IntegrityError:
                 skipped += 1
         new_records = survivors
+
+    if capture_geo_observations:
+        # Keep this time-series write separate from the content projection.
+        # One answer is retained per task-run/source/content identity even if
+        # the corresponding collected_records row was skipped as a duplicate.
+        observation_time = observed_at or datetime.now(UTC)
+        seen_observation_hashes: set[str] = set()
+        for raw, normalized, content_hash in normalized_triples:
+            if content_hash in seen_observation_hashes:
+                continue
+            seen_observation_hashes.add(content_hash)
+            observation = GeoAnswerObservation(
+                task_id=task_id,
+                task_run_id=task_run_id,
+                source_id=source_id,
+                provider=channel_type,
+                observed_at=observation_time,
+                content_hash=content_hash,
+                raw_data=raw,
+                normalized_data=normalized,
+                lineage=lineage_payload,
+            )
+            try:
+                async with session.begin_nested():
+                    session.add(observation)
+                    await session.flush()
+            except IntegrityError:
+                # A retry of the same task run must not manufacture a second
+                # observation; a separate run has a distinct task_run_id.
+                continue
 
     return new_records + updated_records, skipped

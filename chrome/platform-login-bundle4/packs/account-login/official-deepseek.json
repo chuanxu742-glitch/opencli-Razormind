@@ -1,0 +1,27 @@
+{
+  "id": "official-deepseek",
+  "version": "0.1.0",
+  "platform": "deepseek",
+  "allowed_origins": [
+    "https://chat.deepseek.com"
+  ],
+  "allowed_redirect_origins": [
+    "https://chat.deepseek.com"
+  ],
+  "login_url": "/sign_in",
+  "modes": [
+    "form"
+  ],
+  "qr_supported": false,
+  "interaction_supported": true,
+  "identity_probe_supported": false,
+  "authentication_verified": false,
+  "selectors": [
+    {
+      "id": "form",
+      "selector": "body",
+      "kind": "form",
+      "frame": "main"
+    }
+  ]
+}

@@ -112,12 +112,18 @@ async def lifespan(app: FastAPI):
     from backend.browser_pool import LocalBrowserPool
     from backend.database import AsyncSessionLocal
     from backend.models.browser import BrowserInstance
+    from backend.models.edge_node import EdgeNode
 
     async with AsyncSessionLocal() as session:
         result = await session.execute(select(BrowserInstance))
+        account_node_urls = set((await session.scalars(
+            select(EdgeNode.url).where(EdgeNode.account_capable.is_(True))
+        )).all())
         pool = browser_pool.get_pool()
         db_endpoints: set[str] = set()
         for inst in result.scalars().all():
+            if inst.agent_url in account_node_urls:
+                continue
             db_endpoints.add(inst.endpoint)
             if isinstance(pool, LocalBrowserPool):
                 if inst.endpoint not in pool.endpoints:
@@ -210,6 +216,15 @@ async def lifespan(app: FastAPI):
     from backend.control import cycle_task
 
     cycle_task.start()
+    from backend.services.browser_account_dispatcher import BrowserAccountDispatcher
+
+    account_dispatcher = BrowserAccountDispatcher()
+    account_dispatch_task = asyncio.create_task(account_dispatcher.run())
+    from backend.services.browser_account_pool import DockerAccountPool, configuration
+
+    pool_config = configuration()
+    account_pool = DockerAccountPool(pool_config) if pool_config else None
+    account_pool_task = asyncio.create_task(account_pool.run()) if account_pool else None
 
     logger.info(
         "OpenCLI Admin started (env=%s, executor=%s, orchestrator=%s)",
@@ -219,6 +234,16 @@ async def lifespan(app: FastAPI):
     )
     yield
     # Shutdown
+    from backend.services.browser_native_window import native_window_manager
+
+    # Close only viewers and loopback listeners launched by this API process.
+    # The account dispatcher stays alive until save requests have been queued.
+    await native_window_manager.shutdown()
+    if account_pool:
+        account_pool.stop_event.set()
+        await account_pool_task
+    account_dispatcher.stop_event.set()
+    await account_dispatch_task
     acquisition_sweeper_stop.set()
     await acquisition_sweeper
     await cycle_task.stop()

@@ -82,6 +82,12 @@ ENV BROWSER_ENGINE=${BROWSER_ENGINE} \
     CLOAKBROWSER_CACHE_DIR=/opt/cloakbrowser/cache
 EXPOSE 6080 19222 19825
 
+
+# Account-login bundle 3 uses the current fixed, locally packaged Script Host rules.
+RUN cp -a /opt/browser-runtime-bundles/opencli-default/2/extensions /opt/browser-runtime-bundles/opencli-default/3/extensions
+RUN cp -a /opt/browser-runtime-bundles/opencli-default/3/extensions /opt/browser-runtime-bundles/opencli-default/4/extensions
+COPY chrome/platform-login-bundle4/ /opt/browser-runtime-bundles/opencli-default/4/extensions/opencli-script-host/
+
 USER chrome
 # Pre-create profile directory as chrome user so Docker initialises new
 # named volumes with the correct ownership (avoids "Permission denied" on

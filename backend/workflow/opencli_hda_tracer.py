@@ -661,6 +661,214 @@ async def _authorize_account_bound_workflow(
     )
 
 
+async def _execute_opencli_dispatch(
+    node: CompiledWorkflowNode,
+    dispatch: WorkflowOpenCLIHDATraceDispatch,
+    *,
+    body: WorkflowRunStartRequest,
+    run_id: str,
+    session: AsyncSession | None,
+    requested_by_user_id: str | None,
+    emitter: _WorkflowRunEventEmitter,
+    blocked_by_package: dict[str, list[WorkflowRunBlockReason]],
+) -> list[dict[str, Any]]:
+    """Authorize and dispatch one OpenCLI node, recording its resource and execution events."""
+
+    mutation_block = _opencli_mutation_block_reason(
+        node,
+        body.project.agentPermissions,
+    )
+    if mutation_block is not None:
+        emitter.emit(
+            node,
+            "blocked",
+            message=mutation_block.message,
+            block_reason=mutation_block,
+        )
+        return []
+
+    is_write = _is_opencli_write_node(node)
+    emitter.emit(
+        node,
+        "started",
+        message=(
+            "OpenCLI action dispatch started" if is_write else "OpenCLI source dispatch started"
+        ),
+    )
+    fleet_match = await _match_dispatch_fleet_target(
+        dispatch,
+        node,
+        session=session,
+    )
+    fleet_match_details = _fleet_match_trace_details(fleet_match)
+    resource_requirement, resource_resolution = resolve_runtime_resources(
+        dispatch,
+        node,
+        fleet_match,
+    )
+    resource_details = {
+        "resourceRequirement": resource_requirement.model_dump(
+            mode="json",
+            exclude_none=True,
+        ),
+        "resourceResolution": resource_resolution.model_dump(
+            mode="json",
+            exclude_none=True,
+        ),
+    }
+    if fleet_match_details:
+        emitter.events[-1].details["fleetMatch"] = fleet_match_details
+    emitter.events[-1].details.update(resource_details)
+
+    if resource_resolution.status == "blocked":
+        reason = resource_resolution.blockReason
+        assert reason is not None
+        emitter.emit(
+            node,
+            "blocked",
+            message=reason.message,
+            block_reason=reason,
+            details=resource_details,
+        )
+        for ancestor_id in _package_ancestor_ids(node):
+            blocked_by_package.setdefault(ancestor_id, []).append(reason)
+        return []
+
+    batch = _batch_reference(body.project.id, run_id, dispatch)
+    if is_write:
+        emitter.emit(
+            node,
+            "tool_call_started",
+            message="OpenCLI action call started",
+            batch=batch,
+            details={
+                "functionId": OPENCLI_FUNCTION_ID,
+                "worker": OPENCLI_WORKER,
+                **({"fleetMatch": fleet_match_details} if fleet_match_details else {}),
+                **resource_details,
+            },
+        )
+    dispatch_call = _dispatch_opencli_source_to_fleet
+    dispatch_params = signature(dispatch_call).parameters
+    dispatch_kwargs: dict[str, object] = {}
+    if "node" in dispatch_params:
+        dispatch_kwargs["node"] = node
+    if "actor_user_id" in dispatch_params:
+        dispatch_kwargs["actor_user_id"] = requested_by_user_id
+    output_items, agent_dispatch_details = await dispatch_call(
+        dispatch,
+        fleet_match,
+        **dispatch_kwargs,
+    )
+    if not is_write:
+        output_items, agent_dispatch_details = _bounded_opencli_dispatch_result(
+            output_items,
+            agent_dispatch_details,
+            max_items=body.project.settings.maxItemsPerRun,
+        )
+    output_items = _opencli_dispatch_source_items(node, dispatch, output_items)
+    batch = _batch_reference(body.project.id, run_id, dispatch)
+    if output_items:
+        batch = batch.model_copy(update={"itemCount": len(output_items)})
+    dispatch_trace_details = {
+        **({"fleetMatch": fleet_match_details} if fleet_match_details else {}),
+        **resource_details,
+        **({"agentDispatch": agent_dispatch_details} if agent_dispatch_details else {}),
+    }
+    if not is_write:
+        emitter.emit(
+            node,
+            "batch_ready",
+            message="OpenCLI batch reference ready",
+            batch=batch,
+            details={
+                "functionId": OPENCLI_FUNCTION_ID,
+                "worker": OPENCLI_WORKER,
+                **dispatch_trace_details,
+            },
+        )
+    if agent_dispatch_details and agent_dispatch_details.get("success") is False:
+        reason = WorkflowRunBlockReason(
+            code="fleet_agent_dispatch_failed",
+            message=str(agent_dispatch_details.get("error") or "Fleet agent dispatch failed"),
+            source="workflow_fleet",
+            details={
+                "adapterTaskId": dispatch.taskId,
+                "sourceGroup": dispatch.sourceGroup,
+                "agentDispatch": agent_dispatch_details,
+                **({"fleetMatch": fleet_match_details} if fleet_match_details else {}),
+            },
+        )
+        emitter.emit(
+            node,
+            "failed",
+            message="OpenCLI source dispatch failed on selected fleet agent",
+            block_reason=reason,
+            details=reason.details,
+        )
+        for ancestor_id in _package_ancestor_ids(node):
+            blocked_by_package.setdefault(ancestor_id, []).append(reason)
+        return []
+
+    emitter.emit(
+        node,
+        "partial",
+        message=(
+            "OpenCLI action completed through selected fleet agent"
+            if is_write and agent_dispatch_details
+            else (
+                "OpenCLI action result received"
+                if is_write
+                else (
+                    "OpenCLI source items collected through local OpenCLI"
+                    if _is_local_opencli_dispatch(agent_dispatch_details)
+                    else (
+                        "OpenCLI source items collected through selected fleet agent"
+                        if agent_dispatch_details
+                        else "OpenCLI dispatch envelope is ready for worker fanout"
+                    )
+                )
+            )
+        ),
+        details={
+            "adapterTaskId": dispatch.taskId,
+            "sourceGroup": dispatch.sourceGroup,
+            "itemCount": len(output_items),
+            "outputPort": "items[]",
+            **dispatch_trace_details,
+        },
+    )
+    if is_write:
+        emitter.emit(
+            node,
+            "tool_call_completed",
+            message="OpenCLI action call completed",
+            details={
+                "functionId": OPENCLI_FUNCTION_ID,
+                "worker": OPENCLI_WORKER,
+                **dispatch_trace_details,
+            },
+        )
+    emitter.emit(
+        node,
+        "completed",
+        message=(
+            "OpenCLI action dispatch completed"
+            if is_write
+            else (
+                "OpenCLI source dispatch completed through local OpenCLI"
+                if _is_local_opencli_dispatch(agent_dispatch_details)
+                else (
+                    "OpenCLI source dispatch completed through selected fleet agent"
+                    if agent_dispatch_details
+                    else "OpenCLI source dispatch completed"
+                )
+            )
+        ),
+    )
+    return output_items
+
+
 async def start_workflow_run(
     body: WorkflowRunStartRequest,
     *,
@@ -2042,202 +2250,16 @@ async def start_workflow_run(
             emitter.emit(node, "completed", message="Node completed")
             continue
 
-        mutation_block = _opencli_mutation_block_reason(
+        outputs_by_node[node.id] = await _execute_opencli_dispatch(
             node,
-            body.project.agentPermissions,
-        )
-        if mutation_block is not None:
-            emitter.emit(
-                node,
-                "blocked",
-                message=mutation_block.message,
-                block_reason=mutation_block,
-            )
-            outputs_by_node[node.id] = []
-            continue
-
-        is_write = _is_opencli_write_node(node)
-        emitter.emit(
-            node,
-            "started",
-            message=(
-                "OpenCLI action dispatch started" if is_write else "OpenCLI source dispatch started"
-            ),
-        )
-        fleet_match = await _match_dispatch_fleet_target(
             dispatch,
-            node,
+            body=body,
+            run_id=run_id,
             session=session,
+            requested_by_user_id=requested_by_user_id,
+            emitter=emitter,
+            blocked_by_package=blocked_by_package,
         )
-        fleet_match_details = _fleet_match_trace_details(fleet_match)
-        resource_requirement, resource_resolution = resolve_runtime_resources(
-            dispatch,
-            node,
-            fleet_match,
-        )
-        resource_details = {
-            "resourceRequirement": resource_requirement.model_dump(
-                mode="json",
-                exclude_none=True,
-            ),
-            "resourceResolution": resource_resolution.model_dump(
-                mode="json",
-                exclude_none=True,
-            ),
-        }
-        if fleet_match_details:
-            emitter.events[-1].details["fleetMatch"] = fleet_match_details
-        emitter.events[-1].details.update(resource_details)
-
-        if resource_resolution.status == "blocked":
-            reason = resource_resolution.blockReason
-            assert reason is not None
-            emitter.emit(
-                node,
-                "blocked",
-                message=reason.message,
-                block_reason=reason,
-                details=resource_details,
-            )
-            for ancestor_id in _package_ancestor_ids(node):
-                blocked_by_package.setdefault(ancestor_id, []).append(reason)
-            outputs_by_node[node.id] = []
-            continue
-
-        batch = _batch_reference(body.project.id, run_id, dispatch)
-        if is_write:
-            emitter.emit(
-                node,
-                "tool_call_started",
-                message="OpenCLI action call started",
-                batch=batch,
-                details={
-                    "functionId": OPENCLI_FUNCTION_ID,
-                    "worker": OPENCLI_WORKER,
-                    **({"fleetMatch": fleet_match_details} if fleet_match_details else {}),
-                    **resource_details,
-                },
-            )
-        dispatch_call = _dispatch_opencli_source_to_fleet
-        dispatch_params = signature(dispatch_call).parameters
-        dispatch_kwargs: dict[str, object] = {}
-        if "node" in dispatch_params:
-            dispatch_kwargs["node"] = node
-        if "actor_user_id" in dispatch_params:
-            dispatch_kwargs["actor_user_id"] = requested_by_user_id
-        output_items, agent_dispatch_details = await dispatch_call(
-            dispatch,
-            fleet_match,
-            **dispatch_kwargs,
-        )
-        if not is_write:
-            output_items, agent_dispatch_details = _bounded_opencli_dispatch_result(
-                output_items,
-                agent_dispatch_details,
-                max_items=body.project.settings.maxItemsPerRun,
-            )
-        output_items = _opencli_dispatch_source_items(node, dispatch, output_items)
-        batch = _batch_reference(body.project.id, run_id, dispatch)
-        if output_items:
-            batch = batch.model_copy(update={"itemCount": len(output_items)})
-        dispatch_trace_details = {
-            **({"fleetMatch": fleet_match_details} if fleet_match_details else {}),
-            **resource_details,
-            **({"agentDispatch": agent_dispatch_details} if agent_dispatch_details else {}),
-        }
-        if not is_write:
-            emitter.emit(
-                node,
-                "batch_ready",
-                message="OpenCLI batch reference ready",
-                batch=batch,
-                details={
-                    "functionId": OPENCLI_FUNCTION_ID,
-                    "worker": OPENCLI_WORKER,
-                    **dispatch_trace_details,
-                },
-            )
-        if agent_dispatch_details and agent_dispatch_details.get("success") is False:
-            reason = WorkflowRunBlockReason(
-                code="fleet_agent_dispatch_failed",
-                message=str(agent_dispatch_details.get("error") or "Fleet agent dispatch failed"),
-                source="workflow_fleet",
-                details={
-                    "adapterTaskId": dispatch.taskId,
-                    "sourceGroup": dispatch.sourceGroup,
-                    "agentDispatch": agent_dispatch_details,
-                    **({"fleetMatch": fleet_match_details} if fleet_match_details else {}),
-                },
-            )
-            emitter.emit(
-                node,
-                "failed",
-                message="OpenCLI source dispatch failed on selected fleet agent",
-                block_reason=reason,
-                details=reason.details,
-            )
-            for ancestor_id in _package_ancestor_ids(node):
-                blocked_by_package.setdefault(ancestor_id, []).append(reason)
-            outputs_by_node[node.id] = []
-            continue
-
-        emitter.emit(
-            node,
-            "partial",
-            message=(
-                "OpenCLI action completed through selected fleet agent"
-                if is_write and agent_dispatch_details
-                else (
-                    "OpenCLI action result received"
-                    if is_write
-                    else (
-                        "OpenCLI source items collected through local OpenCLI"
-                        if _is_local_opencli_dispatch(agent_dispatch_details)
-                        else (
-                            "OpenCLI source items collected through selected fleet agent"
-                            if agent_dispatch_details
-                            else "OpenCLI dispatch envelope is ready for worker fanout"
-                        )
-                    )
-                )
-            ),
-            details={
-                "adapterTaskId": dispatch.taskId,
-                "sourceGroup": dispatch.sourceGroup,
-                "itemCount": len(output_items),
-                "outputPort": "items[]",
-                **dispatch_trace_details,
-            },
-        )
-        if is_write:
-            emitter.emit(
-                node,
-                "tool_call_completed",
-                message="OpenCLI action call completed",
-                details={
-                    "functionId": OPENCLI_FUNCTION_ID,
-                    "worker": OPENCLI_WORKER,
-                    **dispatch_trace_details,
-                },
-            )
-        emitter.emit(
-            node,
-            "completed",
-            message=(
-                "OpenCLI action dispatch completed"
-                if is_write
-                else (
-                    "OpenCLI source dispatch completed through local OpenCLI"
-                    if _is_local_opencli_dispatch(agent_dispatch_details)
-                    else (
-                        "OpenCLI source dispatch completed through selected fleet agent"
-                        if agent_dispatch_details
-                        else "OpenCLI source dispatch completed"
-                    )
-                )
-            ),
-        )
-        outputs_by_node[node.id] = output_items
 
     for package_node in reversed(package_nodes):
         if package_node.id in managed_package_terminal_ids:
@@ -4001,50 +4023,7 @@ def _opentabs_tool_block_reason(
 ) -> WorkflowRunBlockReason | None:
     if not _is_opentabs_tool_node(node):
         return None
-    binding_input = _read_dict(_read_dict(node.runtime.get("binding")).get("input"))
-    executor_params = _read_dict(binding_input.get("executorParams"))
-    read_only = executor_params.get("readOnly") is True
-    if read_only:
-        if bool(getattr(permissions, "canFetchNetwork", False)):
-            return None
-        return WorkflowRunBlockReason(
-            code=FETCH_PERMISSION_REQUIRED,
-            message=("OpenTabs read tool is bound, but agentPermissions.canFetchNetwork is false."),
-            source="workflow_permissions",
-            details={
-                "nodeId": node.id,
-                "bindingId": EXTERNAL_TOOL_BINDING_ID,
-                "requiredPermission": "canFetchNetwork",
-            },
-        )
-
-    proposal_state = _read_string(node.runtime.get("proposal_state"))
-    if proposal_state != "accepted":
-        return WorkflowRunBlockReason(
-            code=OPENCLI_WRITE_APPROVAL_REQUIRED,
-            message="OpenTabs write tool must be explicitly accepted before it can run.",
-            source="workflow_permissions",
-            details={
-                "nodeId": node.id,
-                "bindingId": EXTERNAL_TOOL_BINDING_ID,
-                "proposalState": proposal_state or "proposed",
-            },
-        )
-    if not bool(getattr(permissions, "canMutateExternalSites", False)):
-        return WorkflowRunBlockReason(
-            code=OPENCLI_WRITE_PERMISSION_REQUIRED,
-            message=(
-                "OpenTabs write tool is accepted, but "
-                "agentPermissions.canMutateExternalSites is false."
-            ),
-            source="workflow_permissions",
-            details={
-                "nodeId": node.id,
-                "bindingId": EXTERNAL_TOOL_BINDING_ID,
-                "requiredPermission": "canMutateExternalSites",
-            },
-        )
-    return None
+    return _external_tool_block_reason(node, permissions, runtime_label="OpenTabs")
 
 
 def _bbx_tool_block_reason(
@@ -4053,6 +4032,15 @@ def _bbx_tool_block_reason(
 ) -> WorkflowRunBlockReason | None:
     if not _is_bbx_tool_node(node):
         return None
+    return _external_tool_block_reason(node, permissions, runtime_label="BBX")
+
+
+def _external_tool_block_reason(
+    node: CompiledWorkflowNode,
+    permissions: object,
+    *,
+    runtime_label: str,
+) -> WorkflowRunBlockReason | None:
     binding_input = _read_dict(_read_dict(node.runtime.get("binding")).get("input"))
     executor_params = _read_dict(binding_input.get("executorParams"))
     read_only = executor_params.get("readOnly") is True
@@ -4061,7 +4049,10 @@ def _bbx_tool_block_reason(
             return None
         return WorkflowRunBlockReason(
             code=FETCH_PERMISSION_REQUIRED,
-            message=("BBX read tool is bound, but agentPermissions.canFetchNetwork is false."),
+            message=(
+                f"{runtime_label} read tool is bound, but "
+                "agentPermissions.canFetchNetwork is false."
+            ),
             source="workflow_permissions",
             details={
                 "nodeId": node.id,
@@ -4074,7 +4065,7 @@ def _bbx_tool_block_reason(
     if proposal_state != "accepted":
         return WorkflowRunBlockReason(
             code=OPENCLI_WRITE_APPROVAL_REQUIRED,
-            message="BBX write tool must be explicitly accepted before it can run.",
+            message=f"{runtime_label} write tool must be explicitly accepted before it can run.",
             source="workflow_permissions",
             details={
                 "nodeId": node.id,
@@ -4086,7 +4077,8 @@ def _bbx_tool_block_reason(
         return WorkflowRunBlockReason(
             code=OPENCLI_WRITE_PERMISSION_REQUIRED,
             message=(
-                "BBX write tool is accepted, but agentPermissions.canMutateExternalSites is false."
+                f"{runtime_label} write tool is accepted, but "
+                "agentPermissions.canMutateExternalSites is false."
             ),
             source="workflow_permissions",
             details={

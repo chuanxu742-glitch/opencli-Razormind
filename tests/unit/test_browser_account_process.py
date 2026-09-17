@@ -22,6 +22,7 @@ def _isolation(root: Path, *, display: str = ":501") -> StackIsolation:
         cdp_port=31_001,
         bbx_port=31_002,
         daemon_port=19_825,
+        vnc_port=31_003,
         home_dir=root / "home",
         cache_dir=root / "cache",
         profile_dir=root / "profile",
@@ -38,6 +39,34 @@ def test_parallel_isolation_rejects_shared_display(tmp_path: Path) -> None:
         validate_parallel_isolation(
             (_isolation(tmp_path / "first"), _isolation(tmp_path / "second"))
         )
+
+
+def test_stack_environment_excludes_control_plane_secrets(tmp_path: Path) -> None:
+    environment = _isolation(tmp_path).environment(
+        {
+            "PATH": "/usr/bin",
+            "HTTPS_PROXY": "http://proxy.invalid",
+            "AGENT_API_TOKEN": "agent-secret",
+            "AGENT_NODE_CREDENTIAL": "node-secret",
+            "DATABASE_URL": "postgresql://secret",
+            "REDIS_URL": "redis://secret",
+            "THIRD_PARTY_PASSWORD": "password-secret",
+            "ANOTHER_SECRET": "secret-value",
+        }
+    )
+
+    assert environment["PATH"] == "/usr/bin"
+    assert environment["HTTPS_PROXY"] == "http://proxy.invalid"
+    assert environment["DISPLAY"] == ":501"
+    for name in (
+        "AGENT_API_TOKEN",
+        "AGENT_NODE_CREDENTIAL",
+        "DATABASE_URL",
+        "REDIS_URL",
+        "THIRD_PARTY_PASSWORD",
+        "ANOTHER_SECRET",
+    ):
+        assert name not in environment
 
 
 def test_process_shutdown_records_confirmed_evidence() -> None:

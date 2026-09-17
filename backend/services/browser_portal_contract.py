@@ -5,26 +5,27 @@ RecordSession lifecycle at the sensitive boundary, then leaves ticket CAS and
 owner transport commits to their owning services.
 """
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import hashlib
 import hmac
 import inspect
 import json
 import secrets
 import struct
-from typing import Any, Callable, TypeVar
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any, TypeVar
 
 from pydantic import SecretStr
 
 from backend.schemas.browser_account import (
+    ERROR_HTTP_STATUS,
     AccountRef,
     BrowserAccountErrorCode,
     BrowserAccountRevisionCASV1,
     BrowserAccountRevisionPreconditionV1,
     CommandExecutionGuardV1,
     DurableCommandV1,
-    ERROR_HTTP_STATUS,
     NodeClaimV1,
     PortalControlMessageV1,
     PortalEntryBlockedV1,
@@ -33,23 +34,22 @@ from backend.schemas.browser_account import (
     PortalOuterBindingV1,
     PortalOwnerRouteV1,
     PortalPerceptionV1,
+    PortalPixelFrameV1,
     PortalPreEntryHandoffV1,
     PortalRecordSessionContractV1,
     PortalSensitivePayloadV1,
     PortalTicketConsumeCASV1,
     PortalTicketGrantV1,
-    PortalTicketIssueRequestV1,
     PortalTicketIssuedV1,
+    PortalTicketIssueRequestV1,
     PortalTicketRecordV1,
     PortalTicketRedeemRequestV1,
     PortalTransientV1,
     PortalWireFrameV1,
     PortalWireLayoutV1,
-    PortalPixelFrameV1,
-    SessionEnvelopeV1,
     SensitiveSessionBindingV1,
+    SessionEnvelopeV1,
 )
-
 
 _TransportResult = TypeVar("_TransportResult")
 
@@ -99,6 +99,11 @@ def _frame_candidates(record_session: Any, frame_id: Any) -> list[Any]:
         frames = list(frames)
     except TypeError as exc:
         raise ValueError("record session frame selection failed") from exc
+    if (frame_id == 0 or frame_id == "0") and getattr(
+        record_session, "_portal_verified_page", None
+    ) is raw_page:
+        main = getattr(raw_page, "main_frame", None)
+        return [frame for frame in frames if frame is main]
     candidates: list[Any] = []
     for frame in frames:
         for attr in ("frame_id", "id", "name"):
@@ -181,7 +186,6 @@ async def _call_async(record_session: Any, name: str, *args: Any) -> Any:
     return await result
 
 
-
 async def _page_is_closed(page: Any) -> bool:
     raw_page = getattr(page, "page", page)
     checker = getattr(raw_page, "is_closed", None)
@@ -252,9 +256,19 @@ def register_portal_record_session(
         raise ValueError("record session must expose its real id and page")
     if page is not None and page is not actual_page:
         raise ValueError("record session page does not match registration")
-    if getattr(record_session, "stopped", False) or getattr(record_session, "sensitive", False):
-        raise ValueError("stopped or sensitive record session cannot be registered")
+    if getattr(record_session, "stopped", False):
+        raise ValueError("stopped record session cannot be registered")
+    if getattr(record_session, "sensitive", False):
+        raw_page = getattr(actual_page, "page", actual_page)
+        if getattr(
+            record_session, "_portal_verified_page", None
+        ) is not raw_page or _listener_state(record_session) != (False, True, False):
+            raise ValueError("sensitive record session is not an exact verified portal page")
     if record_id in _RECORD_SESSIONS:
+        existing = _RECORD_SESSIONS[record_id]
+        if existing.session is record_session and existing.binding == binding:
+            _require_same_record_identity(existing, record_session)
+            return existing.contract
         raise ValueError("record session id is already registered")
     page_identity, frame_identity, document_identity, reported_document = _record_identity(
         record_session,
@@ -296,6 +310,12 @@ async def freeze_portal_record_session(
         or registration.binding != binding
     ):
         raise ValueError("record session is not registered for this binding")
+    if registration.contract.status == "sensitive":
+        _require_same_record_identity(registration, record_session)
+        await _require_open_page(registration.page)
+        if _listener_state(record_session) != (False, True, False):
+            raise ValueError("record session sensitive guard changed")
+        return registration.contract
     if registration.contract.status != "active":
         raise ValueError("record session is not in active pre-entry state")
     if getattr(record_session, "stopped", False):
@@ -454,8 +474,6 @@ def issue_first_portal_ticket(
     )
 
 
-
-
 def ticket_record_from_issue(
     issued: PortalTicketIssuedV1,
     *,
@@ -542,6 +560,8 @@ def redeem_portal_ticket(
         websocket_path=websocket_path,
         consume_cas=cas,
     )
+
+
 async def consume_portal_ticket_cas(
     request: PortalTicketRedeemRequestV1,
     *,
@@ -570,6 +590,7 @@ async def consume_portal_ticket_cas(
     if not applied:
         return _blocked(request, BrowserAccountErrorCode.SESSION_EXPIRED)
     return outcome
+
 
 _PORTAL_WIRE_HEADER = struct.Struct(">4sBBBBHIH")
 PORTAL_WIRE_HEADER_SIZE = 16
@@ -603,6 +624,8 @@ def _wire_metadata(frame: PortalWireFrameV1) -> tuple[dict[str, Any], bytes]:
                 "x": sensitive.x,
                 "y": sensitive.y,
             }
+            if sensitive.pointer_action is not None:
+                metadata_message["sensitive_payload"]["pointer_action"] = sensitive.pointer_action
             if value is not None:
                 payload = value.encode("utf-8")
     else:
@@ -618,14 +641,14 @@ def _wire_metadata(frame: PortalWireFrameV1) -> tuple[dict[str, Any], bytes]:
             "encoding": frame.encoding,
             "content_type": frame.content_type,
             "mime_type": frame.mime_type,
-
-
             "byte_length": frame.byte_length,
             "binding": frame.transient.binding.model_dump(mode="json"),
             "message": metadata_message,
         },
         payload,
     )
+
+
 def portal_wire_metadata_length(frame: PortalWireFrameV1) -> int:
     """Return canonical UTF-8 metadata length for the fixed header."""
 
@@ -729,7 +752,7 @@ def decode_portal_wire_frame(data: bytes) -> PortalWireFrameV1:
         if expected_encoding == "control-json":
             sensitive = message.pop("sensitive_payload", None)
             if sensitive is not None:
-                if not isinstance(sensitive, dict) or set(sensitive) != {
+                if not isinstance(sensitive, dict) or set(sensitive) - {"pointer_action"} != {
                     "key",
                     "value_present",
                     "x",
@@ -747,6 +770,7 @@ def decode_portal_wire_frame(data: bytes) -> PortalWireFrameV1:
                     key=sensitive["key"],
                     x=sensitive["x"],
                     y=sensitive["y"],
+                    pointer_action=sensitive.get("pointer_action"),
                 )
             elif payload:
                 raise ValueError("portal unexpected control payload bytes")
@@ -791,6 +815,7 @@ def decode_portal_wire_frame(data: bytes) -> PortalWireFrameV1:
     finally:
         buffer[:] = b"\x00" * len(buffer)
 
+
 def _clip_contains(container: Any, candidate: Any) -> bool:
     return (
         container.x <= candidate.x
@@ -808,7 +833,7 @@ def validate_portal_frame_binding(
 ) -> PortalWireFrameV1:
     """Validate the transient wire at the center without an edge-local record."""
 
-    checked_at = now or datetime.now(timezone.utc)
+    checked_at = now or datetime.now(UTC)
     if owner_route.route_expires_at <= checked_at:
         raise ValueError("portal owner route has expired")
     binding = frame.transient.binding

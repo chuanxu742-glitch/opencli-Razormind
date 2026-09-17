@@ -1,0 +1,27 @@
+{
+  "id": "official-grok",
+  "version": "0.1.0",
+  "platform": "grok",
+  "allowed_origins": [
+    "https://grok.com"
+  ],
+  "allowed_redirect_origins": [
+    "https://grok.com"
+  ],
+  "login_url": "/auth/sign-in",
+  "modes": [
+    "form"
+  ],
+  "qr_supported": false,
+  "interaction_supported": true,
+  "identity_probe_supported": false,
+  "authentication_verified": false,
+  "selectors": [
+    {
+      "id": "form",
+      "selector": "body",
+      "kind": "form",
+      "frame": "main"
+    }
+  ]
+}

@@ -91,7 +91,15 @@ export function shouldAcceptOidcRenewal(
 }
 
 export function sanitizeReturnTo(value: unknown): string {
-  return typeof value === 'string' && value.startsWith('/') && !value.startsWith('//')
-    ? value
-    : '/studio'
+  if (typeof value !== 'string' || !value.startsWith('/') || value.startsWith('//')) return '/studio'
+  // Browsers normalize backslashes and discard ASCII controls while parsing URLs.
+  if (/[\\\u0000-\u001f\u007f]/.test(value)) return '/studio'
+  try {
+    const origin = 'https://return-to.invalid'
+    const url = new URL(value, origin)
+    if (url.origin !== origin || url.pathname.startsWith('//')) return '/studio'
+    return `${url.pathname}${url.search}${url.hash}`
+  } catch {
+    return '/studio'
+  }
 }

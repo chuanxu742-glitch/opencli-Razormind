@@ -185,6 +185,8 @@ async def prepare_portal_route(
         workflow="login.observe",
         input={
             "session_id": session_envelope.session_id,
+            "rule_id": session_envelope.login_rule_id,
+            "rule_version": session_envelope.login_rule_version,
             "epoch": session_envelope.epoch,
             "target": target.model_dump(mode="json")
             | {"view_generation": session_envelope.view_generation},
@@ -230,6 +232,7 @@ async def prepare_portal_route(
     if focus.target != target or focus.view_generation != session_envelope.view_generation:
         raise RuntimeError("login observe focus lineage changed")
 
+    registration = await _bind_portal_record(runtime.cdp_endpoint, registration, session_envelope)
     binding = SensitiveSessionBindingV1(
         account_ref={
             "workspace_id": session_envelope.workspace_id,
@@ -259,7 +262,9 @@ async def prepare_portal_route(
         tunnel_auth_digest=registration.tunnel_auth_digest,
         region_focus=focus,
         session_revision=session_revision,
-        route_expires_at=datetime.now(UTC) + timedelta(seconds=timeout),
+        route_expires_at=min(
+            datetime.now(UTC) + timedelta(seconds=timeout), session_envelope.lease_expires_at
+        ),
         max_frame_bytes=4_000_000,
         max_input_bytes=4_096,
     )
@@ -432,13 +437,14 @@ async def observe_login_runtime(
     claim: NodeClaimV1,
     node_identity: NodeIdentityV1,
     expected_origin: str,
+    expected_tab_id: int | None = None,
 ) -> LoginObservationV1:
     """Read one fixed-rule observation from the actual isolated login tab."""
 
-    if session.purpose != "login":
+    if session.purpose not in {"login", "browser"}:
         raise BrowserRuntimeError(
             "runtime_command_invalid",
-            "login observation requires a login session",
+            "login observation requires a login or browser session",
         )
     if session.login_rule_id is None or session.login_rule_version is None:
         raise BrowserRuntimeError(
@@ -448,6 +454,9 @@ async def observe_login_runtime(
     target = await _discover_login_target(
         cdp_endpoint=cdp_endpoint,
         expected_origin=expected_origin,
+        rule_id=session.login_rule_id,
+        rule_version=session.login_rule_version,
+        expected_tab_id=expected_tab_id,
     )
     invocation_target = {
         "tab_id": target["tab_id"],
@@ -461,6 +470,8 @@ async def observe_login_runtime(
         workflow="login.observe",
         input={
             "session_id": session.session_id,
+            "rule_id": session.login_rule_id,
+            "rule_version": session.login_rule_version,
             "epoch": session.epoch,
             "target": invocation_target,
             "expected_qr_generation": target["qr_generation"],
@@ -471,7 +482,14 @@ async def observe_login_runtime(
             "tab_id": target["tab_id"],
         },
     )
-    outer = await invoke_script_host(request, cdp_endpoint=cdp_endpoint)
+    try:
+        outer = await invoke_script_host(request, cdp_endpoint=cdp_endpoint)
+    except HTTPException:
+        # QR load/navigation can replace a generation between discovery and invoke.
+        # The observer retries discovery; it must not stop watching this live lease.
+        raise BrowserRuntimeError(
+            "login_observation_unavailable", "login observation target changed during invocation"
+        ) from None
     response = outer.get("result") if isinstance(outer, dict) else None
     if not isinstance(response, dict) or response.get("ok") is not True:
         raise BrowserRuntimeError(
@@ -513,6 +531,7 @@ async def observe_login_runtime(
             view_generation=observed["view_generation"],
             state=observed["state"],
             evidence_kind=observed["evidence_kind"],
+            browser_session_state=observed.get("browser_session_state", "unknown"),
             external_identity=observed.get("external_identity"),
             observed_at=observed["observed_at"],
             error_code=observed.get("error_code"),
@@ -528,6 +547,9 @@ async def _discover_login_target(
     *,
     cdp_endpoint: str,
     expected_origin: str,
+    rule_id: str = "controlled-login-fixture",
+    rule_version: str = "1.0.0",
+    expected_tab_id: int | None = None,
 ) -> dict[str, Any]:
     """Ask the installed Script Host for one exact tab/document generation."""
 
@@ -567,48 +589,33 @@ async def _discover_login_target(
             )
             if manifest_name != "OpenCLI Script Host":
                 continue
-            expression = f"""
-                (async () => {{
-                  const pack = packs.get("account-login");
-                  if (!pack?.ruleManifest) throw new Error("login rule unavailable");
-                  const tabs = await chrome.tabs.query({{}});
-                  const matches = tabs.filter((tab) => {{
-                    try {{
-                      return new URL(tab.url || "").origin === {json.dumps(expected_origin)};
-                    }} catch {{
-                      return false;
-                    }}
-                  }});
-                  if (matches.length !== 1 || !Number.isInteger(matches[0].id)) {{
-                    throw new Error("login target is ambiguous");
-                  }}
-                  const probe = await chrome.tabs.sendMessage(
-                    matches[0].id,
-                    {{
-                      type: "opencli-script-host.login-target",
-                      pack: pack.id,
-                      version: pack.version,
-                      rule: pack.ruleManifest,
-                    }},
-                    {{ frameId: 0 }},
-                  );
-                  if (!probe?.ok) throw new Error("login target probe failed");
-                  return {{
-                    tab_id: matches[0].id,
-                    frame_id: 0,
-                    document_id: probe.target.documentId,
-                    origin: probe.target.origin,
-                    view_generation: probe.target.viewGeneration,
-                    qr_generation: probe.target.qrGeneration,
-                  }};
-                }})()
-            """
+            expression = (
+                "globalThis.opencliScriptHost.discoverLoginTarget("
+                + json.dumps(
+                    {
+                        "rule_id": rule_id,
+                        "rule_version": rule_version,
+                        "origin": expected_origin,
+                        "tab_id": expected_tab_id,
+                    }
+                )
+                + ")"
+            )
             result = await _evaluate_cdp_target(websocket_url, expression)
         except Exception:
             continue
         if (
             isinstance(result, dict)
-            and result.get("origin") == expected_origin
+            and (
+                result.get("origin") == expected_origin
+                or (
+                    rule_id == "bilibili-qr"
+                    and rule_version == "0.1.0"
+                    and expected_tab_id is not None
+                    and result.get("origin") == "https://www.bilibili.com"
+                )
+            )
+            and (expected_tab_id is None or result.get("tab_id") == expected_tab_id)
             and isinstance(result.get("tab_id"), int)
             and isinstance(result.get("frame_id"), int)
             and isinstance(result.get("view_generation"), int)
@@ -622,9 +629,10 @@ async def _discover_login_target(
     )
 
 
-async def resolve_portal_target(cdp_endpoint: str, route: PortalOwnerRouteV1) -> str:
-    """Resolve the exact live page target; never accept a caller endpoint."""
-    target = route.binding.target
+async def _authorized_cdp_page(
+    cdp_endpoint: str, target: Any, view_generation: int
+) -> tuple[str, str]:
+    """Map the authorized extension document to its exact opaque CDP page id."""
     target.require_complete()
     try:
         async with httpx.AsyncClient(timeout=5) as client:
@@ -633,25 +641,126 @@ async def resolve_portal_target(cdp_endpoint: str, route: PortalOwnerRouteV1) ->
             targets = response.json()
     except (httpx.HTTPError, ValueError) as exc:
         raise RuntimeError("Chrome CDP target listing is unavailable") from exc
+    from types import SimpleNamespace
+
+    from backend.browser_target_mapping import map_chrome_tab
+
+    websocket_url = await map_chrome_tab(
+        pages=[item for item in targets if item.get("type") == "page"],
+        workers=[
+            item
+            for item in targets
+            if item.get("type") in {"service_worker", "page"}
+            and str(item.get("url", "")).startswith("chrome-extension://")
+        ],
+        target=SimpleNamespace(**target.model_dump(), view_generation=view_generation),
+        evaluate=_evaluate_cdp_target,
+    )
     matches = [
         item
         for item in targets
-        if item.get("type") == "page"
-        and str(item.get("id")) == str(target.tab_id)
-        and isinstance(item.get("webSocketDebuggerUrl"), str)
+        if item.get("type") == "page" and item.get("webSocketDebuggerUrl") == websocket_url
     ]
-    if len(matches) != 1:
-        raise RuntimeError("portal page target is missing or ambiguous")
-    page_url = matches[0].get("url", "")
-    actual = urlparse(page_url)
-    expected = urlparse(target.origin or "")
-    if (
-        not actual.scheme
-        or not actual.netloc
-        or (actual.scheme, actual.netloc) != (expected.scheme, expected.netloc)
-    ):
-        raise RuntimeError("portal page origin does not match server target")
-    return matches[0]["webSocketDebuggerUrl"]
+    if len(matches) != 1 or not isinstance(matches[0].get("id"), str) or not matches[0]["id"]:
+        raise RuntimeError("authorized CDP target identity is ambiguous")
+    return websocket_url, matches[0]["id"]
+
+
+async def resolve_portal_target(cdp_endpoint: str, route: PortalOwnerRouteV1) -> str:
+    """Resolve the exact live page target; never accept a caller endpoint."""
+    websocket_url, _ = await _authorized_cdp_page(
+        cdp_endpoint,
+        route.binding.target,
+        route.binding.view_generation,
+    )
+    return websocket_url
+
+
+async def _bind_portal_record(
+    cdp_endpoint: str, registration: Any, session: SessionEnvelopeV1
+) -> Any:
+    """Replace an initial/unbound record only with a verified, capture-blocked page."""
+    from dataclasses import replace
+
+    from backend.skills.record import start_recording
+
+    old = registration.record_session
+    lock = getattr(old, "_portal_prepare_lock", None)
+    if lock is None:
+        lock = old._portal_prepare_lock = asyncio.Lock()
+    async with lock:
+        registry = session_portal_registry()
+        registration = registry.resolve(
+            session_id=session.session_id,
+            node_id=session.node_id,
+            boot_id=session.node_boot_id,
+            epoch=session.epoch,
+            agent_url=registration.agent_url,
+        )
+        old = registration.record_session
+        _, target_id = await _authorized_cdp_page(
+            cdp_endpoint, session.target, session.view_generation
+        )
+        target_key = (
+            target_id,
+            session.target.document_id,
+            session.target.origin,
+            session.view_generation,
+        )
+        if (
+            getattr(old, "_portal_target_key", None) == target_key
+            and not old.stopped
+            and getattr(old, "_portal_bound_identity", None)
+            == old.binding_identity(session.target.frame_id)
+        ):
+            return registration
+        # Revoke and drain before attaching to a page containing real login data.
+        await old.stop(status="failed", note="portal page binding replaced")
+        await old.page.aclose()
+        replacement = await start_recording(
+            cdp_endpoint,
+            domain=session.target.origin,
+            capability="account-login",
+            target_id=target_id,
+        )
+        try:
+            attached_identity = replacement.binding_identity()
+            # Recheck after Playwright attachment: a same-tab navigation must not
+            # silently bind the newly-created record to a different document.
+            _, checked_id = await _authorized_cdp_page(
+                cdp_endpoint, session.target, session.view_generation
+            )
+            if checked_id != target_id or replacement.binding_identity() != attached_identity:
+                raise RuntimeError("portal CDP target changed during record attachment")
+            raw_page = replacement.page.page
+            replacement._portal_verified_page = raw_page
+            replacement._portal_target_key = target_key
+            replacement._portal_prepare_lock = lock
+            replacement._portal_bound_identity = replacement.binding_identity(
+                session.target.frame_id
+            )
+            current = registry.resolve(
+                session_id=session.session_id,
+                node_id=session.node_id,
+                boot_id=session.node_boot_id,
+                epoch=session.epoch,
+                agent_url=registration.agent_url,
+            )
+            if current is not registration:
+                raise RuntimeError("portal registration changed during record attachment")
+            updated = replace(registration, record_session=replacement)
+            registry.revoke(
+                session_id=session.session_id,
+                node_id=session.node_id,
+                boot_id=session.node_boot_id,
+                epoch=session.epoch,
+            )
+            registry.register(updated)
+            return updated
+        except BaseException:
+            await replacement.stop(status="failed")
+            await replacement.page.aclose()
+            raise
 
 
 def _portal_binding(route: PortalOwnerRouteV1) -> PortalOuterBindingV1:
@@ -674,7 +783,10 @@ async def _portal_masked_regions(
 
     regions = await _evaluate_cdp_target(
         websocket_url,
-        """(() => [...document.querySelectorAll('[data-sensitive-field]')].map((node) => {
+        """(() => [...document.querySelectorAll(
+          '[data-sensitive-field], input:not([type="button"]):not([type="submit"])' +
+          ':not([type="checkbox"]):not([type="radio"]), textarea'
+        )].map((node) => {
           const rect = node.getBoundingClientRect();
           return {
             x: Math.round(rect.x),
@@ -685,10 +797,10 @@ async def _portal_masked_regions(
         }))()""",
     )
     if not isinstance(regions, list):
-        return []
+        raise RuntimeError("portal sensitive field measurement failed")
     allowed = route.region_focus.approved_regions
     masked: list[dict[str, int]] = []
-    for region in regions[:32]:
+    for region in regions:
         if not isinstance(region, dict):
             continue
         values = {name: region.get(name) for name in ("x", "y", "width", "height")}
@@ -696,14 +808,14 @@ async def _portal_masked_regions(
             continue
         if values["width"] <= 0 or values["height"] <= 0:
             continue
-        if any(
-            candidate.x <= values["x"]
-            and candidate.y <= values["y"]
-            and values["x"] + values["width"] <= candidate.x + candidate.width
-            and values["y"] + values["height"] <= candidate.y + candidate.height
-            for candidate in allowed
-        ):
-            masked.append(values)
+        for candidate in allowed:
+            left, top = max(candidate.x, values["x"]), max(candidate.y, values["y"])
+            right = min(candidate.x + candidate.width, values["x"] + values["width"])
+            bottom = min(candidate.y + candidate.height, values["y"] + values["height"])
+            if right > left and bottom > top:
+                masked.append({"x": left, "y": top, "width": right-left, "height": bottom-top})
+        if len(masked) > 32:
+            raise RuntimeError("portal sensitive field mask limit exceeded")
     return masked
 
 
@@ -722,6 +834,41 @@ async def _apply_guarded_field_input(
         or not control.field_ref
     ):
         raise ValueError("portal field input is outside approved focus")
+    if control.field_ref.startswith("official-login:"):
+        if route.region_focus.region_kind not in {"form", "approved"}:
+            raise ValueError("official input requires an interactive login surface")
+        expected = {
+            "origin": route.binding.target.origin, "field": control.field_ref,
+            "value": payload.value.get_secret_value(),
+            "regions": [region.model_dump() for region in route.region_focus.approved_regions],
+        }
+        expression = """(expected => {
+          if (location.origin !== expected.origin) return false;
+          const node = document.activeElement;
+          if (!node || !node.matches('input, textarea') || node.disabled || node.readOnly ||
+              node.getAttribute('data-opencli-login-field') !== expected.field) return false;
+          const rect = node.getBoundingClientRect();
+          if (!expected.regions.some(r => rect.width > 0 && rect.height > 0 &&
+              rect.x >= r.x && rect.y >= r.y &&
+              rect.right <= r.x+r.width && rect.bottom <= r.y+r.height)) return false;
+          const proto = node.tagName === 'TEXTAREA'
+              ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+          const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+          if (!setter) return false;
+          setter.call(node, expected.value);
+          node.dispatchEvent(new Event('input', {bubbles:true}));
+          node.dispatchEvent(new Event('change', {bubbles:true}));
+          return true;
+        })""" + f"({json.dumps(expected, separators=(',', ':'))})"
+        try:
+            accepted = await _evaluate_cdp_target(websocket_url, expression)
+        except Exception:
+            raise ValueError("official login field input failed") from None
+        finally:
+            expected["value"] = ""
+        if accepted is not True:
+            raise ValueError("official login field is no longer focused")
+        return
     field = control.field_ref.removeprefix("controlled-login-fixture:")
     if not field or field == control.field_ref:
         raise ValueError("portal field reference is invalid")
@@ -782,7 +929,45 @@ async def capture_portal_frame(
     sequence: int,
 ) -> PortalWireFrameV1:
     """Capture only the first L-approved region from the real page target."""
+    if route.binding.target.origin.startswith("https://"):
+        from backend.browser_account_runtime import account_runtime_allocator
+
+        running = account_runtime_allocator().get(route.binding.session_id)
+        admission = runtime_lease_book().current(running.command_id) if running else None
+        if admission is None:
+            raise RuntimeError("portal account lease is no longer current")
+        target = route.binding.target
+        request = RuntimeInvokeRequest(
+            runtime="script-host",
+            workflow="login.observe",
+            input={
+                "session_id": route.binding.session_id,
+                "epoch": route.binding.epoch,
+                "rule_id": admission.session.login_rule_id,
+                "rule_version": admission.session.login_rule_version,
+                "target": {
+                    "tab_id": int(target.tab_id),
+                    "frame_id": int(target.frame_id),
+                    "document_id": target.document_id,
+                    "origin": target.origin,
+                    "view_generation": route.binding.view_generation,
+                },
+            },
+            config={
+                "pack": "account-login",
+                "action": "login.observe",
+                "tab_id": int(target.tab_id),
+            },
+        )
+        checked = await invoke_script_host(request, cdp_endpoint=running.binding.cdp_endpoint)
+        response = checked.get("result", {})
+        if response.get("ok") is not True:
+            raise RuntimeError("portal QR target is no longer current")
+        focus = PortalRegionFocusV1.model_validate(response.get("result", {}).get("region_focus"))
+        if focus != route.region_focus:
+            raise RuntimeError("portal approved QR region changed")
     region = route.region_focus.approved_regions[0]
+    masked_regions = await _portal_masked_regions(websocket_url, route)
     result = await _cdp_command(
         websocket_url,
         "Page.captureScreenshot",
@@ -800,7 +985,8 @@ async def capture_portal_frame(
         },
     )
     raw = base64.b64decode(result.get("data", ""), validate=True)
-    masked_regions = await _portal_masked_regions(websocket_url, route)
+    if masked_regions != await _portal_masked_regions(websocket_url, route):
+        raise RuntimeError("portal sensitive field layout changed during capture")
     try:
         from PIL import Image, ImageDraw
 
@@ -836,6 +1022,7 @@ async def capture_portal_frame(
         expires_at=datetime.now(UTC) + timedelta(seconds=5),
         clip=region,
         masked_regions=masked_regions,
+        focused_field_ref=route.region_focus.focused_field_ref,
         byte_length=len(raw),
         frame_bytes=raw,
     )
@@ -867,6 +1054,14 @@ def _point_in_regions(route: PortalOwnerRouteV1, x: int, y: int) -> bool:
     )
 
 
+async def release_portal_pointer(websocket_url: str) -> None:
+    """Release a held pointer on its original target without clicking a page control."""
+    await _cdp_command(websocket_url, "Input.dispatchMouseEvent", {
+        "type": "mouseReleased", "x": -1, "y": -1,
+        "button": "left", "buttons": 0, "clickCount": 0,
+    })
+
+
 async def apply_portal_control(
     *,
     websocket_url: str,
@@ -882,16 +1077,51 @@ async def apply_portal_control(
     if control.kind == "field_input":
         await _apply_guarded_field_input(websocket_url, route, control)
         return True
+    if control.kind == "takeover":
+        from backend.browser_account_runtime import account_runtime_allocator
+
+        running = account_runtime_allocator().get(route.binding.session_id)
+        admission = runtime_lease_book().current(running.command_id) if running else None
+        if admission is None:
+            raise ValueError("portal takeover has no active lease")
+        target = route.binding.target
+        result = await invoke_script_host(
+            RuntimeInvokeRequest(
+                runtime="script-host", workflow="login.switch-mode",
+                input={
+                    "session_id": route.binding.session_id, "epoch": route.binding.epoch,
+                    "rule_id": admission.session.login_rule_id,
+                    "rule_version": admission.session.login_rule_version, "mode": "form",
+                    "target": {
+                        **target.model_dump(mode="json"),
+                        "tab_id": int(target.tab_id),
+                        "frame_id": int(target.frame_id),
+                        "view_generation": route.binding.view_generation,
+                    },
+                },
+                config={
+                    "pack": "account-login", "action": "login.switch-mode",
+                    "tab_id": int(target.tab_id),
+                },
+            ),
+            cdp_endpoint=cdp_endpoint,
+        )
+        if result.get("result", {}).get("ok") is not True:
+            raise ValueError("official login interaction was rejected")
+        return True
     if payload is None:
         raise ValueError("portal control requires transient payload")
     if control.kind == "pointer":
+        if route.region_focus.region_kind not in {"form", "approved"}:
+            raise ValueError("QR projection is not interactive")
         if (
             payload.x is None
             or payload.y is None
             or not _point_in_regions(route, payload.x, payload.y)
         ):
             raise ValueError("portal pointer is outside approved regions")
-        for event_type in ("mousePressed", "mouseReleased"):
+        actions = {"down": ("mousePressed",), "move": ("mouseMoved",), "up": ("mouseReleased",)}
+        for event_type in actions.get(payload.pointer_action, ("mousePressed", "mouseReleased")):
             await _cdp_command(
                 websocket_url,
                 "Input.dispatchMouseEvent",
@@ -900,6 +1130,7 @@ async def apply_portal_control(
                     "x": payload.x,
                     "y": payload.y,
                     "button": "left",
+                    "buttons": 0 if event_type == "mouseReleased" else 1,
                     "clickCount": 1,
                 },
             )
@@ -908,10 +1139,15 @@ async def apply_portal_control(
         if payload.key is None:
             raise ValueError("portal key control has no key")
         key = payload.key
+        if route.region_focus.region_kind not in {"form", "approved"} or key not in {
+            "Tab", "Enter", "Backspace", "Escape", "Delete", "ArrowLeft", "ArrowRight",
+            "ArrowUp", "ArrowDown", "Home", "End", "Space",
+        }:
+            raise ValueError("portal key is outside approved interactive controls")
+        if key == "Space":
+            key = " "
         await _cdp_command(websocket_url, "Input.dispatchKeyEvent", {"type": "keyDown", "key": key})
         await _cdp_command(websocket_url, "Input.dispatchKeyEvent", {"type": "keyUp", "key": key})
-        return True
-    if control.kind == "takeover":
         return True
     raise ValueError("unsupported portal control")
 

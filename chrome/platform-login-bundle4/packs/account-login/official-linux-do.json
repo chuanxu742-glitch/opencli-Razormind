@@ -1,0 +1,27 @@
+{
+  "id": "official-linux-do",
+  "version": "0.1.0",
+  "platform": "linux-do",
+  "allowed_origins": [
+    "https://linux.do"
+  ],
+  "allowed_redirect_origins": [
+    "https://linux.do"
+  ],
+  "login_url": "/login",
+  "modes": [
+    "form"
+  ],
+  "qr_supported": false,
+  "interaction_supported": true,
+  "identity_probe_supported": false,
+  "authentication_verified": false,
+  "selectors": [
+    {
+      "id": "form",
+      "selector": "body",
+      "kind": "form",
+      "frame": "main"
+    }
+  ]
+}

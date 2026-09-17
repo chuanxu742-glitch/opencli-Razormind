@@ -87,6 +87,9 @@ class LegacyDbSink:
                 channel_type=ctx.provider, forward_to_odp=self.forward_to_odp,
                 identities=identities,
                 lineage=ctx.lineage_envelope(),
+                capture_geo_observations=ctx.geo_observation_capture,
+                task_run_id=ctx.run_id,
+                observed_at=ctx.observed_at,
             )
             await session.commit()
 

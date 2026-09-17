@@ -37,7 +37,9 @@ import {
   getIdentityGeneration,
   hasDevelopmentSession,
   isDevelopmentLoginAllowed,
-  persistBootstrapIdentityToken,
+  isRememberedLocalIdentityToken,
+  persistLocalIdentityToken,
+  REMEMBERED_LOCAL_TOKEN_KEY,
   setDevelopmentSession,
   setRuntimeIdentityToken,
 } from '@/lib/auth/session'
@@ -52,7 +54,7 @@ type AuthContextValue = {
   oidcEnabled: boolean
   developmentLoginEnabled: boolean
   signInWithOidc: (returnTo?: string) => Promise<void>
-  signInWithPassword: (username: string, password: string) => Promise<boolean>
+  signInWithPassword: (username: string, password: string, rememberLogin?: boolean) => Promise<boolean>
   changePassword: (currentPassword: string, newPassword: string) => Promise<void>
   completeOidcSignIn: () => Promise<string>
   enterDevelopmentMode: () => void
@@ -88,6 +90,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [status, setStatus] = useState<AuthStatus>('loading')
   const [identity, setIdentity] = useState<AuthIdentity | null>(null)
   const identityRef = useRef<AuthIdentity | null>(null)
+  const rememberedLocalOwnershipRef = useRef<string | null>(null)
   identityRef.current = identity
   const [recoveryError, setRecoveryError] = useState<string | null>(null)
   const [recoveryMode, setRecoveryMode] = useState<'service' | 'incompatible' | null>(null)
@@ -138,6 +141,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       requireCurrentRecovery(epoch)
       cancelAuthQueryCache()
       claimOidcOwnership(owner)
+      if (owner === 'oidc') {
+        rememberedLocalOwnershipRef.current = null
+        clearIdentityToken()
+      }
       setRuntimeIdentityToken(token)
       const nextIdentity = await getCurrentIdentity()
       requireCurrentRecovery(epoch)
@@ -153,11 +160,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     [cancelAuthQueryCache, claimOidcOwnership, clearAuthQueryCache, requireCurrentRecovery],
   )
 
-  const clearLocalIdentity = useCallback(() => {
+  const clearLocalIdentity = useCallback((preserveRememberedLocalLogin = false) => {
     clearAuthQueryCache()
     claimOidcOwnership(false)
     recoveryCoordinator.invalidate()
-    clearIdentityToken()
+    rememberedLocalOwnershipRef.current = null
+    clearIdentityToken(preserveRememberedLocalLogin)
     setDevelopmentSession(false)
     setIdentity(null)
     setRecoveryError(null)
@@ -184,8 +192,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return promise
   }, [])
 
-  const becomeAnonymous = useCallback(async () => {
-    clearLocalIdentity()
+  const becomeAnonymous = useCallback(async (preserveRememberedLocalLogin = false) => {
+    clearLocalIdentity(preserveRememberedLocalLogin)
     await removeOidcUser()
   }, [clearLocalIdentity, removeOidcUser])
 
@@ -357,6 +365,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
       const bootstrapToken = getBootstrapIdentityToken()
       if (bootstrapToken) {
+        rememberedLocalOwnershipRef.current = isRememberedLocalIdentityToken(bootstrapToken) ? bootstrapToken : null
         claimOidcOwnership(false)
         try {
           await recoverIdentityToken(bootstrapToken, 'bootstrap', epoch)
@@ -472,7 +481,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       void becomeAnonymous()
     }
     window.addEventListener(AUTH_REQUIRED_EVENT, onAuthRequired)
-    return () => window.removeEventListener(AUTH_REQUIRED_EVENT, onAuthRequired)
+    const onStorage = (event: StorageEvent) => {
+      if (event.key !== REMEMBERED_LOCAL_TOKEN_KEY || event.newValue !== null || !rememberedLocalOwnershipRef.current) return
+      try {
+        if (JSON.parse(event.oldValue ?? 'null')?.token !== rememberedLocalOwnershipRef.current) return
+      } catch { return }
+      // Cancel restore/recovery even before /auth/me has accepted an identity.
+      // A newer login in the other tab may already have replaced its stored token.
+      void becomeAnonymous(true)
+    }
+    window.addEventListener('storage', onStorage)
+    return () => {
+      window.removeEventListener(AUTH_REQUIRED_EVENT, onAuthRequired)
+      window.removeEventListener('storage', onStorage)
+    }
   }, [becomeAnonymous, developmentLoginEnabled])
 
   const signInWithOidc = useCallback(
@@ -486,7 +508,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   )
 
   const signInWithPassword = useCallback(
-    async (username: string, password: string) => {
+    async (username: string, password: string, rememberLogin = false) => {
       const epoch = recoveryCoordinator.beginEpoch()
       const result = await loginWithPassword(username, password)
       requireCurrentRecovery(epoch)
@@ -494,7 +516,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       const oidcRemoved = await removeOidcUser()
       requireCurrentRecovery(epoch)
       if (!oidcRemoved) throw new Error('无法清理旧 OIDC 会话，本地管理员登录未保存。请重试。')
-      persistBootstrapIdentityToken(result.access_token)
+      persistLocalIdentityToken(result.access_token, rememberLogin)
+      rememberedLocalOwnershipRef.current = isRememberedLocalIdentityToken(result.access_token) ? result.access_token : null
       await recoverIdentityToken(result.access_token, 'bootstrap', epoch)
       return result.using_default_password
     },
@@ -530,6 +553,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     recoveryCoordinator.beginEpoch()
     if (!isSameIdentityPrincipal(identityRef.current, DEVELOPMENT_IDENTITY)) clearAuthQueryCache()
     claimOidcOwnership(false)
+    rememberedLocalOwnershipRef.current = null
     clearIdentityToken()
     setDevelopmentSession(true)
     setIdentity(DEVELOPMENT_IDENTITY)

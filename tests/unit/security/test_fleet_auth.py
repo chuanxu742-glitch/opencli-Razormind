@@ -161,6 +161,28 @@ async def test_ws_no_token_configured_passes_through(auth_disabled):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["portal", "browser"])
+async def test_account_portal_ws_delegates_to_owner_auth(auth_enabled, endpoint):
+    recorder = _Recorder()
+    path = f"/api/v1/workspaces/w/browser-accounts/a/login-sessions/s/{endpoint}"
+    await _wrapped(recorder)(_ws_scope(path), recorder.receive, recorder.send)
+    assert recorder.app_called is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["portal", "browser"])
+@pytest.mark.parametrize("suffix", ["/", "/extra", "-ticket/issue", "-ticket/redeem"])
+async def test_nearby_portal_ws_paths_still_require_fleet_auth(
+    auth_enabled, endpoint, suffix
+):
+    recorder = _Recorder()
+    path = f"/api/v1/workspaces/w/browser-accounts/a/login-sessions/s/{endpoint}{suffix}"
+    await _wrapped(recorder)(_ws_scope(path), recorder.receive, recorder.send)
+    assert recorder.app_called is False
+    assert recorder.sent[0]["code"] == 4401
+
+
+@pytest.mark.asyncio
 async def test_ws_token_set_no_credential_is_rejected_4401(auth_enabled):
     recorder = _Recorder()
     scope = _ws_scope("/api/v1/nodes/ws")

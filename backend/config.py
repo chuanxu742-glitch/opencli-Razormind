@@ -215,6 +215,17 @@ class Settings(BaseSettings):
     # If empty, the system tries to derive it from request headers (may give internal URL
     # when behind a reverse proxy with changeOrigin=true).
     public_url: str = ""
+    # Exact browser-facing origin for account portals behind a host-rewriting proxy.
+    # Empty means the request's own origin; forwarded headers are never trusted here.
+    browser_portal_public_origin: str = ""
+    # Explicit opt-in for a native TigerVNC window on the same Windows host
+    # as the API process. Empty keeps native desktop launching disabled.
+    browser_native_viewer_executable: str = ""
+    # Optional TigerVNC viewer used by the Windows desktop API process to open
+    # account browsers in a native window. Empty keeps the capability disabled.
+    # The native-window service requires an absolute executable path and never
+    # accepts a viewer path from an HTTP request.
+    browser_native_viewer_executable: str = ""
 
     # Fleet network bootstrap used by the generated edge-agent installer.
     # The collection layer only needs reachability between CENTRAL_API_URL and

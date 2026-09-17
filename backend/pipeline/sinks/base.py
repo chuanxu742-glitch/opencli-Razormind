@@ -15,6 +15,7 @@ never by rewriting the pipeline.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Protocol, Sequence
 
 
@@ -129,6 +130,8 @@ class RunContext:
     trace_ref: str | None = None
     artifact_refs: list[Any] | tuple[Any, ...] | None = None
     lineage: CollectionLineage | None = None
+    geo_observation_capture: bool = False
+    observed_at: datetime | None = None
 
     def lineage_envelope(self) -> CollectionLineage:
         """Build one immutable envelope without inventing missing references."""

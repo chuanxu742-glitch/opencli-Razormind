@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
+import sqlite3
 import sys
 import textwrap
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -16,7 +18,9 @@ from backend.browser_account_runtime import (
     AccountRuntimeConfiguration,
     BrowserAccountRuntimeAllocator,
     BrowserRuntimeError,
+    inspect_password_inventory,
     session_runtime_registry,
+    verify_password_manager_policy,
 )
 from backend.models.browser import BrowserCommandKind
 from backend.schemas.browser_account import (
@@ -41,6 +45,64 @@ def test_account_paths_follow_configured_persistent_volume(monkeypatch, tmp_path
     override = tmp_path / "separately-mounted-profiles"
     monkeypatch.setenv("ACCOUNT_PROFILE_ROOT", str(override))
     assert AccountRuntimeConfiguration.from_environment().profile_root == override
+
+
+def _empty_login_database(profile: Path, name: str = "Login Data") -> Path:
+    profile.mkdir(parents=True, exist_ok=True)
+    database = profile / name
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE logins (id INTEGER PRIMARY KEY)")
+    return database
+
+
+def test_password_inventory_accepts_only_empty_rollback_journal_for_empty_store(
+    tmp_path: Path,
+) -> None:
+    profile = tmp_path / "profile"
+    database = _empty_login_database(profile)
+    journal = database.with_name(f"{database.name}-journal")
+    journal.write_bytes(b"")
+
+    inventory = inspect_password_inventory(profile)
+
+    assert inventory.status == "not_present"
+    assert inventory.credential_count == 0
+    assert inventory.database_paths == ("Login Data", "Login Data-journal")
+
+    journal.write_bytes(b"not-an-inert-journal")
+    assert inspect_password_inventory(profile).status == "unknown"
+
+
+def test_password_inventory_rejects_empty_journal_when_credentials_exist(
+    tmp_path: Path,
+) -> None:
+    profile = tmp_path / "profile"
+    database = _empty_login_database(profile)
+    with sqlite3.connect(database) as connection:
+        connection.execute("INSERT INTO logins DEFAULT VALUES")
+    database.with_name(f"{database.name}-journal").write_bytes(b"")
+
+    inventory = inspect_password_inventory(profile)
+
+    assert inventory.status == "unknown"
+    assert inventory.credential_count == 1
+
+
+def test_desktop_policy_requires_local_file_and_developer_tool_controls(tmp_path: Path) -> None:
+    policy = tmp_path / "policy.json"
+    policy.write_text(
+        json.dumps(
+            {
+                "PasswordManagerEnabled": False,
+                "AutofillAddressEnabled": False,
+                "AutofillCreditCardEnabled": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(BrowserRuntimeError, match="credential_policy_unverified"):
+        verify_password_manager_policy(policy)
 
 
 _RUNTIME_PROCESS = r"""
@@ -92,6 +154,22 @@ if role == "xvfb":
                 os.unlink(unix_path)
             except FileNotFoundError:
                 pass
+    raise SystemExit(0)
+
+if role == "x11vnc":
+    port = int(sys.argv[sys.argv.index("-rfbport") + 1])
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", port))
+    server.listen(8)
+    while running:
+        server.settimeout(0.1)
+        try:
+            conn, _ = server.accept()
+            conn.close()
+        except TimeoutError:
+            pass
+    server.close()
     raise SystemExit(0)
 
 if role == "browser":
@@ -201,6 +279,12 @@ def _configuration(tmp_path: Path, *, browser_role: str = "browser") -> AccountR
                 "PasswordManagerEnabled": False,
                 "AutofillAddressEnabled": False,
                 "AutofillCreditCardEnabled": False,
+                "DeveloperToolsAvailability": 0,
+                "RemoteDebuggingAllowed": True,
+                "AllowFileSelectionDialogs": False,
+                "DefaultFileSystemReadGuardSetting": 2,
+                "DefaultFileSystemWriteGuardSetting": 2,
+                "URLBlocklist": ["file:///*", "file://*", "view-source:*"],
             }
         ),
         encoding="utf-8",
@@ -219,6 +303,7 @@ def _configuration(tmp_path: Path, *, browser_role: str = "browser") -> AccountR
         bundle_id="bundle-2",
         policy_file=policy,
         xvfb_argv=(*command, "xvfb"),
+        x11vnc_argv=(*command, "x11vnc"),
         browser_argv=(*command, browser_role),
         bbx_argv=(*command, "bbx"),
         bbx_install_argv=(*command, "bbx-install"),
@@ -234,7 +319,7 @@ def _configuration(tmp_path: Path, *, browser_role: str = "browser") -> AccountR
 
 
 def _contracts(
-    *, expires_in: float = 30, suffix: str = "1"
+    *, expires_in: float = 30, suffix: str = "1", purpose: str = "login"
 ) -> tuple[DurableCommandV1, NodeClaimV1, SessionEnvelopeV1, NodeIdentityV1]:
     now = datetime.now(UTC)
     command = DurableCommandV1(
@@ -278,7 +363,7 @@ def _contracts(
         login_rule_id="controlled-login-fixture",
         login_rule_version="1.0.0",
         view_generation=0,
-        purpose="login",
+        purpose=purpose,
         command_id=command.command_id,
         profile_state="new",
     )
@@ -534,6 +619,131 @@ async def test_start_login_allocates_one_real_isolated_stack_and_is_idempotent(
             node_id=identity.node_id,
             boot_id=identity.boot_id,
             epoch=claim.epoch,
+        )
+
+
+@pytest.mark.asyncio
+async def test_start_login_accepts_browser_purpose_and_exposes_isolated_vnc(
+    tmp_path: Path,
+) -> None:
+    configuration = _configuration(tmp_path)
+    spawned = []
+
+    def spawn(argv, **kwargs):
+        spawned.append(tuple(argv))
+        return browser_runtime.spawn_isolated_process(argv, **kwargs)
+
+    allocator = BrowserAccountRuntimeAllocator(configuration, process_factory=spawn)
+    command, claim, session, identity = _contracts(purpose="browser")
+
+    runtime = await allocator.start(
+        command=command,
+        claim=claim,
+        session=session,
+        node_identity=identity,
+    )
+    try:
+        assert runtime.binding.vnc_port not in {
+            runtime.binding.cdp_port,
+            runtime.binding.bbx_port,
+            runtime.binding.daemon_port,
+        }
+        assert _accepts(runtime.binding.vnc_port)
+        vnc_argv = next(
+            argv
+            for argv in spawned
+            if argv[: len(configuration.x11vnc_argv)] == configuration.x11vnc_argv
+        )
+        assert "-noclipboard" in vnc_argv
+        assert "-nosetclipboard" in vnc_argv
+    finally:
+        await allocator.stop(
+            session_id=session.session_id,
+            node_id=identity.node_id,
+            boot_id=identity.boot_id,
+            epoch=claim.epoch,
+        )
+
+
+@pytest.mark.asyncio
+async def test_runtime_waits_for_x_listener_before_spawning_vnc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configuration = replace(_configuration(tmp_path), startup_timeout=0.15)
+    spawned = []
+
+    def spawn(argv, **kwargs):
+        spawned.append(tuple(argv))
+        return browser_runtime.spawn_isolated_process(argv, **kwargs)
+
+    monkeypatch.setattr(browser_runtime, "_x_display_accepting", lambda _display: False)
+    allocator = BrowserAccountRuntimeAllocator(configuration, process_factory=spawn)
+    command, claim, session, identity = _contracts(purpose="browser")
+
+    with pytest.raises(BrowserRuntimeError, match="Xvfb display"):
+        await allocator.start(
+            command=command,
+            claim=claim,
+            session=session,
+            node_identity=identity,
+        )
+
+    assert len(spawned) == 1
+    assert spawned[0][: len(configuration.xvfb_argv)] == configuration.xvfb_argv
+    assert allocator.active_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_xvfb_early_exit_prevents_vnc_spawn_and_cleans_allocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = _configuration(tmp_path)
+    command_prefix = base.xvfb_argv[:-1]
+    configuration = replace(base, xvfb_argv=(*command_prefix, "fail"))
+    spawned = []
+
+    def spawn(argv, **kwargs):
+        spawned.append(tuple(argv))
+        return browser_runtime.spawn_isolated_process(argv, **kwargs)
+
+    allocator = BrowserAccountRuntimeAllocator(configuration, process_factory=spawn)
+    monkeypatch.setattr(browser_runtime, "_x_display_accepting", lambda _display: False)
+    command, claim, session, identity = _contracts(purpose="browser")
+
+    with pytest.raises(BrowserRuntimeError, match="Xvfb exited"):
+        await allocator.start(
+            command=command,
+            claim=claim,
+            session=session,
+            node_identity=identity,
+        )
+
+    assert len(spawned) == 1
+    assert allocator.active_count() == 0
+
+
+def test_runtime_lease_renewal_promotes_login_admission_to_browser() -> None:
+    _command, claim, login, identity = _contracts()
+    book = browser_runtime.AuthenticatedRuntimeLeaseBook()
+    book.claim(claim=claim, session=login, node_identity=identity)
+    renewed_claim = claim.model_copy(
+        update={"expires_at": claim.expires_at + timedelta(seconds=30)}
+    )
+    browser = login.model_copy(update={"purpose": "browser"})
+
+    admission = book.renew(
+        claim=renewed_claim,
+        session=browser,
+        node_identity=identity,
+    )
+
+    assert admission.session.purpose == "browser"
+    with pytest.raises(BrowserRuntimeError, match="runtime purpose"):
+        book.renew(
+            claim=renewed_claim,
+            session=browser.model_copy(update={"purpose": "execution"}),
+            node_identity=identity,
         )
 
 

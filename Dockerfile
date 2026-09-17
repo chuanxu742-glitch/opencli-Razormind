@@ -63,6 +63,11 @@ ENV PYTHONPATH=/app \
 ARG IMAGE_TAG=latest
 ENV IMAGE_TAG=${IMAGE_TAG}
 
+EXPOSE 8000
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000", "--access-log", "--log-level", "info"]
+
 # Acceptance-only image: production runtime plus the independently pinned III
 # engine and deterministic source-only CLI fixture. It is never the default
 # Compose image.
@@ -84,7 +89,6 @@ ENV III_CLI_PATH=/opt/iii/iii \
     OPENCLI_BIN=/opt/non-bypass/opencli-proof
 USER appuser
 
-EXPOSE 8000
-
-ENTRYPOINT ["/entrypoint.sh"]
-CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000", "--access-log", "--log-level", "info"]
+# Keep the acceptance fixture available through an explicit target while
+# making the default build resolve to a clean production image.
+FROM runtime AS production

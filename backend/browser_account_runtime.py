@@ -64,8 +64,6 @@ _MAX_PASSWORD_SCAN_ENTRIES = 100_000
 _OPENCLI_DAEMON_PORT = 19_825
 
 
-
-
 @dataclass(frozen=True)
 class PasswordInventory:
     """Metadata-only password credential inventory."""
@@ -469,8 +467,6 @@ class EpochStore:
                 )
 
 
-
-
 class LeaseSupervisor:
     """Watch a lease and stop the complete runtime when it is lost."""
 
@@ -513,6 +509,8 @@ class LeaseSupervisor:
         """Advance the watched deadline only for the same fenced generation."""
 
         with self._lease_lock:
+            if self.lost.is_set() or self._stop.is_set():
+                raise BrowserRuntimeError("stale_lease", "lease supervisor has stopped")
             current = self.lease
             if (
                 current.node_id != lease.node_id
@@ -527,6 +525,16 @@ class LeaseSupervisor:
                 )
             self.lease = lease
 
+    def renew_lease(self, renew: Callable[[EpochLease], EpochLease]) -> EpochLease:
+        """Persist and publish a renewal atomically with supervisor validation."""
+        with self._lease_lock:
+            if self.lost.is_set() or self._stop.is_set():
+                raise BrowserRuntimeError("stale_lease", "lease supervisor has stopped")
+            self.lease.assert_valid()
+            renewed = renew(self.lease)
+            self.update_lease(renewed)
+            return renewed
+
     @property
     def shutdown_evidence(self) -> ShutdownEvidence | None:
         return self.process_supervisor.last_shutdown
@@ -535,16 +543,17 @@ class LeaseSupervisor:
         while not self._stop.wait(self.poll_seconds):
             with self._lease_lock:
                 lease = self.lease
-            valid = lease.is_valid()
-            if valid and self.lease_check is not None:
-                try:
-                    checked = self.lease_check(lease)
-                    valid = checked is not False
-                except Exception:
-                    valid = False
-            if valid:
-                continue
-            self.lost.set()
+                valid = lease.is_valid()
+                if valid and self.lease_check is not None:
+                    try:
+                        checked = self.lease_check(lease)
+                        valid = checked is not False
+                    except Exception:
+                        valid = False
+                if valid:
+                    continue
+                # Once loss is decided, no renewal can resurrect this stack.
+                self.lost.set()
             stopped = self.process_supervisor.stop()
             if stopped:
                 try:
@@ -594,7 +603,36 @@ def verify_password_manager_policy(
             raise BrowserRuntimeError(
                 "credential_policy_unverified", "autofill policy is not disabled"
             )
-    return {"policy": "verified", "password_manager_enabled": False, "source": str(path)}
+    required_desktop_policies: dict[str, Any] = {
+        # Value 0 keeps the runtime's loopback CDP automation available while
+        # denying DevTools inspection of enterprise-installed extensions.
+        # Chromium's value 2 also rejects CDP target attachment and therefore
+        # cannot be used by this observer-driven runtime.
+        "DeveloperToolsAvailability": 0,
+        "RemoteDebuggingAllowed": True,
+        "AllowFileSelectionDialogs": False,
+        "DefaultFileSystemReadGuardSetting": 2,
+        "DefaultFileSystemWriteGuardSetting": 2,
+    }
+    if any(payload.get(key) != value for key, value in required_desktop_policies.items()):
+        raise BrowserRuntimeError(
+            "credential_policy_unverified", "desktop local-file policy is not enforced"
+        )
+    blocked_urls = payload.get("URLBlocklist")
+    if not isinstance(blocked_urls, list) or not {
+        "file:///*",
+        "file://*",
+        "view-source:*",
+    }.issubset(blocked_urls):
+        raise BrowserRuntimeError(
+            "credential_policy_unverified", "desktop URL policy is not enforced"
+        )
+    return {
+        "policy": "verified",
+        "password_manager_enabled": False,
+        "local_file_access": "blocked",
+        "source": str(path),
+    }
 
 
 def inspect_password_inventory(profile_dir: str | os.PathLike[str]) -> PasswordInventory:
@@ -660,7 +698,15 @@ def inspect_password_inventory(profile_dir: str | os.PathLike[str]) -> PasswordI
         }
         for path in stores
     )
-    if unknown_databases or any(path.name not in _PASSWORD_DATABASE_NAMES for path in stores):
+    sidecars = [path for path in stores if path.name not in _PASSWORD_DATABASE_NAMES]
+    inert_rollback_journals = all(
+        path.name.endswith("-journal")
+        and path.stat().st_size == 0
+        and path.with_name(path.name.removesuffix("-journal")) in credential_counts
+        and credential_counts[path.with_name(path.name.removesuffix("-journal"))] == 0
+        for path in sidecars
+    )
+    if unknown_databases or not inert_rollback_journals:
         status = "unknown"
     else:
         status = "present" if total else "not_present"
@@ -996,8 +1042,6 @@ def _validate_id(value: str, field: str, *, max_length: int = 128) -> None:
         or not _SAFE_COMPONENT.fullmatch(value)
     ):
         raise BrowserRuntimeError("identifier_invalid", f"{field} is invalid")
-
-
 
 
 @contextmanager
@@ -1460,6 +1504,7 @@ class SessionRuntimeBinding:
     cdp_port: int
     bbx_port: int
     daemon_port: int
+    vnc_port: int
 
     def validate(self) -> None:
         for field_name, value in (
@@ -1475,6 +1520,7 @@ class SessionRuntimeBinding:
             cdp_port=self.cdp_port,
             bbx_port=self.bbx_port,
             daemon_port=self.daemon_port,
+            vnc_port=self.vnc_port,
             home_dir=self.home_dir,
             cache_dir=self.cache_dir,
             profile_dir=self.profile_dir,
@@ -1514,6 +1560,7 @@ class SessionRuntimeBinding:
             cdp_port=self.cdp_port,
             bbx_port=self.bbx_port,
             daemon_port=self.daemon_port,
+            vnc_port=self.vnc_port,
             home_dir=self.home_dir,
             cache_dir=self.cache_dir,
             profile_dir=self.profile_dir,
@@ -1730,7 +1777,8 @@ class AuthenticatedRuntimeLeaseBook:
         return admission
 
     def renew(
-        self, *, claim: Any, node_identity: Any, now: datetime | None = None
+        self, *, claim: Any, node_identity: Any, session: Any | None = None,
+        now: datetime | None = None
     ) -> RuntimeLeaseAdmission:
         current = now or _now()
         if node_identity.node_id != claim.node_id or node_identity.boot_id != claim.boot_id:
@@ -1759,9 +1807,36 @@ class AuthenticatedRuntimeLeaseBook:
                 raise BrowserRuntimeError("stale_claim", "renewal shortens the admitted claim")
             if current >= claim.expires_at:
                 raise BrowserRuntimeError("claim_expired", "claim deadline has passed")
+            renewed_session = admission.session
+            if session is not None:
+                session_lineage = (
+                    "workspace_id",
+                    "account_id",
+                    "session_id",
+                    "node_id",
+                    "node_boot_id",
+                    "epoch",
+                    "lease_id",
+                )
+                if any(
+                    getattr(admission.session, field) != getattr(session, field)
+                    for field in session_lineage
+                ):
+                    raise BrowserRuntimeError(
+                        "stale_claim", "renewal changes admitted session lineage"
+                    )
+                if (admission.session.purpose, session.purpose) not in {
+                    ("login", "login"),
+                    ("login", "browser"),
+                    ("browser", "browser"),
+                }:
+                    raise BrowserRuntimeError(
+                        "stale_claim", "renewal changes the admitted runtime purpose"
+                    )
+                renewed_session = session
             updated = RuntimeLeaseAdmission(
                 claim,
-                admission.session,
+                renewed_session,
                 admission.node_identity,
                 admission.result,
             )
@@ -1796,6 +1871,16 @@ class AuthenticatedRuntimeLeaseBook:
             self._claims[result.command_id] = updated
             return updated
 
+    def current(
+        self, command_id: str, *, now: datetime | None = None
+    ) -> RuntimeLeaseAdmission | None:
+        """Read the current admitted generation; expired/revoked claims are absent."""
+        with self._lock:
+            admission = self._claims.get(command_id)
+            if admission is None or (now or _now()) >= admission.claim.expires_at:
+                return None
+            return admission
+
     def revoke(self, command_id: str) -> None:
         with self._lock:
             self._claims.pop(command_id, None)
@@ -1818,6 +1903,7 @@ class AccountRuntimeConfiguration:
     bundle_id: str
     policy_file: Path
     xvfb_argv: tuple[str, ...]
+    x11vnc_argv: tuple[str, ...]
     browser_argv: tuple[str, ...]
     bbx_argv: tuple[str, ...]
     bbx_install_argv: tuple[str, ...]
@@ -1893,6 +1979,7 @@ class AccountRuntimeConfiguration:
             bundle_id=os.environ.get("BROWSER_RUNTIME_BUNDLE_ID", "").strip(),
             policy_file=policy_file,
             xvfb_argv=(os.environ.get("ACCOUNT_RUNTIME_XVFB_BIN", "Xvfb"),),
+            x11vnc_argv=(os.environ.get("ACCOUNT_RUNTIME_X11VNC_BIN", "x11vnc"),),
             browser_argv=(browser_binary,),
             bbx_argv=(os.environ.get("ACCOUNT_RUNTIME_BBX_DAEMON_BIN", "bbx-daemon"),),
             bbx_install_argv=(os.environ.get("ACCOUNT_RUNTIME_BBX_BIN", "bbx"),),
@@ -1937,10 +2024,10 @@ class AccountRuntimeConfiguration:
                 "runtime_configuration_invalid",
                 "account runtime port range is invalid",
             )
-        if self.port_max - self.port_min < 1:
+        if self.port_max - self.port_min < 2:
             raise BrowserRuntimeError(
                 "runtime_configuration_invalid",
-                "account runtime port range must contain at least two ports",
+                "account runtime port range must contain at least three ports",
             )
         if not 0 < self.startup_timeout <= 120:
             raise BrowserRuntimeError(
@@ -1963,6 +2050,7 @@ class AccountRuntimeConfiguration:
             )
         for argv, label in (
             (self.xvfb_argv, "Xvfb"),
+            (self.x11vnc_argv, "x11vnc"),
             (self.bbx_install_argv, "Browser Bridge installer"),
             (self.browser_argv, "Chromium"),
             (self.bbx_argv, "Browser Bridge"),
@@ -2185,6 +2273,30 @@ class BrowserAccountRuntimeAllocator:
                     env=environment,
                 )
                 process_supervisor.register(xvfb)
+                startup_deadline = (
+                    asyncio.get_running_loop().time()
+                    + self.configuration.startup_timeout
+                )
+                await self._wait_for_x_display(
+                    xvfb=xvfb,
+                    display=stack.display,
+                    deadline=startup_deadline,
+                )
+                # x11vnc is a per-stack loopback endpoint.  It is deliberately
+                # never published as a host port or shared between accounts.
+                vnc = self.process_factory(
+                    (
+                        *self.configuration.x11vnc_argv,
+                        "-display", stack.display,
+                        "-rfbport", str(stack.vnc_port),
+                        "-listen", "127.0.0.1",
+                        "-localhost", "-noipv6", "-nopw", "-forever", "-shared", "-xkb",
+                        "-noclipboard", "-nosetclipboard", "-noprimary", "-nosetprimary",
+                    ),
+                    isolation=stack,
+                    env=environment,
+                )
+                process_supervisor.register(vnc)
                 bbx = self.process_factory(
                     self.configuration.bbx_argv,
                     isolation=stack,
@@ -2201,7 +2313,6 @@ class BrowserAccountRuntimeAllocator:
                     *self.configuration.browser_argv,
                     f"--remote-debugging-port={stack.cdp_port}",
                     "--remote-debugging-address=127.0.0.1",
-                    "--remote-allow-origins=*",
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
                     "--no-first-run",
@@ -2231,7 +2342,8 @@ class BrowserAccountRuntimeAllocator:
                 process_supervisor.register(browser)
                 browser_version = await self._wait_until_ready(
                     stack=stack,
-                    processes=(xvfb, bbx, daemon, browser),
+                    processes=(xvfb, vnc, bbx, daemon, browser),
+                    deadline=startup_deadline,
                 )
                 binding = SessionRuntimeBinding(
                     session_id=session.session_id,
@@ -2248,6 +2360,7 @@ class BrowserAccountRuntimeAllocator:
                     cdp_port=stack.cdp_port,
                     bbx_port=stack.bbx_port,
                     daemon_port=stack.daemon_port,
+                    vnc_port=stack.vnc_port,
                 )
                 lease = EpochLease(
                     claim.node_id,
@@ -2344,12 +2457,10 @@ class BrowserAccountRuntimeAllocator:
                 "runtime renewal does not match the live generation",
             )
         if claim.expires_at > running.lease.expires_at:
-            renewed = running.epoch_store.renew(
-                running.lease,
-                expires_at=claim.expires_at,
+            renewed = running.lease_supervisor.renew_lease(
+                lambda current: running.epoch_store.renew(current, expires_at=claim.expires_at)
             )
             running.lease = renewed
-            running.lease_supervisor.update_lease(renewed)
         return running
 
     async def stop(
@@ -2463,6 +2574,11 @@ class BrowserAccountRuntimeAllocator:
             self._release_isolation(self._stack_from_binding(running.binding))
         return manifest
 
+    def occupied_slots(self) -> int:
+        """Count real allocated stacks for the current node capacity fact."""
+        with self._state_lock:
+            return len(self._sessions)
+
     async def close_all(self) -> None:
         with self._state_lock:
             running = list(self._sessions.values())
@@ -2514,10 +2630,10 @@ class BrowserAccountRuntimeAllocator:
                 "session_claim_mismatch",
                 "start command, claim and session are not the same generation",
             )
-        if session.purpose != "login":
+        if session.purpose not in {"login", "browser"}:
             raise BrowserRuntimeError(
                 "runtime_command_invalid",
-                "START_LOGIN requires a login session",
+                "START_LOGIN requires a login or browser session",
             )
         if _now() >= claim.expires_at:
             raise BrowserRuntimeError("claim_expired", "claim deadline has passed")
@@ -2588,27 +2704,12 @@ class BrowserAccountRuntimeAllocator:
                 "runtime_bundle_incompatible",
                 "runtime bundle has no Script Host",
             )
-        rules_path = script_host / "packs" / "account-login" / "rules.json"
-        if rules_path.is_symlink() or not rules_path.is_file():
+        from backend.browser_login_rules import load_packaged_rule
+
+        rule = load_packaged_rule(script_host, session.login_rule_id, session.login_rule_version)
+        if rule is None:
             raise BrowserRuntimeError(
-                "login_rule_unknown",
-                "installed bundle has no verified login rule",
-            )
-        try:
-            rule = json.loads(rules_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise BrowserRuntimeError(
-                "login_rule_unknown",
-                "installed login rule is invalid",
-            ) from exc
-        if (
-            not isinstance(rule, dict)
-            or rule.get("id") != session.login_rule_id
-            or rule.get("version") != session.login_rule_version
-        ):
-            raise BrowserRuntimeError(
-                "login_rule_unknown",
-                "authorized login rule is not installed",
+                "login_rule_unknown", "authorized login rule is not installed"
             )
         origins = rule.get("allowed_origins")
         login_url_value = rule.get("login_url")
@@ -2704,12 +2805,12 @@ class BrowserAccountRuntimeAllocator:
                 ):
                     continue
                 ports.append(candidate)
-                if len(ports) == 2:
+                if len(ports) == 3:
                     break
-            if len(ports) != 2:
+            if len(ports) != 3:
                 raise BrowserRuntimeError(
                     "capacity_missing",
-                    "two isolated runtime ports are unavailable",
+                    "three isolated runtime ports are unavailable",
                 )
             self._displays.add(display_number)
             self._ports.update((*ports, _OPENCLI_DAEMON_PORT))
@@ -2725,6 +2826,7 @@ class BrowserAccountRuntimeAllocator:
                 cdp_port=ports[0],
                 bbx_port=ports[1],
                 daemon_port=_OPENCLI_DAEMON_PORT,
+                vnc_port=ports[2],
                 home_dir=home_dir,
                 cache_dir=cache_dir,
                 profile_dir=profile_dir,
@@ -2742,8 +2844,11 @@ class BrowserAccountRuntimeAllocator:
         *,
         stack: StackIsolation,
         processes: Sequence[Any],
+        deadline: float | None = None,
     ) -> str:
-        deadline = asyncio.get_running_loop().time() + self.configuration.startup_timeout
+        deadline = deadline or (
+            asyncio.get_running_loop().time() + self.configuration.startup_timeout
+        )
         while asyncio.get_running_loop().time() < deadline:
             if any(_process_returncode(process) is not None for process in processes):
                 raise BrowserRuntimeError(
@@ -2755,6 +2860,7 @@ class BrowserAccountRuntimeAllocator:
             )
             if (
                 display_ready
+                and _local_port_accepting(stack.vnc_port)
                 and _local_port_accepting(stack.bbx_port)
                 and _local_port_accepting(stack.daemon_port)
             ):
@@ -2765,6 +2871,25 @@ class BrowserAccountRuntimeAllocator:
         raise BrowserRuntimeError(
             "runtime_readiness_timeout",
             "account runtime did not become ready before the trusted deadline",
+        )
+
+    async def _wait_for_x_display(
+        self, *, xvfb: Any, display: str, deadline: float
+    ) -> None:
+        """Wait for the real X11 listener before x11vnc is allowed to start."""
+
+        while asyncio.get_running_loop().time() < deadline:
+            if _process_returncode(xvfb) is not None:
+                raise BrowserRuntimeError(
+                    "runtime_process_exited",
+                    "Xvfb exited before its display became ready",
+                )
+            if _x_display_accepting(display):
+                return
+            await asyncio.sleep(0.05)
+        raise BrowserRuntimeError(
+            "runtime_readiness_timeout",
+            "Xvfb display did not become ready before the trusted deadline",
         )
 
     def _on_lease_lost(
@@ -2811,6 +2936,7 @@ class BrowserAccountRuntimeAllocator:
             cdp_port=binding.cdp_port,
             bbx_port=binding.bbx_port,
             daemon_port=binding.daemon_port,
+            vnc_port=binding.vnc_port,
             home_dir=binding.home_dir,
             cache_dir=binding.cache_dir,
             profile_dir=binding.profile_dir,
@@ -2818,7 +2944,9 @@ class BrowserAccountRuntimeAllocator:
 
     def _release_isolation(self, stack: StackIsolation) -> None:
         self._displays.discard(int(stack.display[1:]))
-        self._ports.difference_update({stack.cdp_port, stack.bbx_port, stack.daemon_port})
+        self._ports.difference_update(
+            {stack.cdp_port, stack.bbx_port, stack.daemon_port, stack.vnc_port}
+        )
 
 
 def _install_bbx_native_host(
@@ -2875,7 +3003,10 @@ def _process_returncode(process: Any) -> int | None:
 def _local_port_available(port: int) -> bool:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+        # Linux listeners can restart over TIME_WAIT connections. Match that
+        # behavior without SO_REUSEPORT, so a live listener still blocks us.
+        # Windows SO_REUSEADDR can steal a bound address; retain exclusivity there.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, int(sys.platform == "linux"))
         sock.bind(("127.0.0.1", port))
         return True
     except OSError:
@@ -2889,6 +3020,18 @@ def _local_port_accepting(port: int) -> bool:
     try:
         sock.settimeout(0.05)
         return sock.connect_ex(("127.0.0.1", port)) == 0
+    finally:
+        sock.close()
+
+
+def _x_display_accepting(display: str) -> bool:
+    if os.name != "posix":
+        return True
+    path = f"/tmp/.X11-unix/X{display.removeprefix(':')}"
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(0.05)
+        return sock.connect_ex(path) == 0
     finally:
         sock.close()
 

@@ -1394,12 +1394,14 @@ test('Houdini-style wiring uses native lifecycle hooks without validation toast 
 })
 
 test('the right inspector uses graph contracts instead of manual keys and field paths', async () => {
-  const [inspector, parameterInterface] = await Promise.all([
+  const [inspector, edgeInspector, parameterInterface] = await Promise.all([
     readSource('components/flow/inspector.tsx'),
+    readSource('components/flow/edge-inspector.tsx'),
     readSource('lib/workflow/parameter-interface.ts'),
   ])
 
-  assert.match(inspector, /fieldMappingGap/)
+  assert.match(inspector, /<EdgeInspector/)
+  assert.match(edgeInspector, /copy\.fieldMappingGap/)
   assert.match(inspector, /onReconnect\(currentEdge, connection\)/)
   assert.match(inspector, /connectNodes\(connection\)/)
   assert.match(inspector, /removeEdgesByIds\(currentEdges\.map\(\(edge\) => edge\.id\)\)/)

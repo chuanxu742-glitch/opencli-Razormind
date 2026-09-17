@@ -32,7 +32,7 @@ async def test_new_reused_and_renewed_claims_carry_durable_account_identity(db_s
             EdgeNodeCapacity(
                 node_id="claim-n",
                 boot_id="boot",
-                slot_limit=2,
+                slot_limit=1,
                 occupied_slots=0,
                 disk_available=1000,
                 observed_at=now,

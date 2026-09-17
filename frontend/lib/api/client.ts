@@ -1,6 +1,7 @@
 import axios, { type InternalAxiosRequestConfig } from 'axios'
 
 import { getIdentityGeneration } from '@/lib/auth/session'
+import { browserAccountErrorText } from '@/lib/browser-accounts/error-text'
 
 import { getApiAuthHeaders } from './auth-headers'
 import { notifyAuthRequired } from './auth-events'
@@ -72,7 +73,8 @@ const normalizeApiError = (err: unknown) => {
     const detailIsList = Array.isArray(detail)
     const message =
       err.response?.data?.error || (detailIsList ? undefined : detail) || err.message || 'Unknown error'
-    const normalized = new Error(message) as Error & {
+    const accountOperation = /\/workspaces\/[^/]+\/browser-accounts(?:\/|$)/.test(err.config?.url ?? '')
+    const normalized = new Error(accountOperation ? browserAccountErrorText(detail ?? message) : message) as Error & {
       code?: string
       detail?: unknown
       fleetTransportCredentialAttached?: boolean

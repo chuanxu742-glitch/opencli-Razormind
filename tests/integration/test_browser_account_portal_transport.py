@@ -4,20 +4,27 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
+import struct
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from backend.api.v1 import browser_accounts
+from backend.config import get_settings
 from backend.main import app
 from backend.models.browser import (
-    BrowserAccount, BrowserAccountLease, BrowserLoginSession, BrowserRuntimeBundle,
+    BrowserAccount,
+    BrowserAccountLease,
+    BrowserLoginSession,
+    BrowserRuntimeBundle,
 )
-from backend.models.edge_node import EdgeNode
 from backend.models.browser_portal import BrowserPortalOwner
+from backend.models.edge_node import EdgeNode
 from backend.models.identity import User, Workspace, WorkspaceMembership, WorkspaceRole
 from backend.schemas.browser_account import (
     AccountRef,
@@ -72,9 +79,14 @@ class _NodeTransportDouble:
             self._emitted = True
             return self._pixel
         await asyncio.sleep(timeout or 0.01)
-        return None
+        # An in-flight frame can arrive at the route deadline. It must be
+        # discarded as normal expiry, not mistaken for a replay/auth failure.
+        return self._pixel
 
     async def send(self, frame: PortalWireFrameV1) -> None:
+        # The actual node transport re-encodes, so browser JSON must be
+        # normalized after Pydantic adds optional defaults.
+        encode_portal_wire_frame(frame)
         self.sent.append(frame)
 
     async def close(self, *, reason: str) -> None:
@@ -160,16 +172,20 @@ async def test_asgi_portal_websocket_relays_canonical_pixels_and_input_with_db_o
         )
     )
     await db_session.commit()
-    endpoint, actual_envelope, revision = (
-        await browser_accounts.browser_account_service.get_portal_session_envelope(
-            db_session, _WORKSPACE, _ACCOUNT, _SESSION
-        )
+    (
+        endpoint,
+        actual_envelope,
+        revision,
+    ) = await browser_accounts.browser_account_service.get_portal_session_envelope(
+        db_session, _WORKSPACE, _ACCOUNT, _SESSION
     )
     assert endpoint == "https://node.test"
     assert actual_envelope.node_id == "portal-transport-node"
     assert revision == 3
 
-    target = SessionTargetV1(tab_id="tab", frame_id="frame", document_id="document", origin="https://fixture.test")
+    target = SessionTargetV1(
+        tab_id="tab", frame_id="frame", document_id="document", origin="https://fixture.test"
+    )
     binding = SensitiveSessionBindingV1(
         account_ref=AccountRef(workspace_id=_WORKSPACE, account_id=_ACCOUNT),
         session_id=_SESSION,
@@ -186,7 +202,11 @@ async def test_asgi_portal_websocket_relays_canonical_pixels_and_input_with_db_o
         tunnel_handle="portal-tunnel",
         tunnel_auth_digest="a" * 64,
         region_focus=PortalRegionFocusV1(
-            target=target, view_generation=2, region_kind="form", approved_regions=[clip], focused_field_ref="password"
+            target=target,
+            view_generation=2,
+            region_kind="form",
+            approved_regions=[clip],
+            focused_field_ref="password",
         ),
         session_revision=3,
         route_expires_at=now + timedelta(minutes=1),
@@ -195,21 +215,49 @@ async def test_asgi_portal_websocket_relays_canonical_pixels_and_input_with_db_o
     )
     raw_pixels = b"\x89PNG\r\n\x1a\n"
     pixel = PortalPixelFrameV1(
-        workspace_id=_WORKSPACE, account_id=_ACCOUNT, session_id=_SESSION, epoch=7, target=target,
-        view_generation=2, sequence=1, region_kind="form", mime_type="image/png",
-        expires_at=now + timedelta(seconds=30), clip=clip, byte_length=len(raw_pixels), frame_bytes=raw_pixels,
+        workspace_id=_WORKSPACE,
+        account_id=_ACCOUNT,
+        session_id=_SESSION,
+        epoch=7,
+        target=target,
+        view_generation=2,
+        sequence=1,
+        region_kind="form",
+        mime_type="image/png",
+        expires_at=now + timedelta(seconds=30),
+        clip=clip,
+        byte_length=len(raw_pixels),
+        frame_bytes=raw_pixels,
     )
-    pixel_wire = _wire(PortalWireFrameV1(
-        sequence=1, encoding="pixel-binary", content_type="application/octet-stream", mime_type="image/png",
-        byte_length=len(raw_pixels), layout=PortalWireLayoutV1(metadata_bytes=1, payload_bytes=len(raw_pixels)),
-        transient=PortalTransientV1(binding=PortalOuterBindingV1(
-            workspace_id=_WORKSPACE, account_id=_ACCOUNT, session_id=_SESSION, epoch=7, target=target, view_generation=2
-        ), pixel=pixel),
-    ), len(raw_pixels))
+    pixel_wire = _wire(
+        PortalWireFrameV1(
+            sequence=1,
+            encoding="pixel-binary",
+            content_type="application/octet-stream",
+            mime_type="image/png",
+            byte_length=len(raw_pixels),
+            layout=PortalWireLayoutV1(metadata_bytes=1, payload_bytes=len(raw_pixels)),
+            transient=PortalTransientV1(
+                binding=PortalOuterBindingV1(
+                    workspace_id=_WORKSPACE,
+                    account_id=_ACCOUNT,
+                    session_id=_SESSION,
+                    epoch=7,
+                    target=target,
+                    view_generation=2,
+                ),
+                pixel=pixel,
+            ),
+        ),
+        len(raw_pixels),
+    )
     transport = _NodeTransportDouble(pixel_wire)
     session_factory = async_sessionmaker(db_engine, class_=AsyncSession, expire_on_commit=False)
+
     async def prepare_route(*_args, **_kwargs):
-        return route
+        return route.model_copy(
+            update={"route_expires_at": datetime.now(UTC) + timedelta(seconds=1)}
+        )
 
     async def open_route(*_args, **_kwargs):
         return transport
@@ -218,9 +266,27 @@ async def test_asgi_portal_websocket_relays_canonical_pixels_and_input_with_db_o
     monkeypatch.setattr("backend.ws_agent_manager.prepare_portal_route", prepare_route)
     monkeypatch.setattr("backend.ws_agent_manager.open_portal_route", open_route)
 
-    websocket_path = f"/api/v1/workspaces/{_WORKSPACE}/browser-accounts/{_ACCOUNT}/login-sessions/{_SESSION}/portal"
+    websocket_path = (
+        f"/api/v1/workspaces/{_WORKSPACE}/browser-accounts/{_ACCOUNT}"
+        f"/login-sessions/{_SESSION}/portal"
+    )
+    monkeypatch.setattr(get_settings(), "api_auth_token", "portal-fleet-test")
+    monkeypatch.setattr(get_settings(), "browser_portal_public_origin", "http://testserver")
     with TestClient(app) as asgi:
-        with asgi.websocket_connect(websocket_path, headers={"origin": "http://testserver", "cookie": f"qrac2_portal={_OWNER_TOKEN}"}) as socket:
+        for headers in (
+            {"origin": "http://testserver"},
+            {"origin": "https://wrong.test", "cookie": f"qrac2_portal={_OWNER_TOKEN}"},
+        ):
+            with pytest.raises(WebSocketDisconnect) as rejected:
+                with asgi.websocket_connect(websocket_path, headers=headers):
+                    pass
+            assert rejected.value.code == 4403
+        for suffix in ("-ticket/issue", "-ticket/redeem"):
+            assert asgi.post(websocket_path + suffix, json={}).status_code == 401
+        with asgi.websocket_connect(
+            websocket_path,
+            headers={"origin": "http://testserver", "cookie": f"qrac2_portal={_OWNER_TOKEN}"},
+        ) as socket:
             observed = decode_portal_wire_frame(socket.receive_bytes())
             assert observed.encoding == "pixel-binary"
             assert observed.transient.pixel is not None
@@ -228,24 +294,59 @@ async def test_asgi_portal_websocket_relays_canonical_pixels_and_input_with_db_o
 
             secret = "transient-password"
             control = PortalControlMessageV1(
-                workspace_id=_WORKSPACE, account_id=_ACCOUNT, session_id=_SESSION, epoch=7, target=target,
-                view_generation=2, sequence=1, kind="field_input", field_ref="password",
+                workspace_id=_WORKSPACE,
+                account_id=_ACCOUNT,
+                session_id=_SESSION,
+                epoch=7,
+                target=target,
+                view_generation=2,
+                sequence=1,
+                kind="field_input",
+                field_ref="password",
                 sensitive_payload=PortalSensitivePayloadV1(value=SecretStr(secret)),
             )
-            control_wire = _wire(PortalWireFrameV1(
-                sequence=1, encoding="control-json", content_type="application/json", mime_type="application/json",
-                layout=PortalWireLayoutV1(metadata_bytes=1, payload_bytes=len(secret)),
-                transient=PortalTransientV1(binding=PortalOuterBindingV1(
-                    workspace_id=_WORKSPACE, account_id=_ACCOUNT, session_id=_SESSION, epoch=7, target=target, view_generation=2
-                ), control=control),
-            ), len(secret))
-            socket.send_bytes(encode_portal_wire_frame(control_wire))
+            control_wire = _wire(
+                PortalWireFrameV1(
+                    sequence=1,
+                    encoding="control-json",
+                    content_type="application/json",
+                    mime_type="application/json",
+                    layout=PortalWireLayoutV1(metadata_bytes=1, payload_bytes=len(secret)),
+                    transient=PortalTransientV1(
+                        binding=PortalOuterBindingV1(
+                            workspace_id=_WORKSPACE,
+                            account_id=_ACCOUNT,
+                            session_id=_SESSION,
+                            epoch=7,
+                            target=target,
+                            view_generation=2,
+                        ),
+                        control=control,
+                    ),
+                ),
+                len(secret),
+            )
+            wire = encode_portal_wire_frame(control_wire)
+            metadata_size = struct.unpack_from(">H", wire, 8)[0]
+            metadata = json.loads(wire[16 : 16 + metadata_size])
+            metadata["message"].pop("contract_version")
+            browser_metadata = json.dumps(metadata, separators=(",", ":")).encode()
+            header = bytearray(wire[:16])
+            struct.pack_into(">H", header, 8, len(browser_metadata))
+            socket.send_bytes(bytes(header) + browser_metadata + wire[16 + metadata_size :])
             for _ in range(50):
                 if transport.sent:
                     break
                 await asyncio.sleep(0.01)
+            with pytest.raises(WebSocketDisconnect) as expired:
+                socket.receive_bytes()
+            assert expired.value.code == 1000
+            assert expired.value.reason == "Portal route expired"
 
     assert len(transport.sent) == 1
     assert transport.sent[0].transient.control is not None
-    assert transport.sent[0].transient.control.sensitive_payload.value.get_secret_value() == "transient-password"
+    assert (
+        transport.sent[0].transient.control.sensitive_payload.value.get_secret_value()
+        == "transient-password"
+    )
     assert transport.closed_reason == "portal_closed"

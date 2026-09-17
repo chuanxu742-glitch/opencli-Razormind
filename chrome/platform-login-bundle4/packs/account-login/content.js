@@ -1,0 +1,766 @@
+const PACK_ID = "account-login";
+const PACK_VERSION = "1.0.0";
+const ALLOWED_ACTIONS = new Set([
+  "login.observe",
+  "login.open",
+  "login.refresh",
+  "login.switch-mode",
+]);
+const SAFE_IDENTITY = /^[A-Za-z0-9_.:@-]{1,80}$/;
+const LOGIN_ERROR_CODES = new Set([
+  "auth_required",
+  "account_identity_mismatch",
+  "stale_generation",
+  "login_rule_unknown",
+  "ambiguous_login_region",
+  "capability_missing",
+  "session_expired",
+]);
+
+function fail(code) {
+  return {
+    ok: false,
+    error_code: LOGIN_ERROR_CODES.has(code) ? code : "login_rule_unknown",
+  };
+}
+
+function validDocumentId(value) {
+  return (
+    (Number.isInteger(value) && value >= 0) ||
+    (typeof value === "string" && value.length > 0 && value.length <= 255)
+  );
+}
+
+function targetFor(message) {
+  const target = message?.target;
+  if (!target || typeof target !== "object") return null;
+  const keys = Object.keys(target).sort().join(",");
+  if (keys !== "documentId,frameId,origin,tabId,viewGeneration") return null;
+  if (!Number.isInteger(target.tabId) || target.tabId < 0) return null;
+  if (!Number.isInteger(target.frameId) || target.frameId < 0) return null;
+  if (!validDocumentId(target.documentId)) return null;
+  if (!Number.isInteger(target.viewGeneration) || target.viewGeneration < 0) return null;
+  if (typeof target.origin !== "string" || target.origin !== window.location.origin) return null;
+  return target;
+}
+
+function targetWire(target) {
+  return {
+    tab_id: target.tabId,
+    frame_id: target.frameId,
+    document_id: target.documentId,
+    origin: target.origin,
+  };
+}
+
+function generationValue(value) {
+  return Number.isInteger(value) && value >= 0 ? value : null;
+}
+
+function sameGeneration(left, right) {
+  return (
+    left !== null &&
+    right !== null &&
+    String(left.documentId) === String(right.documentId) &&
+    String(left.viewGeneration) === String(right.viewGeneration)
+  );
+}
+
+// Ephemeral isolated-world state, never read from the page or persisted.
+const platformDocumentId = globalThis.crypto?.randomUUID?.() ?? null;
+let platformViewGeneration = Date.now();
+let platformQrGeneration = platformViewGeneration;
+let platformQrSource = null;
+let platformLoginOpened = false;
+let platformInteractive = false;
+let platformSurfaceKey = null;
+let platformFocusedField = null;
+const platformFields = new WeakMap();
+
+function platformNodeVisible(node) {
+  if (!node || !rectFor(node)) return false;
+  for (let current = node; current; current = current.parentElement) {
+    const style = getComputedStyle(current);
+    if (style.display === 'none' || style.visibility === 'hidden' ||
+        style.visibility === 'collapse' || Number(style.opacity) === 0) return false;
+  }
+  return true;
+}
+
+function platformVisibleText(container) {
+  if (!container || !platformNodeVisible(container)) return '';
+  const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+  const parts = [];
+  for (let text = walker.nextNode(); text; text = walker.nextNode()) {
+    if (platformNodeVisible(text.parentElement)) parts.push(text.textContent);
+  }
+  return parts.join(' ');
+}
+
+function platformScanState(node) {
+  const container = node?.closest('.login-scan, .code-area, .J2iCN0Aj') ?? node?.parentElement?.parentElement;
+  const text = platformVisibleText(container);
+  const scanned = /扫码成功|扫描成功|已扫码|已扫描|请在手机.{0,12}确认|请在.{0,8}APP.{0,8}确认/i.test(text);
+  const expired = !scanned && /二维码.{0,6}(已过期|失效)|点击.{0,4}刷新|刷新二维码/.test(text);
+  return { scanned, expired };
+}
+
+function platformChallengeVisible() {
+  return [...document.querySelectorAll(
+    '.geetest_panel, .geetest_widget, [id*="captcha"], [class*="captcha"], [class*="verify-dialog"]'
+  )].some(platformNodeVisible);
+}
+
+function platformFormFocus() {
+  const active = document.activeElement;
+  if (!active?.matches('input:not([type="hidden"]):not([type="submit"]):not([type="button"]), textarea') ||
+      active.disabled || active.readOnly || !platformNodeVisible(active)) return null;
+  if (!platformFields.has(active)) {
+    platformFields.set(active, 'official-login:' + crypto.randomUUID());
+  }
+  const ref = platformFields.get(active);
+  active.setAttribute('data-opencli-login-field', ref);
+  return ref;
+}
+
+function platformSignedInVisible(rule) {
+  if (rule.id !== 'xiaohongshu-qr' || window.location.origin !== 'https://www.xiaohongshu.com') return false;
+  return [...document.querySelectorAll('a[href]')].some(anchor => {
+    if (!anchor.closest('nav, [role="navigation"], .side-bar') || !platformNodeVisible(anchor)
+        || platformVisibleText(anchor).trim() !== '我') return false;
+    try {
+      const url = new URL(anchor.getAttribute('href'), window.location.href);
+      return url.origin === window.location.origin && /^\/user\/profile\/[a-f0-9]{24}\/?$/i.test(url.pathname)
+        && !url.search && !url.hash;
+    } catch { return false; }
+  });
+}
+
+function platformSurface(rule, node) {
+  const scan = platformScanState(node);
+  const challenge = platformChallengeVisible();
+  if (challenge) platformInteractive = true;
+  const interactive = platformInteractive || rule.modes?.includes('form');
+  const browserSessionState = !challenge && !node && platformSignedInVisible(rule) ? 'signed_in_visible' : 'unknown';
+  const focused = interactive ? platformFormFocus() : null;
+  const key = JSON.stringify([interactive, challenge, browserSessionState, focused, interactive ? innerWidth : null, interactive ? innerHeight : null]);
+  if (platformSurfaceKey !== null && platformSurfaceKey !== key) {
+    platformViewGeneration = Math.max(Date.now(), platformViewGeneration + 1);
+  }
+  platformSurfaceKey = key;
+  platformFocusedField = focused;
+  return { ...scan, interactive, challenge, browserSessionState };
+}
+
+const PLATFORM_POLICIES = {
+  'xiaohongshu-qr': {platform:'xiaohongshu',origins:['https://www.xiaohongshu.com'],url:'/explore',selector:'img.qrcode-img'},
+  'bilibili-qr': {platform:'bilibili',origins:['https://passport.bilibili.com','https://www.bilibili.com'],url:'/login',selector:'.login-scan__qrcode img[alt="Scan me!"]'},
+  'douyin-qr': {platform:'douyin',origins:['https://creator.douyin.com'],url:'/',selector:'img[aria-label="二维码"]'},
+};
+const verifiedOfficialRules = new WeakSet();
+let officialCatalogPromise;
+function canonicalRule(value) {
+  if (Array.isArray(value)) return '[' + value.map(canonicalRule).join(',') + ']';
+  if (value && typeof value === 'object') return '{' + Object.keys(value).sort().map(
+    key => JSON.stringify(key) + ':' + canonicalRule(value[key])).join(',') + '}';
+  return JSON.stringify(value).replace(/[\u007f-\uffff]/g, character => '\\u' + character.charCodeAt(0).toString(16).padStart(4,'0'));
+}
+async function verifyOfficialRule(rule) {
+  if (!rule?.id?.startsWith('official-')) return;
+  officialCatalogPromise ??= fetch(chrome.runtime.getURL('platform-catalog.json')).then(response => {
+    if (!response.ok) throw new Error('packaged platform catalog unavailable');
+    return response.json();
+  });
+  const catalog = await officialCatalogPromise;
+  const entry = catalog.items.find(item => item.rule_id === rule.id && item.rule_version === rule.version);
+  if (!entry || !entry.browser_login_supported || entry.requires_configuration) return;
+  const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonicalRule(rule)));
+  if ([...new Uint8Array(hash)].map(byte => byte.toString(16).padStart(2,'0')).join('') === entry.rule_sha256)
+    verifiedOfficialRules.add(rule);
+}
+function platformRule(rule) {
+  if (verifiedOfficialRules.has(rule)) return rule.allowed_origins.includes(location.origin);
+  const policy = PLATFORM_POLICIES[rule?.id];
+  return !!policy && rule.version === (rule.id === 'xiaohongshu-qr' ? '0.2.0' : '0.1.0') && rule.platform === policy.platform &&
+    rule.login_url === policy.url && rule.authentication_verified === false &&
+    rule.identity_probe_supported === true &&
+    JSON.stringify(rule.modes) === '["qr"]' &&
+    JSON.stringify(rule.allowed_origins) === JSON.stringify(policy.origins) &&
+    JSON.stringify(rule.allowed_redirect_origins) === JSON.stringify(policy.origins) &&
+    rule.selectors?.length === 1 && rule.selectors[0].selector === policy.selector &&
+    policy.origins.includes(window.location.origin);
+}
+
+function platformQr(rule) {
+  if (verifiedOfficialRules.has(rule)) return {node:null,ambiguous:false};
+  const nodes = nodesFor(selectorFor(rule, "qr")).filter((node) => {
+    const style = getComputedStyle(node);
+    return style.visibility !== "hidden" && style.display !== "none" &&
+      Number(style.opacity) !== 0 && rectFor(node) !== null;
+  });
+  if (nodes.length !== 1) return { node: null, ambiguous: nodes.length > 1 };
+  const node = nodes[0];
+  // Only the observed QR element inside the observed login container is eligible.
+  if ((rule.id === 'xiaohongshu-qr' && (!node.parentElement?.matches('.qrcode') || !node.parentElement.parentElement?.matches('.code-area'))) ||
+      (rule.id === 'bilibili-qr' && !node.closest('.login-scan__qrcode')) ||
+      (rule.id === 'douyin-qr' && (!node.parentElement?.matches('.XI37I0dP') || !node.parentElement.parentElement?.matches('.J2iCN0Aj')))) {
+    return { node: null, ambiguous: true };
+  }
+  const source = node.currentSrc || node.src || "";
+  let allowed = /^data:image\/(?:png|jpeg|webp);base64,/.test(source);
+  try {
+    const url = new URL(source, window.location.href);
+    allowed ||= url.origin === window.location.origin && ["https:", "blob:"].includes(url.protocol);
+  } catch { /* Invalid sources never create a projection. */ }
+  if (!allowed) return { node: null, ambiguous: true };
+  if (source !== platformQrSource) {
+    platformQrSource = source;
+    platformQrGeneration = Math.max(Date.now(), platformQrGeneration + 1);
+    platformViewGeneration = Math.max(Date.now(), platformViewGeneration + 1);
+  }
+  return { node, ambiguous: false };
+}
+
+async function verifiedPlatformIdentity(rule, target) {
+  let endpoint;
+  if (rule.id === 'bilibili-qr' && window.location.origin === 'https://www.bilibili.com')
+    endpoint = 'https://api.bilibili.com/x/web-interface/nav';
+  else if (rule.id === 'douyin-qr' && window.location.origin === 'https://creator.douyin.com')
+    endpoint = 'https://creator.douyin.com/web/api/media/user/info/?aid=1128';
+  else if (rule.id === 'xiaohongshu-qr' && window.location.origin === 'https://www.xiaohongshu.com')
+    endpoint = 'https://edith.xiaohongshu.com/api/sns/web/v2/user/me';
+  else return null;
+  try {
+    const response = await fetch(endpoint, {credentials:'include',redirect:'error',cache:'no-store',signal:AbortSignal.timeout(5000)});
+    if (!response.ok || !response.headers.get('content-type')?.includes('application/json')) return null;
+    const data = await response.json();
+    if (!platformRule(rule) || !(await targetGenerationIsCurrent(target,rule))) return null;
+    let subject;
+    if (rule.id === 'bilibili-qr') {
+      if (data.code !== 0 || data.data?.isLogin !== true) return null;
+      subject = data.data.mid;
+    } else if (rule.id === 'xiaohongshu-qr') {
+      if (data.code !== 0 || data.data?.guest !== false || !/^[a-f0-9]{24}$/i.test(data.data?.user_id ?? '')) return null;
+      return {provider:rule.platform,subject:data.data.user_id,label:data.data.user_id};
+    } else {
+      if (data.status_code !== 0) return null;
+      subject = (data.user_info ?? data.user)?.uid;
+    }
+    if (typeof subject === 'number' && !Number.isSafeInteger(subject)) return null;
+    if (!/^[1-9][0-9]{0,24}$/.test(String(subject))) return null;
+    return {provider:rule.platform,subject:String(subject),label:String(subject)};
+  } catch { return null; }
+}
+
+async function observePlatform(args, target, rule) {
+  if (typeof args.session_id !== "string" || !args.session_id ||
+      !Number.isInteger(args.epoch) || args.epoch < 0) return fail("login_rule_unknown");
+  const { node, ambiguous } = platformQr(rule);
+  const surface = platformSurface(rule, node);
+  if (String(target.documentId) !== platformDocumentId || target.viewGeneration !== platformViewGeneration) {
+    return fail("stale_generation");
+  }
+  const region = node && !surface.expired && !surface.scanned && !surface.interactive ? rectFor(node) : null;
+  const result = {
+    session_id: args.session_id, epoch: args.epoch, rule_id: rule.id, rule_version: rule.version,
+    target: targetWire(target), view_generation: target.viewGeneration,
+    state: region ? "presenting" : "unknown", evidence_kind: "unknown",
+    browser_session_state: surface.browserSessionState,
+    observed_at: new Date().toISOString(),
+  };
+  if (region) result.region_focus = {
+    target: targetWire(target), view_generation: target.viewGeneration,
+    region_kind: "qr", approved_regions: [region],
+  };
+  if (surface.interactive) {
+    result.state = surface.challenge ? 'challenge' : 'presenting';
+    result.region_focus = {
+      target: targetWire(target), view_generation: target.viewGeneration,
+      region_kind: platformFocusedField ? 'form' : 'approved', approved_regions: [{x:0,y:0,width:Math.min(innerWidth,4096),height:Math.min(innerHeight,4096)}],
+      ...(platformFocusedField ? {focused_field_ref:platformFocusedField} : {}),
+    };
+  } else if (surface.scanned) result.state = 'verifying';
+  else if (surface.expired) result.state = 'refreshing';
+  if (ambiguous) result.error_code = "ambiguous_login_region";
+  else if (!region && surface.browserSessionState !== 'signed_in_visible') result.error_code = "auth_required";
+  // Only a successful credentialed official identity API can authenticate.
+  // XHS official API verification runs in the same verified extension context
+  // that invoked this action; runtime messages can race host.html and worker.
+  const identity = region || surface.challenge || rule.id === 'xiaohongshu-qr'
+    ? null : await verifiedPlatformIdentity(rule,target);
+  if (!(await targetGenerationIsCurrent(target,rule))) return fail('stale_generation');
+  if (identity) {
+    result.state = 'verifying'; result.evidence_kind = 'valid';
+    result.external_identity = identity;
+    delete result.region_focus; delete result.error_code;
+  }
+  return { ok: true, result };
+}
+
+function fixedRule(message) {
+  const rule = message?.rule;
+  if (!rule || typeof rule !== "object") return null;
+  if (platformRule(rule)) return rule;
+  if (rule.id !== "controlled-login-fixture" || rule.version !== "1.0.0") return null;
+  const fixedOrigins = ["http://127.0.0.1:49906", "http://localhost:49906"];
+  if (
+    !Array.isArray(rule.allowed_origins) ||
+    rule.allowed_origins.length !== fixedOrigins.length ||
+    new Set(rule.allowed_origins).size !== fixedOrigins.length ||
+    !rule.allowed_origins.every((origin) => fixedOrigins.includes(origin)) ||
+    !rule.allowed_origins.includes(window.location.origin)
+  ) {
+    return null;
+  }
+  if (
+    !Array.isArray(rule.allowed_redirect_origins) ||
+    rule.allowed_redirect_origins.length !== fixedOrigins.length ||
+    new Set(rule.allowed_redirect_origins).size !== fixedOrigins.length ||
+    !rule.allowed_redirect_origins.every((origin) => fixedOrigins.includes(origin)) ||
+    rule.platform !== "controlled-login-fixture"
+  ) return null;
+  if (typeof rule.login_url !== "string") return null;
+  let loginUrl;
+  try {
+    loginUrl = new URL(rule.login_url, window.location.origin);
+  } catch {
+    return null;
+  }
+  if (
+    loginUrl.origin !== window.location.origin ||
+    loginUrl.pathname !== "/login" ||
+    loginUrl.search ||
+    loginUrl.hash
+  ) return null;
+  if (
+    !rule.auth ||
+    rule.auth.identity_path !== "/identity" ||
+    rule.auth.status_path !== "/auth-status" ||
+    !rule.refresh ||
+    rule.refresh.trigger !== "qr_expired" ||
+    rule.refresh.interval !== 30 ||
+    rule.refresh.max_attempts !== 3
+  ) return null;
+  if (
+    !rule.mode_selectors ||
+    rule.mode_selectors.qr !== "#qr-region img#login-qr" ||
+    rule.mode_selectors.form !== "#login-form" ||
+    rule.mode_selectors.native !== "#login-form" ||
+    !rule.mode_evidence ||
+    rule.mode_evidence.qr !== "#qr-region img#login-qr" ||
+    rule.mode_evidence.form !== "#login-form" ||
+    rule.mode_evidence.native !== "#login-form"
+  ) return null;
+  return rule;
+}
+
+function selectorFor(rule, kind) {
+  const selectors = Array.isArray(rule.selectors) ? rule.selectors : [];
+  const entry = selectors.find((candidate) => candidate?.kind === kind);
+  return typeof entry?.selector === "string" ? entry.selector : null;
+}
+
+function nodesFor(selector) {
+  if (!selector) return [];
+  try {
+    return [...document.querySelectorAll(selector)];
+  } catch {
+    return [];
+  }
+}
+
+function formPresent(rule) {
+  return nodesFor(selectorFor(rule, "form")).length === 1;
+}
+
+function rectFor(node) {
+  if (!node) return null;
+  const rect = node.getBoundingClientRect();
+  if (!rect.width || !rect.height) return null;
+  return {
+    x: Math.max(0, Math.round(rect.x)),
+    y: Math.max(0, Math.round(rect.y)),
+    width: Math.max(1, Math.round(rect.width)),
+    height: Math.max(1, Math.round(rect.height)),
+  };
+}
+
+function uniqueQrCandidates(rule) {
+  const configured = nodesFor(selectorFor(rule, "qr"));
+  const allQrImages = [...document.querySelectorAll("img[data-qr-generation], img[data-qr-origin]")];
+  const qrNodes = [...new Set([...configured, ...allQrImages])];
+  const approved = qrNodes.filter((node) => {
+    const region = node.closest("[data-qr-origin]");
+    if (!region || region.dataset.qrOrigin !== window.location.origin) return false;
+    let imageUrl;
+    try {
+      imageUrl = new URL(node.currentSrc || node.src || "", window.location.href);
+    } catch {
+      return false;
+    }
+    return imageUrl.origin === window.location.origin;
+  });
+  return { qrNodes, approved };
+}
+
+async function fetchJson(path) {
+  if (typeof path !== "string" || !path.startsWith("/") || path.includes("//")) {
+    throw new Error("invalid auth endpoint");
+  }
+  const url = new URL(path, window.location.origin);
+  if (url.origin !== window.location.origin || url.search || url.hash) {
+    throw new Error("auth endpoint origin changed");
+  }
+  const response = await fetch(url.href, {
+    credentials: "same-origin",
+    cache: "no-store",
+    headers: { Accept: "application/json" },
+  });
+  if (!response.ok) throw new Error("auth endpoint unavailable");
+  const value = await response.json();
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("auth endpoint returned invalid data");
+  }
+  return value;
+}
+
+async function readTrustedEvidence(rule) {
+  const auth = rule.auth;
+  if (!auth || typeof auth !== "object") return null;
+  try {
+    const identity = await fetchJson(auth.identity_path);
+    const status = await fetchJson(auth.status_path);
+    const authEvidence = status.evidence;
+    if (!authEvidence || typeof authEvidence !== "object" || Array.isArray(authEvidence)) {
+      return null;
+    }
+    const identityValue = identity.identity;
+    const statusValue = status.identity;
+    const identityValid = typeof identityValue === "string" && SAFE_IDENTITY.test(identityValue);
+    const statusValid = typeof statusValue === "string" && SAFE_IDENTITY.test(statusValue);
+    const identityGeneration = {
+      documentId: generationValue(identity.document_generation),
+      viewGeneration: generationValue(identity.view_generation),
+    };
+    const statusGeneration = {
+      documentId: generationValue(authEvidence.document_generation),
+      viewGeneration: generationValue(authEvidence.view_generation),
+    };
+    if (
+      identity.authenticated !== status.authenticated ||
+      identity.identity_status !== status.identity_status ||
+      !sameGeneration(identityGeneration, statusGeneration) ||
+      authEvidence.identity_endpoint !== auth.identity_path ||
+      authEvidence.state_endpoint !== auth.status_path ||
+      typeof authEvidence.frame_label !== "string" ||
+      authEvidence.frame_label.length === 0 ||
+      authEvidence.frame_label.length > 255
+    ) {
+      return null;
+    }
+    return {
+      authenticated: identity.authenticated === true && status.authenticated === true,
+      trusted: status.trusted === true,
+      identityStatus:
+        identity.identity_status === "valid" && status.identity_status === "valid",
+      identity: identityValid && statusValid && identityValue === statusValue ? identityValue : null,
+      generation: identityGeneration,
+      mismatch:
+        identity.identity_status === "mismatch" || status.identity_status === "mismatch" ||
+        (identityValid && statusValid && identityValue !== statusValue),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function trustedGeneration(rule) {
+  const evidence = await readTrustedEvidence(rule);
+  return evidence?.generation ?? null;
+}
+
+async function targetGenerationIsCurrent(target, rule) {
+  if (platformRule(rule)) {
+    platformSurface(rule, platformQr(rule).node);
+    return String(target.documentId) === platformDocumentId && target.viewGeneration === platformViewGeneration;
+  }
+  const current = await trustedGeneration(rule);
+  return sameGeneration(current, {
+    documentId: target.documentId,
+    viewGeneration: target.viewGeneration,
+  });
+}
+
+async function trustedAuthEvidence(rule, target) {
+  const evidence = await readTrustedEvidence(rule);
+  if (!evidence) return null;
+  return {
+    ...evidence,
+    generation: sameGeneration(evidence.generation, {
+      documentId: target.documentId,
+      viewGeneration: target.viewGeneration,
+    }),
+  };
+}
+
+function focusForForm(rule) {
+  const form = nodesFor(selectorFor(rule, "form"));
+  if (form.length !== 1) return null;
+  const fields = [...form[0].querySelectorAll("[data-sensitive-field]")].filter(
+    (node) => node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement,
+  );
+  const active = document.activeElement;
+  const focused = fields.includes(active) ? active : fields.length === 1 ? fields[0] : null;
+  if (!focused) return null;
+  if (document.activeElement !== focused) focused.focus({ preventScroll: true });
+  const rect = rectFor(focused);
+  const field = focused.getAttribute("data-sensitive-field");
+  if (!rect || !field || !/^[A-Za-z0-9_-]{1,80}$/.test(field)) return null;
+  return {
+    region: rectFor(form[0]),
+    focused_field_ref: `controlled-login-fixture:${field}`,
+  };
+}
+
+function approvedRegionFocus(rule, target) {
+  const { approved, qrNodes } = uniqueQrCandidates(rule);
+  if (qrNodes.length === 1 && approved.length === 1) {
+    const region = rectFor(approved[0]);
+    if (region) {
+      return {
+        target: targetWire(target),
+        view_generation: target.viewGeneration,
+        region_kind: "qr",
+        approved_regions: [region],
+      };
+    }
+  }
+  const form = focusForForm(rule);
+  if (form?.region && form.focused_field_ref) {
+    return {
+      target: targetWire(target),
+      view_generation: target.viewGeneration,
+      region_kind: "form",
+      approved_regions: [form.region],
+      focused_field_ref: form.focused_field_ref,
+    };
+  }
+  return null;
+}
+
+async function observe(message, args, target, rule) {
+  if (platformRule(rule)) return observePlatform(args, target, rule);
+  if (!(await targetGenerationIsCurrent(target, rule))) return fail("stale_generation");
+  if (
+    typeof args.session_id !== "string" || args.session_id.length === 0 ||
+    !Number.isInteger(args.epoch) || args.epoch < 0
+  ) {
+    return fail("login_rule_unknown");
+  }
+  const root = document.documentElement;
+  const pageState = root.dataset.flowState || "unknown";
+  const challenge = nodesFor("[data-challenge-state='required']").length > 0;
+  const authMarker = nodesFor("[data-authenticated='true']").length > 0;
+  const pageClaimsAuthenticated = pageState === "authenticated" || authMarker;
+  const { qrNodes, approved } = uniqueQrCandidates(rule);
+  const expectedQrGeneration = args.expected_qr_generation;
+  const currentQr = approved.filter(
+    (node) => String(node.dataset.qrGeneration) === String(expectedQrGeneration),
+  );
+  const ambiguousQr =
+    qrNodes.length !== 1 || approved.length !== 1 || currentQr.length !== 1;
+  const auth = await trustedAuthEvidence(rule, target);
+
+  let state = "unknown";
+  let evidenceKind = "unknown";
+  let errorCode = null;
+  let externalIdentity = null;
+  if (challenge) {
+    state = "challenge";
+  } else if (pageState === "expired" || root.dataset.qrStatus === "expired") {
+    state = "error";
+    errorCode = "auth_required";
+  } else if (auth?.mismatch) {
+    state = "error";
+    evidenceKind = "invalid";
+    errorCode = "account_identity_mismatch";
+  } else if (pageClaimsAuthenticated && !auth?.trusted) {
+    state = "unknown";
+    errorCode = "auth_required";
+  } else if (
+    auth?.authenticated && auth.trusted && auth.identityStatus && auth.identity && auth.generation &&
+    pageState === "authenticated" && authMarker
+  ) {
+    state = "verifying";
+    evidenceKind = "valid";
+    externalIdentity = {
+      provider: rule.platform,
+      subject: auth.identity,
+      label: auth.identity,
+    };
+  } else if (ambiguousQr && qrNodes.length > 0) {
+    state = "unknown";
+    errorCode = "ambiguous_login_region";
+  } else if (currentQr.length === 1 && approved.length === 1) {
+    state = "presenting";
+  } else if (nodesFor(selectorFor(rule, "form")).length === 1) {
+    state = "presenting";
+  } else if (pageState === "refreshing" || pageState === "verifying") {
+    state = pageState;
+  } else if (pageClaimsAuthenticated) {
+    state = "unknown";
+    errorCode = "auth_required";
+  }
+
+  const regionFocus = approvedRegionFocus(rule, target);
+  if (state === "presenting" && regionFocus === null) {
+    state = "unknown";
+    errorCode = "capability_missing";
+  }
+  const result = {
+    session_id: args.session_id,
+    epoch: args.epoch,
+    rule_id: rule.id,
+    rule_version: rule.version,
+    target: targetWire(target),
+    view_generation: target.viewGeneration,
+    state,
+    evidence_kind: evidenceKind,
+    observed_at: new Date().toISOString(),
+  };
+  if (regionFocus !== null) result.region_focus = regionFocus;
+  if (externalIdentity) result.external_identity = externalIdentity;
+  if (errorCode) result.error_code = errorCode;
+  return { ok: true, result };
+}
+
+async function switchMode(message, args, target, rule) {
+  if (!(await targetGenerationIsCurrent(target, rule))) return fail("stale_generation");
+  const requestedMode = args.mode;
+  if (!Array.isArray(rule.modes) || !rule.modes.includes(requestedMode)) {
+    return fail("login_rule_unknown");
+  }
+  const selectors = rule.mode_selectors;
+  const selector = selectors && typeof selectors === "object" ? selectors[requestedMode] : null;
+  const controls = nodesFor(selector);
+  if (controls.length !== 1) {
+    return fail(controls.length > 1 ? "ambiguous_login_region" : "capability_missing");
+  }
+  const evidenceSelector = rule.mode_evidence?.[requestedMode];
+  if (typeof evidenceSelector !== "string") return fail("capability_missing");
+  const beforeEvidence = nodesFor(evidenceSelector).length;
+  if (beforeEvidence !== 0) {
+    return fail(beforeEvidence > 1 ? "ambiguous_login_region" : "capability_missing");
+  }
+  controls[0].click();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  if (!(await targetGenerationIsCurrent(target, rule))) return fail("stale_generation");
+  if (typeof evidenceSelector !== "string" || nodesFor(evidenceSelector).length !== 1) {
+    return fail("capability_missing");
+  }
+  return {
+    ok: true,
+    result: {
+      state: "presenting",
+      mode: requestedMode,
+      view_generation: target.viewGeneration,
+    },
+  };
+}
+
+async function targetProbe(rule) {
+  if (platformRule(rule)) {
+    if (rule.id === 'douyin-qr' && !platformLoginOpened &&
+        document.querySelectorAll('img[aria-label="二维码"]').length === 0) {
+      const entries = Array.from(document.querySelectorAll('span.C6OZQwMA')).filter(
+        node => node.textContent?.trim() === '扫码登录' && rectFor(node) !== null);
+      if (entries.length === 1) {
+        platformLoginOpened = true;
+        entries[0].click();
+      }
+    }
+    platformSurface(rule, platformQr(rule).node);
+    return { ok: true, target: { documentId: platformDocumentId, viewGeneration: platformViewGeneration,
+      origin: window.location.origin, qrGeneration: platformQrGeneration } };
+  }
+  const current = await trustedGeneration(rule);
+  if (current === null) return fail("stale_generation");
+  const qr = document.querySelector("#qr-region img#login-qr");
+  const qrGeneration = qr && Number.isInteger(Number(qr.dataset.qrGeneration))
+    ? Number(qr.dataset.qrGeneration)
+    : null;
+  return {
+    ok: true,
+    target: {
+      documentId: current.documentId,
+      viewGeneration: current.viewGeneration,
+      origin: window.location.origin,
+      qrGeneration,
+    },
+  };
+}
+
+async function invoke(message) {
+  if (
+    message?.type !== "opencli-script-host.invoke" ||
+    message.pack !== PACK_ID ||
+    message.version !== PACK_VERSION ||
+    !ALLOWED_ACTIONS.has(message.action)
+  ) {
+    return fail("login_rule_unknown");
+  }
+  await verifyOfficialRule(message.rule);
+  const rule = fixedRule(message);
+  if (!rule) return fail("login_rule_unknown");
+  const args = message.args && typeof message.args === "object" ? message.args : {};
+  const target = targetFor(message);
+  if (!target) return fail("stale_generation");
+  if (!(await targetGenerationIsCurrent(target, rule))) return fail("stale_generation");
+  if (message.action === "login.observe") return observe(message, args, target, rule);
+  if (message.action === "login.refresh") {
+    // Refresh is controlled by the background worker so it can verify that a
+    // real document/view generation changed before claiming success.
+    return fail("capability_missing");
+  }
+  if (message.action === "login.switch-mode") {
+    if (platformRule(rule) && args.mode === 'form' && rule.interaction_supported === true) {
+      platformInteractive = true;
+      const surface = platformSurface(rule, platformQr(rule).node);
+      return {ok:true,result:{state:surface.challenge?'challenge':'presenting',view_generation:platformViewGeneration}};
+    }
+    return switchMode(message, args, target, rule);
+  }
+  window.location.assign(new URL(rule.login_url, window.location.origin).href);
+  return { ok: true, result: { state: "opening", view_generation: target.viewGeneration } };
+}
+
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (
+    message?.type === "opencli-script-host.login-target" &&
+    message.pack === PACK_ID &&
+    message.version === PACK_VERSION
+  ) {
+    Promise.resolve(verifyOfficialRule(message.rule)).then(() => {
+      const rule = fixedRule(message);
+      return rule ? targetProbe(rule) : fail('login_rule_unknown');
+    }).then(
+      (result) => sendResponse(result),
+      () => sendResponse(fail("stale_generation")),
+    );
+    return true;
+  }
+  // Messages for another Script Host pack must be ignored so this listener
+  // cannot race its response with page-basics or future packs.
+  if (
+    message?.type !== "opencli-script-host.invoke" ||
+    message.pack !== PACK_ID ||
+    message.version !== PACK_VERSION
+  ) {
+    return false;
+  }
+  Promise.resolve(invoke(message)).then(
+    (result) => sendResponse(result),
+    () => sendResponse(fail("login_rule_unknown")),
+  );
+  return true;
+});

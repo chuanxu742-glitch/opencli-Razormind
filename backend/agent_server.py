@@ -60,7 +60,7 @@ import socket
 import subprocess
 import uuid
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlparse
 from urllib.request import proxy_bypass
@@ -78,6 +78,7 @@ from backend.agent_runtime_dispatch import (
     observe_login_runtime,
     parse_output,
     prepare_portal_route,
+    release_portal_pointer,
     resolve_account_runtime_context,
     resolve_portal_target,
     snapshot_tab_ids,
@@ -107,8 +108,16 @@ from backend.browser_account_runtime import (
     session_portal_registry,
     session_runtime_registry,
 )
+from backend.browser_desktop_protocol import (
+    DESKTOP_MAGIC,
+    DESKTOP_MAX_BUFFERED_FRAMES,
+    BrowserDesktopRouteV1,
+    decode_desktop_frame,
+    encode_desktop_frame,
+)
 from backend.schemas.browser_account import (
     DurableCommandV1,
+    NodeCapacityFactV1,
     NodeClaimV1,
     NodeIdentityV1,
     NodeResultV1,
@@ -532,10 +541,483 @@ class _PortalRuntime:
         self.cdp_endpoint = cdp_endpoint
         self.websocket_url = websocket_url
         self.pixel_sequence = 0
+        self.pixel_lock = asyncio.Lock()
         self.control_sequence = 0
+        self.pointer_pressed = False
 
 
-_ACTIVE_PORTAL_RECORDS: dict[str, Any] = {}
+class _BrowserDesktopRuntime:
+    """One raw RFB bridge whose TCP destination comes from the live binding."""
+
+    def __init__(self, route: BrowserDesktopRouteV1, reader, writer, owner_ws) -> None:
+        self.route = route
+        self.owner_ws = owner_ws
+        self.reader = reader
+        self.writer = writer
+        self.input_sequence = 0
+        self.output_sequence = 0
+        self.input_queue: asyncio.Queue[bytes | None] = asyncio.Queue(
+            maxsize=DESKTOP_MAX_BUFFERED_FRAMES
+        )
+        self.writer_task: asyncio.Task | None = None
+        self.closed = False
+
+
+_ACTIVE_BROWSER_DESKTOPS: dict[str, _BrowserDesktopRuntime] = {}
+_STOPPING_BROWSER_DESKTOPS: set[tuple[str, str, str, int]] = set()
+_DESKTOP_IO_TIMEOUT_SECONDS = 0.75
+
+
+def _desktop_route_is_current(runtime: _BrowserDesktopRuntime) -> bool:
+    route = runtime.route
+    if (route.session_id, route.node_id, route.boot_id, route.epoch) in _STOPPING_BROWSER_DESKTOPS:
+        return False
+    if datetime.now(UTC) >= route.expires_at:
+        return False
+    admission = runtime_lease_book().current(route.command_id)
+    running = account_runtime_allocator().get(route.session_id)
+    if admission is None or running is None or not running.lease.is_valid():
+        return False
+    return (
+        admission.claim.workspace_id == route.workspace_id
+        and admission.claim.account_id == route.account_id
+        and admission.claim.session_id == route.session_id
+        and admission.claim.node_id == route.node_id
+        and admission.claim.boot_id == route.boot_id
+        and admission.claim.epoch == route.epoch
+        and admission.session.lease_id == route.lease_id
+        and admission.session.purpose in {"login", "browser"}
+        and running.profile_id == route.profile_id
+        and running.binding.node_id == route.node_id
+        and running.binding.boot_id == route.boot_id
+        and running.binding.epoch == route.epoch
+    )
+
+
+async def _desktop_ws_send(ws, payload) -> None:
+    async with asyncio.timeout(_DESKTOP_IO_TIMEOUT_SECONDS):
+        await ws.send(payload)
+
+
+def _abort_desktop_writer(writer) -> None:
+    transport = getattr(writer, "transport", None)
+    abort = getattr(transport, "abort", None)
+    if callable(abort):
+        abort()
+
+
+async def _close_browser_desktop(
+    route_id: str,
+    *,
+    owner_ws=None,
+    expected_runtime: _BrowserDesktopRuntime | None = None,
+) -> None:
+    runtime = _ACTIVE_BROWSER_DESKTOPS.get(route_id)
+    if (
+        runtime is None
+        or (owner_ws is not None and runtime.owner_ws is not owner_ws)
+        or (expected_runtime is not None and runtime is not expected_runtime)
+    ):
+        return
+    if _ACTIVE_BROWSER_DESKTOPS.get(route_id) is runtime:
+        _ACTIVE_BROWSER_DESKTOPS.pop(route_id, None)
+    if runtime.closed:
+        return
+    runtime.closed = True
+    while not runtime.input_queue.empty():
+        try:
+            runtime.input_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+    runtime.input_queue.put_nowait(None)
+    current = asyncio.current_task()
+    if runtime.writer_task is not None and runtime.writer_task is not current:
+        runtime.writer_task.cancel()
+        try:
+            async with asyncio.timeout(_DESKTOP_IO_TIMEOUT_SECONDS):
+                await asyncio.gather(runtime.writer_task, return_exceptions=True)
+        except TimeoutError:
+            pass
+    runtime.writer.close()
+    try:
+        async with asyncio.timeout(_DESKTOP_IO_TIMEOUT_SECONDS):
+            await runtime.writer.wait_closed()
+    except (TimeoutError, ConnectionError, OSError):
+        _abort_desktop_writer(runtime.writer)
+
+
+async def _desktop_write_loop(runtime: _BrowserDesktopRuntime) -> None:
+    while not runtime.closed:
+        payload = await runtime.input_queue.get()
+        if payload is None:
+            return
+        if not _desktop_route_is_current(runtime):
+            raise RuntimeError("desktop route generation is no longer current")
+        runtime.writer.write(payload)
+        async with asyncio.timeout(_DESKTOP_IO_TIMEOUT_SECONDS):
+            await runtime.writer.drain()
+
+
+async def _block_browser_desktop_for_stop(session, claim) -> tuple[str, str, str, int]:
+    generation = (session.session_id, claim.node_id, claim.boot_id, claim.epoch)
+    _STOPPING_BROWSER_DESKTOPS.add(generation)
+    for route_id, runtime in tuple(_ACTIVE_BROWSER_DESKTOPS.items()):
+        route = runtime.route
+        if (route.session_id, route.node_id, route.boot_id, route.epoch) == generation:
+            await _close_browser_desktop(route_id, expected_runtime=runtime)
+    return generation
+
+
+async def _handle_ws_browser_desktop(
+    ws,
+    msg: dict,
+    authenticated_identity: NodeIdentityV1 | None,
+    *,
+    tunnel_handle: str,
+    tunnel_auth_digest: str,
+) -> None:
+    route_id = ""
+    created = False
+    runtime: _BrowserDesktopRuntime | None = None
+    end_reason = "desktop route ended"
+    try:
+        route = BrowserDesktopRouteV1.model_validate(msg.get("route"))
+        route_id = route.route_id
+        if authenticated_identity is None or (
+            route.node_id,
+            route.boot_id,
+        ) != (authenticated_identity.node_id, authenticated_identity.boot_id):
+            raise ValueError("desktop route node identity is not authenticated")
+        if (route.tunnel_handle, route.tunnel_auth_digest) != (
+            tunnel_handle,
+            tunnel_auth_digest,
+        ):
+            raise ValueError("desktop route is not bound to this node connection")
+        route_generation = (
+            route.session_id,
+            route.node_id,
+            route.boot_id,
+            route.epoch,
+        )
+        if route_generation in _STOPPING_BROWSER_DESKTOPS:
+            raise ValueError("desktop session is stopping")
+        if route_id in _ACTIVE_BROWSER_DESKTOPS or any(
+            item.route.session_id == route.session_id
+            for item in _ACTIVE_BROWSER_DESKTOPS.values()
+        ):
+            raise ValueError("desktop session already has an active route")
+        lease_book = runtime_lease_book()
+        admission = lease_book.current(route.command_id)
+        if admission is not None and admission.session.purpose == "login":
+            # Opening an already authorized browser route is the immediate
+            # in-place promotion signal. Do not wait for the next periodic
+            # lease renewal before the long-lived identity observer sees it.
+            admission = lease_book.renew(
+                claim=admission.claim,
+                session=admission.session.model_copy(update={"purpose": "browser"}),
+                node_identity=admission.node_identity,
+            )
+        binding = session_runtime_registry().resolve(
+            session_id=route.session_id,
+            node_id=route.node_id,
+            boot_id=route.boot_id,
+            epoch=route.epoch,
+        )
+        running = account_runtime_allocator().get(route.session_id)
+        if (
+            admission is None
+            or running is None
+            or admission.claim.workspace_id != route.workspace_id
+            or admission.claim.account_id != route.account_id
+            or admission.session.lease_id != route.lease_id
+            or admission.session.purpose not in {"login", "browser"}
+            or running.profile_id != route.profile_id
+            or binding is not running.binding
+        ):
+            raise ValueError("desktop route does not match the live runtime lease")
+        # The only TCP destination is the loopback VNC port in the validated
+        # SessionRuntimeBinding. No address from the route is accepted here.
+        reader, writer = await asyncio.open_connection("127.0.0.1", binding.vnc_port)
+        runtime = _BrowserDesktopRuntime(route, reader, writer, ws)
+        if not _desktop_route_is_current(runtime):
+            writer.close()
+            try:
+                async with asyncio.timeout(_DESKTOP_IO_TIMEOUT_SECONDS):
+                    await writer.wait_closed()
+            except (TimeoutError, ConnectionError, OSError):
+                _abort_desktop_writer(writer)
+            raise ValueError("desktop route expired before opening")
+        _ACTIVE_BROWSER_DESKTOPS[route_id] = runtime
+        created = True
+        runtime.writer_task = asyncio.create_task(_desktop_write_loop(runtime))
+        await _desktop_ws_send(
+            ws, json.dumps({"type": "browser_desktop_ready", "route_id": route_id})
+        )
+        while _ACTIVE_BROWSER_DESKTOPS.get(route_id) is runtime:
+            if not _desktop_route_is_current(runtime):
+                raise RuntimeError("desktop route generation is no longer current")
+            if runtime.writer_task.done():
+                error = runtime.writer_task.exception()
+                if error is not None:
+                    raise error
+                raise RuntimeError("desktop input bridge ended")
+            try:
+                payload = await asyncio.wait_for(
+                    reader.read(64 * 1024), timeout=0.5
+                )
+            except TimeoutError:
+                continue
+            if not payload:
+                end_reason = "desktop VNC connection closed"
+                return
+            runtime.output_sequence += 1
+            await _desktop_ws_send(
+                ws,
+                encode_desktop_frame(route_id, 1, runtime.output_sequence, payload)
+            )
+    except Exception as exc:
+        end_reason = "desktop route failed"
+        logger.warning("WS desktop route rejected or ended: %s", type(exc).__name__)
+        if route_id and route_id not in _ACTIVE_BROWSER_DESKTOPS:
+            try:
+                await _desktop_ws_send(
+                    ws,
+                    json.dumps(
+                        {
+                            "type": "browser_desktop_error",
+                            "route_id": route_id,
+                            "error": "desktop route admission failed",
+                        }
+                    )
+                )
+            except Exception:
+                pass
+    finally:
+        if route_id and created and runtime is not None:
+            await _close_browser_desktop(route_id, expected_runtime=runtime)
+            try:
+                await _desktop_ws_send(
+                    ws,
+                    json.dumps(
+                        {
+                            "type": "browser_desktop_closed",
+                            "route_id": route_id,
+                            "reason": end_reason,
+                        }
+                    ),
+                )
+            except Exception:
+                logger.debug("WS: failed to report desktop route end", exc_info=True)
+
+
+async def _handle_ws_browser_desktop_binary(ws, data: bytes) -> None:
+    runtime: _BrowserDesktopRuntime | None = None
+    try:
+        route_id, direction, sequence, payload = decode_desktop_frame(data)
+        runtime = _ACTIVE_BROWSER_DESKTOPS.get(route_id)
+        if (
+            runtime is None
+            or runtime.owner_ws is not ws
+            or direction != 0
+            or not _desktop_route_is_current(runtime)
+        ):
+            raise ValueError("desktop input is outside the active route")
+        if sequence <= runtime.input_sequence:
+            raise ValueError("desktop input sequence did not increase")
+        runtime.input_sequence = sequence
+        runtime.input_queue.put_nowait(payload)
+    except (ValueError, asyncio.QueueFull):
+        logger.warning("WS: invalid or overflowing desktop input frame")
+        if runtime is not None:
+            await _close_browser_desktop(
+                runtime.route.route_id,
+                owner_ws=ws,
+                expected_runtime=runtime,
+            )
+
+
+
+
+_LOGIN_OBSERVERS: dict[str, asyncio.Task] = {}
+
+
+def _current_login_admission(command_id: str):
+    admission = runtime_lease_book().current(command_id)
+    if admission is None:
+        return None
+    running = account_runtime_allocator().get(admission.session.session_id)
+    if (
+        running is None
+        or not running.lease.is_valid()
+        or running.binding.epoch != admission.claim.epoch
+        or running.binding.node_id != admission.claim.node_id
+        or running.binding.boot_id != admission.claim.boot_id
+    ):
+        return None
+    return admission
+
+
+async def _watch_login(ws, command_id: str, initial=None, expected_tab_id=None) -> None:
+    from backend.browser_login_observer import observe_until_terminal
+    from backend.browser_login_refresh import ExpiredQrRefresher
+
+    refresher = ExpiredQrRefresher()
+
+    async def refresh(admission, observation):
+        running = account_runtime_allocator().get(admission.session.session_id)
+        if running is None:
+            return
+        try:
+            await refresher.refresh(
+                admission=admission, observation=observation,
+                cdp_endpoint=running.binding.cdp_endpoint,
+                current=lambda: _current_login_admission(command_id),
+            )
+        except Exception:
+            # A scanned QR or challenge may supersede expiration while probing.
+            # Keep observing; never reload blindly or log authentication payloads.
+            logger.info("Expired QR refresh deferred for command %s", command_id)
+
+    async def observe(admission):
+        for attempt in range(15):
+            current = _current_login_admission(command_id)
+            if current is None:
+                raise BrowserRuntimeError("claim_expired", "login observer lease ended")
+            running = account_runtime_allocator().get(current.session.session_id)
+            try:
+                return await observe_login_runtime(
+                    cdp_endpoint=running.binding.cdp_endpoint,
+                    session=current.session,
+                    claim=current.claim,
+                    node_identity=current.node_identity,
+                    expected_origin=running.bundle.login_origin,
+                    expected_tab_id=expected_tab_id,
+                )
+            except BrowserRuntimeError:
+                if attempt == 14:
+                    raise
+                await asyncio.sleep(1)
+
+    async def send(message):
+        await ws.send(json.dumps(message))
+
+    try:
+        await observe_until_terminal(
+            current=lambda: _current_login_admission(command_id),
+            observe=observe,
+            send=send,
+            initial=initial,
+            refresh=refresh,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # Never log DOM, QR bytes or identity payloads.
+        logger.warning("Login observation stopped for command %s", command_id)
+
+
+def _measured_account_capacity(identity: NodeIdentityV1) -> NodeCapacityFactV1:
+    from backend.browser_login_rules import PACKAGED_RULE_FILES, load_packaged_rule
+
+    allocator = account_runtime_allocator()
+    configuration = allocator.configuration
+    manifest = json.loads(configuration.bundle_manifest.read_text(encoding="utf-8"))
+    root = configuration.bundle_root.resolve()
+    manifest_path = configuration.bundle_manifest.resolve()
+    if root not in manifest_path.parents or configuration.bundle_manifest.is_symlink():
+        raise ValueError("runtime manifest escapes deployment root")
+    installed = []
+    for component in manifest.get("components", []):
+        if component.get("id") != "opencli-script-host":
+            continue
+        script_host = (manifest_path.parent / component["path"]).resolve()
+        if manifest_path.parent not in script_host.parents:
+            raise ValueError("script host escapes runtime bundle")
+        for rule_id, version in PACKAGED_RULE_FILES:
+            rule = load_packaged_rule(script_host, rule_id, version)
+            if rule is not None:
+                installed.append(
+                    {
+                        "id": rule_id,
+                        "version": version,
+                        "platform": rule.get("platform", rule_id),
+                        "identity_probe_supported": rule.get("identity_probe_supported", False),
+                        "qr_only": rule.get("modes") == ["qr"],
+                        "authentication_verified": False,
+                    }
+                )
+    if not installed or not isinstance(manifest.get("version"), str):
+        raise ValueError("no packaged account login rule installed")
+    disk_path = configuration.runtime_root
+    while not disk_path.exists() and disk_path.parent != disk_path:
+        disk_path = disk_path.parent
+    now = datetime.now(UTC)
+    occupied = allocator.occupied_slots()
+    if occupied > 1:
+        raise ValueError("fixed-port account node exceeds its single slot")
+    return NodeCapacityFactV1(
+        node_id=identity.node_id,
+        boot_id=identity.boot_id,
+        slot_limit=1,
+        occupied_slots=occupied,
+        disk_available=shutil.disk_usage(disk_path).free,
+        observed_at=now,
+        expires_at=now + timedelta(seconds=30),
+        capabilities={
+            "browser_login_bundles": [
+                {"id": configuration.bundle_id, "version": manifest["version"], "rules": installed}
+            ]
+        },
+    )
+
+
+async def _send_account_capacity(ws, identity: NodeIdentityV1) -> None:
+    try:
+        while True:
+            capacity = _measured_account_capacity(identity)
+            await ws.send(
+                json.dumps(
+                    {"type": "account_capacity", "capacity": capacity.model_dump(mode="json")}
+                )
+            )
+            await asyncio.sleep(10)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning("Account capacity reporting stopped; stale capacity will expire")
+
+
+async def _accept_ws_lease_renewal(message: dict, authenticated_identity: NodeIdentityV1) -> None:
+    claim = NodeClaimV1.model_validate(message.get("claim"))
+    session = SessionEnvelopeV1.model_validate(message.get("session"))
+    identity = NodeIdentityV1.model_validate(message.get("node_identity"))
+    if identity != authenticated_identity:
+        raise ValueError("renewal identity does not match authenticated node")
+    current = runtime_lease_book().current(claim.command_id)
+    if current is None or (
+        session.workspace_id,
+        session.account_id,
+        session.session_id,
+        session.node_id,
+        session.node_boot_id,
+        session.epoch,
+        session.lease_id,
+    ) != (
+        current.session.workspace_id,
+        current.session.account_id,
+        current.session.session_id,
+        current.session.node_id,
+        current.session.node_boot_id,
+        current.session.epoch,
+        current.session.lease_id,
+    ):
+        raise ValueError("renewal changes session lineage")
+    admission = runtime_lease_book().renew(
+        claim=claim, session=session, node_identity=identity
+    )
+    await account_runtime_allocator().renew(
+        claim=claim, session=admission.session, node_identity=identity
+    )
 
 
 async def _register_login_portal_runtime(
@@ -547,7 +1029,20 @@ async def _register_login_portal_runtime(
 ) -> None:
     """Bind the login session to the real page RecordSession before portal use."""
 
-    if session.purpose != "login" or session.session_id in _ACTIVE_PORTAL_RECORDS:
+    if session.purpose != "login":
+        return
+    try:
+        session_portal_registry().resolve(
+            session_id=session.session_id,
+            node_id=session.node_id,
+            boot_id=session.node_boot_id,
+            epoch=session.epoch,
+            agent_url=agent_url,
+        )
+    except BrowserRuntimeError as exc:
+        if exc.code != "portal_record_missing":
+            raise
+    else:
         return
     owner_endpoint = _CENTRAL_API_URL
     if not agent_url.startswith("https://") or not owner_endpoint.startswith("https://"):
@@ -589,11 +1084,20 @@ async def _register_login_portal_runtime(
     except BaseException:
         await record_session.stop(status="failed", note="portal registration failed")
         raise
-    _ACTIVE_PORTAL_RECORDS[session.session_id] = record_session
 
 
 _ACTIVE_PORTALS: dict[str, _PortalRuntime] = {}
 _PORTAL_MAX_WIRE_BYTES = 4_200_000
+
+
+async def _close_portal_runtime(portal_id: str) -> None:
+    runtime = _ACTIVE_PORTALS.pop(portal_id, None)
+    if runtime is not None and runtime.pointer_pressed:
+        runtime.pointer_pressed = False
+        try:
+            await asyncio.wait_for(release_portal_pointer(runtime.websocket_url), timeout=2)
+        except Exception:
+            logger.debug("Portal pointer target already closed")
 
 
 async def _send_ws_binary(ws, data: bytes) -> None:
@@ -605,16 +1109,17 @@ async def _send_ws_binary(ws, data: bytes) -> None:
 
 
 async def _send_portal_pixel(ws, runtime: _PortalRuntime) -> None:
-    runtime.pixel_sequence += 1
-    frame = await capture_portal_frame(
-        websocket_url=runtime.websocket_url,
-        route=runtime.route,
-        sequence=runtime.pixel_sequence,
-    )
-    encoded = encode_portal_wire_frame(frame)
-    if len(encoded) > _PORTAL_MAX_WIRE_BYTES:
-        raise RuntimeError("portal pixel exceeds transport limit")
-    await _send_ws_binary(ws, encoded)
+    async with runtime.pixel_lock:
+        runtime.pixel_sequence += 1
+        frame = await capture_portal_frame(
+            websocket_url=runtime.websocket_url,
+            route=runtime.route,
+            sequence=runtime.pixel_sequence,
+        )
+        encoded = encode_portal_wire_frame(frame)
+        if len(encoded) > _PORTAL_MAX_WIRE_BYTES:
+            raise RuntimeError("portal pixel exceeds transport limit")
+        await _send_ws_binary(ws, encoded)
 
 
 def _portal_frame_matches_route(
@@ -661,7 +1166,7 @@ async def _handle_ws_portal(ws, msg: dict, authenticated_identity: NodeIdentityV
         await ws.send(json.dumps({"type": "portal_ready", "portal_id": portal_id}))
         await _send_portal_pixel(ws, runtime)
     except Exception as exc:
-        _ACTIVE_PORTALS.pop(portal_id, None)
+        await _close_portal_runtime(portal_id)
         try:
             await ws.send(
                 json.dumps(
@@ -690,6 +1195,7 @@ async def _handle_ws_portal_binary(ws, data: bytes) -> None:
     runtime = _ACTIVE_PORTALS.get(portal_id)
     if runtime is None:
         logger.warning("WS: control for inactive portal session=%s", portal_id)
+        return
     try:
         if runtime.route.route_expires_at <= datetime.now(UTC):
             raise ValueError("portal route expired")
@@ -705,12 +1211,18 @@ async def _handle_ws_portal_binary(ws, data: bytes) -> None:
         current_target = await resolve_portal_target(runtime.cdp_endpoint, runtime.route)
         if current_target != runtime.websocket_url:
             raise ValueError("portal browser target changed")
+        if control.kind == "pointer" and control.sensitive_payload is not None:
+            if control.sensitive_payload.pointer_action == "down":
+                runtime.pointer_pressed = True
         await apply_portal_control(
             websocket_url=runtime.websocket_url,
             cdp_endpoint=runtime.cdp_endpoint,
             route=runtime.route,
             control=control,
         )
+        if control.kind == "pointer" and control.sensitive_payload is not None:
+            if control.sensitive_payload.pointer_action in {None, "up"}:
+                runtime.pointer_pressed = False
         runtime.control_sequence = frame.sequence
         if control.kind == "request_view":
             await _send_portal_pixel(ws, runtime)
@@ -722,7 +1234,7 @@ async def _handle_ws_portal_binary(ws, data: bytes) -> None:
             )
     except Exception:
         logger.warning("WS: portal control rejected for session=%s", portal_id, exc_info=True)
-        _ACTIVE_PORTALS.pop(portal_id, None)
+        await _close_portal_runtime(portal_id)
         try:
             await ws.send(
                 json.dumps(
@@ -885,6 +1397,13 @@ async def _handle_ws_agent_task(
             }
             command_kind = runtime_request.command.kind.value
             if command_kind in {"stop_and_save", "close_session"}:
+                stopping_generation = await _block_browser_desktop_for_stop(
+                    runtime_request.session, runtime_request.claim
+                )
+                watcher = _LOGIN_OBSERVERS.pop(runtime_request.session.session_id, None)
+                if watcher is not None:
+                    watcher.cancel()
+                    await asyncio.gather(watcher, return_exceptions=True)
                 try:
                     registration = session_portal_registry().resolve(
                         session_id=runtime_request.session.session_id,
@@ -903,6 +1422,28 @@ async def _handle_ws_agent_task(
                         runtime_request.session.session_id,
                         exc_info=True,
                     )
+                pre_save_login_observation = None
+                if (
+                    command_kind == "stop_and_save"
+                    and runtime_request.session.purpose == "browser"
+                ):
+                    running_before_stop = account_runtime_allocator().get(
+                        runtime_request.session.session_id
+                    )
+                    if running_before_stop is not None:
+                        try:
+                            observed = await observe_login_runtime(
+                                cdp_endpoint=running_before_stop.binding.cdp_endpoint,
+                                session=runtime_request.session,
+                                claim=runtime_request.claim,
+                                node_identity=authenticated_identity,
+                                expected_origin=running_before_stop.bundle.login_origin,
+                            )
+                            pre_save_login_observation = observed.model_dump(mode="json")
+                        except BrowserRuntimeError:
+                            # Saving the browser environment remains allowed, but
+                            # the center must clear any earlier authentication.
+                            pass
                 manifest = await account_runtime_allocator().stop(
                     session_id=runtime_request.session.session_id,
                     node_id=runtime_request.claim.node_id,
@@ -920,6 +1461,7 @@ async def _handle_ws_agent_task(
                     epoch=runtime_request.claim.epoch,
                 )
                 runtime_lease_book().revoke(runtime_request.command.command_id)
+                _STOPPING_BROWSER_DESKTOPS.discard(stopping_generation)
                 await _send_result(
                     {
                         "type": "done",
@@ -928,6 +1470,7 @@ async def _handle_ws_agent_task(
                             "runtime_status": "stopped",
                             "session_id": runtime_request.session.session_id,
                             "profile_manifest": manifest,
+                            "pre_save_login_observation": pre_save_login_observation,
                         },
                     }
                 )
@@ -945,21 +1488,78 @@ async def _handle_ws_agent_task(
                     tunnel_handle=tunnel_handle,
                     tunnel_auth_digest=tunnel_auth_digest,
                 )
-                observation = await observe_login_runtime(
-                    cdp_endpoint=running.binding.cdp_endpoint,
-                    session=runtime_request.session,
-                    claim=runtime_request.claim,
-                    node_identity=authenticated_identity,
-                    expected_origin=running.bundle.login_origin,
-                )
-                await ws.send(
-                    json.dumps(
+                if runtime_request.session.purpose == "browser":
+                    # A full desktop is ready when the isolated Chromium/VNC
+                    # stack is healthy. Login target discovery is useful
+                    # evidence, but it must never gate desktop availability.
+                    old_watcher = _LOGIN_OBSERVERS.pop(
+                        runtime_request.session.session_id, None
+                    )
+                    if old_watcher is not None:
+                        old_watcher.cancel()
+                    _LOGIN_OBSERVERS[runtime_request.session.session_id] = (
+                        asyncio.create_task(
+                            _watch_login(ws, runtime_request.command.command_id)
+                        )
+                    )
+                    await _send_result(
                         {
-                            "type": "login_observation",
-                            "observation": observation.model_dump(mode="json"),
+                            "type": "done",
+                            "task_id": request_id,
+                            "result": {
+                                "runtime_status": "healthy",
+                                "session_id": running.binding.session_id,
+                                "profile_id": running.profile_id,
+                            },
                         }
                     )
+                    return
+                # Chrome health precedes document injection; wait briefly for the
+                # exact installed rule to produce its first real observation.
+                for attempt in range(15):
+                    try:
+                        first = await observe_login_runtime(
+                            cdp_endpoint=running.binding.cdp_endpoint,
+                            session=runtime_request.session,
+                            claim=runtime_request.claim,
+                            node_identity=authenticated_identity,
+                            expected_origin=running.bundle.login_origin,
+                        )
+                        break
+                    except BrowserRuntimeError:
+                        if (
+                            attempt == 14
+                            or _current_login_admission(runtime_request.command.command_id) is None
+                        ):
+                            raise
+                        await asyncio.sleep(1)
+                first_wire = first.model_dump(mode="json")
+                await ws.send(json.dumps({"type": "login_observation", "observation": first_wire}))
+                initial_fingerprint = json.dumps(
+                    {
+                        key: first_wire.get(key)
+                        for key in (
+                            "state",
+                            "evidence_kind",
+                            "browser_session_state",
+                            "external_identity",
+                            "target",
+                            "view_generation",
+                            "error_code",
+                        )
+                    },
+                    sort_keys=True,
                 )
+                old_watcher = _LOGIN_OBSERVERS.pop(runtime_request.session.session_id, None)
+                if old_watcher is not None:
+                    old_watcher.cancel()
+                watcher = asyncio.create_task(
+                    _watch_login(
+                        ws, runtime_request.command.command_id,
+                        initial_fingerprint, first.target.tab_id,
+                    )
+                )
+                _LOGIN_OBSERVERS[runtime_request.session.session_id] = watcher
                 await _send_result(
                     {
                         "type": "done",
@@ -1174,6 +1774,7 @@ async def _register_via_ws(advertise_url: str) -> None:
     attempt = 0
     while True:
         attempt += 1
+        connection_ws = None
         try:
             logger.info("WS connecting to center %s (attempt %d)", ws_url, attempt)
             connect_kwargs: dict = {"ping_interval": 30, "ping_timeout": 10}
@@ -1191,6 +1792,7 @@ async def _register_via_ws(advertise_url: str) -> None:
             else:
                 connector = websockets.connect(ws_url, **connect_kwargs)
             async with connector as ws:
+                connection_ws = ws
                 attempt = 0  # reset on successful connect
                 await ws.send(register_payload)
 
@@ -1222,10 +1824,17 @@ async def _register_via_ws(advertise_url: str) -> None:
                     connection_tunnel_digest = ""
                 logger.info("WS registered with center as %s", advertise_url)
 
+                if identity is not None and _account_runtime_prerequisite(advertise_url)[0]:
+                    asyncio.create_task(_send_account_capacity(ws, identity))
+
                 # Main receive loop
                 async for raw_msg in ws:
                     if isinstance(raw_msg, (bytes, bytearray)):
-                        await _handle_ws_portal_binary(ws, bytes(raw_msg))
+                        wire = bytes(raw_msg)
+                        if wire.startswith(DESKTOP_MAGIC):
+                            await _handle_ws_browser_desktop_binary(ws, wire)
+                        else:
+                            await _handle_ws_portal_binary(ws, wire)
                         continue
                     try:
                         msg = json.loads(raw_msg)
@@ -1233,7 +1842,18 @@ async def _register_via_ws(advertise_url: str) -> None:
                         logger.warning("WS: invalid JSON from center: %r", raw_msg[:200])
                         continue
                     msg_type = msg.get("type")
-                    if msg_type == "collect":
+                    if msg_type == "account_lease_renewed":
+                        current_identity = _node_identity(required=True)
+                        try:
+                            await _accept_ws_lease_renewal(msg, current_identity)
+                        except (BrowserRuntimeError, ValueError) as exc:
+                            logger.warning(
+                                "Account lease renewal rejected: %s; WS remains connected",
+                                exc.code
+                                if isinstance(exc, BrowserRuntimeError)
+                                else "invalid_renewal",
+                            )
+                    elif msg_type == "collect":
                         asyncio.create_task(_handle_ws_collect(ws, msg))
                     elif msg_type == "portal_open":
                         asyncio.create_task(
@@ -1244,7 +1864,21 @@ async def _register_via_ws(advertise_url: str) -> None:
                             _handle_ws_portal_prepare(ws, msg, _node_identity(required=False))
                         )
                     elif msg_type == "portal_close":
-                        _ACTIVE_PORTALS.pop(msg.get("portal_id", ""), None)
+                        await _close_portal_runtime(msg.get("portal_id", ""))
+                    elif msg_type == "browser_desktop_open":
+                        asyncio.create_task(
+                            _handle_ws_browser_desktop(
+                                ws,
+                                msg,
+                                _node_identity(required=False),
+                                tunnel_handle=connection_tunnel_handle,
+                                tunnel_auth_digest=connection_tunnel_digest,
+                            )
+                        )
+                    elif msg_type == "browser_desktop_close":
+                        await _close_browser_desktop(
+                            msg.get("route_id", ""), owner_ws=ws
+                        )
                     elif msg_type == "agent_task":
                         _start_ws_agent_task(
                             ws,
@@ -1279,7 +1913,13 @@ async def _register_via_ws(advertise_url: str) -> None:
             )
             await asyncio.sleep(wait)
         finally:
-            _ACTIVE_PORTALS.clear()
+            for portal_id in tuple(_ACTIVE_PORTALS):
+                await _close_portal_runtime(portal_id)
+            for route_id, runtime in tuple(_ACTIVE_BROWSER_DESKTOPS.items()):
+                if connection_ws is not None and runtime.owner_ws is connection_ws:
+                    await _close_browser_desktop(
+                        route_id, owner_ws=connection_ws, expected_runtime=runtime
+                    )
             for task in tuple(_ACTIVE_AGENT_TASKS.values()):
                 task.cancel()
 

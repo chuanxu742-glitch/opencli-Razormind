@@ -138,3 +138,53 @@ test('图谱工具栏在窄视口显示选中项目且不横向溢出', async ({
   await page.keyboard.press('Enter')
   await expect(projectSelect).toContainText(projects[1].name)
 })
+
+test('图谱没有项目时禁用选择器，不展开空白横线菜单', async ({ page }) => {
+  await mockApi(page)
+  await page.route(`**/api/v1/workspaces/${workspace.id}/projects`, (route) =>
+    route.fulfill({ contentType: 'application/json', body: JSON.stringify({ data: [] }) }))
+  await page.goto('/records/graph')
+
+  const projectSelect = page.getByRole('combobox', { name: '预览项目' })
+  await expect(projectSelect).toContainText('暂无可预览的项目')
+  await expect(projectSelect).toBeDisabled()
+  await expect(projectSelect).toHaveAttribute('aria-expanded', 'false')
+  await expect(page.getByRole('combobox', { name: '图谱密度' })).toBeDisabled()
+  await expect(page.getByRole('textbox', { name: '搜索当前项目预览' })).toBeDisabled()
+  await expect(page.locator('[data-slot="select-content"]')).toHaveCount(0)
+  await expect(page.getByText('还没有可预览的项目', { exact: true })).toBeVisible()
+})
+
+test('图谱等待项目请求时显示加载状态，返回后恢复选择', async ({ page }) => {
+  await mockApi(page)
+  let release!: () => void
+  const pending = new Promise<void>((resolve) => { release = resolve })
+  await page.route(`**/api/v1/workspaces/${workspace.id}/projects`, async (route) => {
+    await pending
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ data: projects }) })
+  })
+  try {
+    await page.goto('/records/graph')
+    const projectSelect = page.getByRole('combobox', { name: '预览项目' })
+    await expect(projectSelect).toContainText('正在加载项目…')
+    await expect(projectSelect).toBeDisabled()
+    release()
+    await expect(projectSelect).toContainText(projects[0].name)
+    await expect(projectSelect).toBeEnabled()
+    await projectSelect.click()
+    await expect(page.getByRole('option', { name: projects[1].name })).toBeVisible()
+  } finally {
+    release()
+  }
+})
+
+test('图谱项目请求失败时明确显示错误并禁用空菜单', async ({ page }) => {
+  await mockApi(page)
+  await page.route(`**/api/v1/workspaces/${workspace.id}/projects`, (route) =>
+    route.fulfill({ status: 403, contentType: 'application/json', body: JSON.stringify({ detail: '无法读取项目' }) }))
+  await page.goto('/records/graph')
+  const projectSelect = page.getByRole('combobox', { name: '预览项目' })
+  await expect(projectSelect).toContainText('项目加载失败', { timeout: 15000 })
+  await expect(projectSelect).toBeDisabled()
+  await expect(page.locator('[data-slot="select-content"]')).toHaveCount(0)
+})

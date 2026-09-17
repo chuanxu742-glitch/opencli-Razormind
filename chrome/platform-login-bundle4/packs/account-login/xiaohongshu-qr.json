@@ -1,0 +1,31 @@
+{
+  "id": "xiaohongshu-qr",
+  "version": "0.2.0",
+  "platform": "xiaohongshu",
+  "allowed_origins": [
+    "https://www.xiaohongshu.com"
+  ],
+  "allowed_redirect_origins": [
+    "https://www.xiaohongshu.com"
+  ],
+  "login_url": "/explore",
+  "modes": [
+    "qr"
+  ],
+  "authentication_verified": false,
+  "selectors": [
+    {
+      "id": "qr",
+      "selector": "img.qrcode-img",
+      "kind": "qr",
+      "frame": "main"
+    }
+  ],
+  "refresh": {
+    "trigger": "qr_expired",
+    "interval": 30,
+    "max_attempts": 3
+  },
+  "identity_probe_supported": true,
+  "interaction_supported": true
+}

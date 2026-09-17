@@ -2,24 +2,58 @@
   {
     "id": "page-basics",
     "version": "1.0.0",
-    "matches": ["http://*/*", "https://*/*"],
-    "js": ["packs/page-basics/content.js"],
+    "matches": [
+      "http://*/*",
+      "https://*/*"
+    ],
+    "js": [
+      "packs/page-basics/content.js"
+    ],
     "run_at": "document_idle",
-    "actions": [{ "id": "page.metadata" }]
+    "actions": [
+      {
+        "id": "page.metadata"
+      }
+    ]
   },
   {
     "id": "account-login",
     "version": "1.0.0",
-    "matches": ["http://127.0.0.1:49906/*", "http://localhost:49906/*"],
-    "js": ["packs/account-login/content.js"],
+    "matches": [
+      "http://127.0.0.1:49906/*",
+      "http://localhost:49906/*",
+      "https://www.xiaohongshu.com/*"
+    ],
+    "js": [
+      "packs/account-login/content.js"
+    ],
     "run_at": "document_idle",
     "rule": "packs/account-login/rules.json",
     "rule_version": "1.0.0",
     "actions": [
-      { "id": "login.observe", "sensitive": false },
-      { "id": "login.open", "sensitive": false },
-      { "id": "login.refresh", "sensitive": false },
-      { "id": "login.switch-mode", "sensitive": false }
+      {
+        "id": "login.observe",
+        "sensitive": false
+      },
+      {
+        "id": "login.open",
+        "sensitive": false
+      },
+      {
+        "id": "login.refresh",
+        "sensitive": false
+      },
+      {
+        "id": "login.switch-mode",
+        "sensitive": false
+      }
+    ],
+    "rules": [
+      {
+        "id": "xiaohongshu-qr",
+        "version": "0.1.0",
+        "path": "packs/account-login/xiaohongshu-qr.json"
+      }
     ]
   }
 ]

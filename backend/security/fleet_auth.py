@@ -62,6 +62,7 @@ using the bearer header or query parameter described above.
 
 from __future__ import annotations
 
+import re
 import secrets
 import sys
 from collections.abc import Sequence
@@ -84,6 +85,9 @@ PROTECTED_PREFIXES = ("/api", "/mcp")
 FLEET_AUTH_ERROR_CODE = "fleet_auth_invalid"
 # Receiver v2 supplies independent MAC authentication; Studio remains fleet-authenticated.
 CONTROLLED_RECEIVER_V2_PREFIX = "/api/v1/controlled-receiver/v2/"
+_ACCOUNT_PORTAL_WS_PATH = re.compile(
+    r"/api/v1/workspaces/[^/]+/browser-accounts/[^/]+/login-sessions/[^/]+/(?:portal|browser)"
+)
 
 # Local login is intentionally the only unauthenticated API route. Once the
 # user has a local bearer session, the identity dependency authenticates it.
@@ -200,6 +204,12 @@ class FleetAuthMiddleware:
             await self.app(scope, receive, send)
             return
         path = scope.get("path", "")
+        if scope["type"] == "websocket" and _ACCOUNT_PORTAL_WS_PATH.fullmatch(path):
+            # This one route authenticates its short-lived HttpOnly owner cookie,
+            # origin, live membership and fenced session before accepting. A
+            # browser WebSocket cannot carry the HTTP bearer used to issue it.
+            await self.app(scope, receive, send)
+            return
         if not path.startswith(PROTECTED_PREFIXES) or path in PUBLIC_PATHS:
             await self.app(scope, receive, send)
             return

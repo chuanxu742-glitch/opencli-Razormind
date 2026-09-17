@@ -35,6 +35,7 @@ from backend.models.browser import (
     BrowserRuntimeBundle,
 )
 from backend.models.browser_portal import BrowserPortalOwner, BrowserPortalTicket
+from backend.models.browser_space import BrowserSpace
 from backend.models.edge_node import EdgeNode
 from backend.models.identity import User, Workspace, WorkspaceMembership
 from backend.models.source_binding import SourceBindingRevision
@@ -70,21 +71,13 @@ from backend.schemas.browser_account import (
 from backend.schemas.browser_account import (
     BrowserAuthEvidence as _SchemaBrowserAuthEvidence,
 )
+from backend.services.browser_account_session_contract import ACTIVE_BROWSER_SESSION_STATUSES
 from backend.services.browser_portal_contract import (
     consume_portal_ticket_cas,
     issue_first_portal_ticket,
     ticket_record_from_issue,
 )
 
-_ACTIVE_SESSION_STATUSES = (
-    BrowserAccountStatus.OPENING.value,
-    BrowserAccountStatus.PRESENTING.value,
-    BrowserAccountStatus.REFRESHING.value,
-    BrowserAccountStatus.VERIFYING.value,
-    BrowserAccountStatus.CHALLENGE.value,
-    BrowserAccountStatus.UNKNOWN.value,
-    BrowserAccountStatus.SAVING.value,
-)
 _TERMINAL_SESSION_STATUSES = (
     BrowserAccountStatus.EXPIRED.value,
     BrowserAccountStatus.CLOSED.value,
@@ -188,11 +181,13 @@ async def _account_or_error(
     statement = select(BrowserAccount).where(
         BrowserAccount.workspace_id == workspace_id,
         BrowserAccount.id == account_id,
+        or_(BrowserAccount.status_reason_code.is_(None),
+            BrowserAccount.status_reason_code != "account_deleted"),
     )
     if for_update:
-        statement = statement.with_for_update()
+        statement = statement.with_for_update().execution_options(populate_existing=True)
     account = await db.scalar(statement)
-    if account is None:
+    if account is None or account.status_reason_code == "account_deleted":
         raise BrowserAccountError("not_found", "browser account not found", 404)
     return account
 
@@ -205,13 +200,24 @@ async def _session_or_error(
     *,
     for_update: bool = False,
 ) -> BrowserLoginSession:
+    # 只读标量，避免刷新 identity map 覆盖调用方尚未 flush 的账号修改。
+    account_query = select(BrowserAccount.id).where(
+        BrowserAccount.workspace_id == workspace_id,
+        BrowserAccount.id == account_id,
+        or_(BrowserAccount.status_reason_code.is_(None),
+            BrowserAccount.status_reason_code != "account_deleted"),
+    )
+    if for_update:
+        account_query = account_query.with_for_update()
+    if await db.scalar(account_query) is None:
+        raise BrowserAccountError("not_found", "browser account not found", 404)
     statement = select(BrowserLoginSession).where(
         BrowserLoginSession.workspace_id == workspace_id,
         BrowserLoginSession.account_id == account_id,
         BrowserLoginSession.id == session_id,
     )
     if for_update:
-        statement = statement.with_for_update()
+        statement = statement.with_for_update().execution_options(populate_existing=True)
     session = await db.scalar(statement)
     if session is None:
         raise BrowserAccountError("not_found", "login session not found", 404)
@@ -259,6 +265,19 @@ async def create_browser_account(
         raise BrowserAccountError(
             "invalid_login_rule", "login_rule_id and version must be supplied together", 422
         )
+    if not any(
+        (
+            payload.node_id,
+            payload.runtime_bundle_id,
+            payload.login_rule_id,
+            payload.login_rule_version,
+        )
+    ):
+        from backend.services.browser_account_login_options import match_new_account_login
+
+        matched = await match_new_account_login(db, payload.site, require_free_slot=False)
+        if matched:
+            payload = payload.model_copy(update=matched)
     node = await _validate_node(db, payload.node_id) if payload.node_id else None
     bundle = (
         await _runtime_bundle_or_error(db, payload.runtime_bundle_id)
@@ -299,7 +318,11 @@ async def list_browser_accounts(
     await _workspace_or_error(db, workspace_id)
     if not 1 <= limit <= 200:
         raise BrowserAccountError("invalid_limit", "limit must be between 1 and 200", 422)
-    statement = select(BrowserAccount).where(BrowserAccount.workspace_id == workspace_id)
+    statement = select(BrowserAccount).where(
+        BrowserAccount.workspace_id == workspace_id,
+        or_(BrowserAccount.status_reason_code.is_(None),
+            BrowserAccount.status_reason_code != "account_deleted"),
+    )
     if status is not None:
         statement = statement.where(BrowserAccount.status == status.value)
     if after_id:
@@ -316,10 +339,10 @@ async def list_browser_accounts(
 
 
 async def get_browser_account(
-    db: AsyncSession, workspace_id: str, account_id: str
+    db: AsyncSession, workspace_id: str, account_id: str, *, for_update: bool = False
 ) -> BrowserAccount:
     await _workspace_or_error(db, workspace_id)
-    return await _account_or_error(db, workspace_id, account_id)
+    return await _account_or_error(db, workspace_id, account_id, for_update=for_update)
 
 
 async def _active_lease(
@@ -416,6 +439,40 @@ def _set_revision(account: BrowserAccount) -> None:
     account.revision += 1
 
 
+async def delete_browser_account(
+    db: AsyncSession, workspace_id: str, account_id: str, expected_revision: int
+) -> None:
+    """注销闲置项目账号，保留历史记录及加密 profile 引用。"""
+    account = await _account_or_error(db, workspace_id, account_id, for_update=True)
+    if expected_revision != account.revision:
+        raise BrowserAccountError(
+            BrowserAccountErrorCode.STALE_GENERATION, "account revision is stale"
+        )
+    # 账号行锁与会话创建、调度入队共享；过期租约仍须明确释放。
+    blockers = (
+        (BrowserAccountLease, BrowserAccountLease.status.in_(("active", "quarantined"))),
+        (BrowserLoginSession, BrowserLoginSession.closed_at.is_(None)),
+        (
+            BrowserDurableCommand,
+            BrowserDurableCommand.status.in_(("queued", "claimed", "running")),
+        ),
+        (BrowserSpace, BrowserSpace.status != "closed"),
+    )
+    for model, condition in blockers:
+        busy = await db.scalar(select(model.id).where(
+            model.workspace_id == workspace_id, model.account_id == account_id, condition
+        ).limit(1))
+        if busy is not None:
+            raise BrowserAccountError(
+                "account_busy", "account still owns unfinished resources", 409
+            )
+    account.status = BrowserAccountStatus.CLOSED.value
+    account.paused = True
+    account.status_reason_code = "account_deleted"
+    _set_revision(account)
+    await db.flush()
+
+
 async def update_browser_account(
     db: AsyncSession,
     workspace_id: str,
@@ -430,10 +487,13 @@ async def update_browser_account(
             BrowserAccountErrorCode.STALE_GENERATION, "account revision is stale"
         )
     changed = False
+    if body.label is not None and body.label != account.label:
+        account.label = body.label
+        changed = True
     if body.auth_required is not None and body.auth_required != account.auth_required:
         account.auth_required = body.auth_required
         changed = True
-        if body.auth_required and account.status in _ACTIVE_SESSION_STATUSES:
+        if body.auth_required and account.status in ACTIVE_BROWSER_SESSION_STATUSES:
             account.status = BrowserAccountStatus.UNKNOWN.value
             account.status_reason_code = BrowserAccountErrorCode.AUTH_REQUIRED.value
     if body.paused is not None and body.paused != account.paused:
@@ -543,7 +603,7 @@ async def queue_account_migration(
         select(BrowserLoginSession.id).where(
             BrowserLoginSession.workspace_id == workspace_id,
             BrowserLoginSession.account_id == account_id,
-            BrowserLoginSession.status.in_(_ACTIVE_SESSION_STATUSES),
+            BrowserLoginSession.status.in_(ACTIVE_BROWSER_SESSION_STATUSES),
         )
     )
     if active_session is not None:
@@ -571,7 +631,7 @@ async def create_login_session(
     workspace_id: str,
     account_id: str,
     *,
-    purpose: Literal["login", "execution"] = "login",
+    purpose: Literal["login", "execution", "browser"] = "login",
     execution_id: str | None = None,
     expected_revision: int,
     source_binding_revision_id: str | None = None,
@@ -607,13 +667,114 @@ async def create_login_session(
         .where(
             BrowserLoginSession.workspace_id == workspace_id,
             BrowserLoginSession.account_id == account_id,
-            BrowserLoginSession.status.in_(_ACTIVE_SESSION_STATUSES),
+            BrowserLoginSession.status.in_(ACTIVE_BROWSER_SESSION_STATUSES),
         )
         .order_by(BrowserLoginSession.updated_at.desc(), BrowserLoginSession.id.desc())
     )
-    if active is not None:
-        return active
     node = await db.get(EdgeNode, account.node_id) if account.node_id else None
+    if active is not None:
+        command = (
+            await db.get(BrowserDurableCommand, active.command_id) if active.command_id else None
+        )
+        now = _now()
+        expired = active.expires_at is not None and _as_utc(active.expires_at) <= now
+        command_failed = command is None or command.status in {
+            "failed",
+            "expired",
+            "cancelled",
+        }
+        stale_node_boot = active.node_id != account.node_id or (
+            active.node_id is not None and (node is None or active.node_boot_id != node.boot_id)
+        )
+        claimed_or_running = command is not None and command.status in {"claimed", "running"}
+        live_lease = None
+        if claimed_or_running and active.lease_id is not None:
+            live_lease = await db.scalar(
+                select(BrowserAccountLease)
+                .where(
+                    BrowserAccountLease.lease_id == active.lease_id,
+                    BrowserAccountLease.workspace_id == workspace_id,
+                    BrowserAccountLease.account_id == account_id,
+                    BrowserAccountLease.status == BrowserLeaseStatus.ACTIVE.value,
+                )
+                .with_for_update()
+            )
+        stale_live_lease = claimed_or_running and (
+            live_lease is None
+            or _as_utc(live_lease.expires_at) <= now
+            or live_lease.node_id != active.node_id
+            or live_lease.node_boot_id != active.node_boot_id
+            or live_lease.epoch != active.epoch
+        )
+        if (
+            purpose == "browser"
+            and active.purpose == "login"
+            and not command_failed
+            and not stale_node_boot
+            and not stale_live_lease
+            and active.status != BrowserAccountStatus.SAVING.value
+            and not expired
+        ):
+            # A login stack is the same isolated profile/lease. Promote it in
+            # place so opening a desktop never creates a second browser.
+            active.purpose = "browser"
+            active.expires_at = now + timedelta(seconds=1_800)
+            active.revision += 1
+            _set_revision(account)
+            # A queued command has not crossed the node trust boundary, so its
+            # optimistic generation must move with the locked account. Once a
+            # claim exists its expected_revision is immutable fencing lineage.
+            if command is not None and command.status == "queued":
+                command.expected_revision = account.revision
+            await db.flush()
+            return active
+        if not command_failed and not stale_node_boot and not stale_live_lease and (
+            active.status == BrowserAccountStatus.SAVING.value or not expired
+        ):
+            return active
+        if command_failed or stale_node_boot or stale_live_lease:
+            raise BrowserAccountError(
+                BrowserAccountErrorCode.LEASE_LOST,
+                "active login session requires fenced recovery",
+            )
+        raise BrowserAccountError(
+            BrowserAccountErrorCode.SESSION_EXPIRED,
+            "active login session has expired",
+            410,
+        )
+    unreleased_lease = await db.scalar(
+        select(BrowserAccountLease.id)
+        .where(
+            BrowserAccountLease.workspace_id == workspace_id,
+            BrowserAccountLease.account_id == account_id,
+            BrowserAccountLease.status.in_(
+                [BrowserLeaseStatus.ACTIVE.value, BrowserLeaseStatus.QUARANTINED.value]
+            ),
+        )
+        .limit(1)
+    )
+    stopping_command = await db.scalar(
+        select(BrowserDurableCommand.id)
+        .where(
+            BrowserDurableCommand.workspace_id == workspace_id,
+            BrowserDurableCommand.account_id == account_id,
+            BrowserDurableCommand.kind.in_(
+                [
+                    BrowserCommandKind.STOP_AND_SAVE.value,
+                    BrowserCommandKind.CLOSE_SESSION.value,
+                    BrowserCommandKind.ISOLATE.value,
+                    BrowserCommandKind.MIGRATE.value,
+                ]
+            ),
+            BrowserDurableCommand.status.in_(["queued", "claimed", "running"]),
+        )
+        .limit(1)
+    )
+    if unreleased_lease is not None or stopping_command is not None:
+        raise BrowserAccountError(
+            BrowserAccountErrorCode.ISOLATION_REQUIRED,
+            "account is waiting for stop or isolation proof",
+        )
     session = BrowserLoginSession(
         id=str(uuid.uuid4()),
         workspace_id=workspace_id,
@@ -635,13 +796,14 @@ async def create_login_session(
     )
     db.add(session)
     account.status = BrowserAccountStatus.OPENING.value
+    account.status_reason_code = None
     _set_revision(account)
     await db.flush()
     command = await _enqueue_command(
         db,
         account,
         BrowserCommandKind.START_LOGIN
-        if purpose == "login"
+        if purpose in {"login", "browser"}
         else BrowserCommandKind.EXECUTE_REFERENCE,
         idempotency_scope=f"session:{session.id}",
         idempotency_key="start",
@@ -649,7 +811,7 @@ async def create_login_session(
         execution_id=execution_id,
         payload=(
             EmptyCommandPayloadV1()
-            if purpose == "login"
+            if purpose in {"login", "browser"}
             else ExecuteReferenceCommandPayloadV1(execution_id=execution_id or "")
         ),
     )
@@ -818,6 +980,23 @@ async def close_login_session(
     reason: Literal["completed", "cancelled", "expired", "error"] = "cancelled",
     expected_revision: int | None = None,
 ) -> BrowserLoginSession:
+    # Match scheduler lock order: command, account, then session.
+    snapshot = await _session_or_error(db, workspace_id, account_id, session_id)
+    queued = (
+        await db.scalar(
+            select(BrowserDurableCommand)
+            .where(
+                BrowserDurableCommand.id == snapshot.command_id,
+                BrowserDurableCommand.workspace_id == workspace_id,
+                BrowserDurableCommand.account_id == account_id,
+                BrowserDurableCommand.session_id == session_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if snapshot.command_id
+        else None
+    )
     account = await _account_or_error(db, workspace_id, account_id, for_update=True)
     session = await _session_or_error(db, workspace_id, account_id, session_id, for_update=True)
     if expected_revision is not None and expected_revision != session.revision:
@@ -826,20 +1005,54 @@ async def close_login_session(
         )
     if session.status in _TERMINAL_SESSION_STATUSES:
         return session
+    if session.status == BrowserAccountStatus.SAVING.value or (
+        session.purpose == "browser"
+        and session.status in {BrowserAccountStatus.SAVED.value, BrowserAccountStatus.ERROR.value}
+    ):
+        # A second desktop close must not replace the fenced completion command.
+        return session
     session.status = (
         BrowserAccountStatus.EXPIRED.value
         if reason == "expired"
         else BrowserAccountStatus.CLOSED.value
     )
     session.closed_at = _now()
+    _set_revision(account)
+    if (
+        session.lease_id is None
+        and queued is not None
+        and queued.status == "queued"
+        and queued.kind == "start_login"
+    ):
+        queued.status = "cancelled"
+        queued.completed_at = _now()
+        session.revision += 1
+        account.status = BrowserAccountStatus.DORMANT.value
+        await db.flush()
+        return session
+    # A desktop session owns an uncommitted live profile. Closing it must use
+    # the fenced save path; CLOSE_SESSION intentionally does not commit one.
+    command_kind = (
+        BrowserCommandKind.STOP_AND_SAVE
+        if session.purpose == "browser"
+        else BrowserCommandKind.CLOSE_SESSION
+    )
+    if session.purpose == "browser":
+        session.status = BrowserAccountStatus.SAVING.value
+        session.closed_at = None
+        account.status = BrowserAccountStatus.SAVING.value
     command = await _enqueue_command(
         db,
         account,
-        BrowserCommandKind.CLOSE_SESSION,
+        command_kind,
         idempotency_scope=f"session:{session.id}:close",
         idempotency_key=reason,
         session_id=session.id,
-        payload=CloseSessionCommandPayloadV1(reason=reason),
+        payload=(
+            StopAndSaveCommandPayloadV1(expected_profile_version=account.profile_version)
+            if session.purpose == "browser"
+            else CloseSessionCommandPayloadV1(reason=reason)
+        ),
     )
     session.command_id = command.id
     session.revision += 1
@@ -848,17 +1061,20 @@ async def close_login_session(
             BrowserLoginSession.workspace_id == workspace_id,
             BrowserLoginSession.account_id == account_id,
             BrowserLoginSession.id != session.id,
-            BrowserLoginSession.status.in_(_ACTIVE_SESSION_STATUSES),
+            BrowserLoginSession.status.in_(ACTIVE_BROWSER_SESSION_STATUSES),
         )
     )
-    if active_other is None and account.status != BrowserAccountStatus.SAVED.value:
+    if (
+        active_other is None
+        and session.purpose != "browser"
+        and account.status != BrowserAccountStatus.SAVED.value
+    ):
         account.status = BrowserAccountStatus.DORMANT.value
-    _set_revision(account)
     await db.flush()
     return session
 
 
-async def _session_envelope(
+async def session_envelope(
     account: BrowserAccount, session: BrowserLoginSession
 ) -> SessionEnvelopeV1:
     if not session.node_id or not session.node_boot_id or not session.lease_id:
@@ -878,8 +1094,8 @@ async def _session_envelope(
             BrowserAccountErrorCode.PROFILE_CORRUPT, "session profile manifest is incomplete"
         )
     target = SessionTargetV1(
-        tab_id=session.tab_id,
-        frame_id=session.frame_id,
+        tab_id=(int(session.tab_id) if str(session.tab_id).isdecimal() else session.tab_id),
+        frame_id=(int(session.frame_id) if str(session.frame_id).isdecimal() else session.frame_id),
         document_id=session.document_id,
         origin=session.origin,
     )
@@ -939,8 +1155,8 @@ async def get_portal_session_envelope(
         or lease.epoch != session.epoch
         or account.node_id != session.node_id
         or account.paused
-        or (account.auth_required and session.purpose != "login")
-        or session.status not in _ACTIVE_SESSION_STATUSES
+        or (account.auth_required and session.purpose == "execution")
+        or session.status not in ACTIVE_BROWSER_SESSION_STATUSES
         or session.expires_at is None
         or _as_utc(session.expires_at) <= _now()
     ):
@@ -948,7 +1164,7 @@ async def get_portal_session_envelope(
             BrowserAccountErrorCode.SESSION_EXPIRED,
             "portal session has no current node lease",
         )
-    envelope = await _session_envelope(account, session)
+    envelope = await session_envelope(account, session)
     envelope.lease_expires_at = min(_as_utc(lease.expires_at), _as_utc(session.expires_at))
     return node.url.rstrip("/"), envelope, session.revision
 
@@ -1016,8 +1232,7 @@ def execution_account_ref(
         workspace_id=requested.workspace_id,
         account_id=requested.account_id,
         source_binding_revision_id=(
-            requested.source_binding_revision_id
-            or configured.source_binding_revision_id
+            requested.source_binding_revision_id or configured.source_binding_revision_id
         ),
     )
 
@@ -1102,9 +1317,7 @@ async def _execution_account_or_error(
 ) -> tuple[BrowserAccount, str | None]:
     """Authorize and lock one account whose committed profile is executable."""
     await _authorized_execution_actor(db, ref.workspace_id, actor_user_id)
-    account = await _account_or_error(
-        db, ref.workspace_id, ref.account_id, for_update=True
-    )
+    account = await _account_or_error(db, ref.workspace_id, ref.account_id, for_update=True)
     binding_revision_id = ref.source_binding_revision_id
     if binding_revision_id is not None:
         binding_revision = await db.scalar(
@@ -1327,12 +1540,8 @@ async def ensure_execution_session(
     structured ``EXECUTE_REFERENCE`` command; node allocation and browser
     startup remain scheduler/runtime responsibilities.
     """
-    ref, context = _parse_execution_session_request(
-        account_ref, execution_context, actor_user_id
-    )
-    account, binding_revision_id = await _execution_account_or_error(
-        db, ref, actor_user_id
-    )
+    ref, context = _parse_execution_session_request(account_ref, execution_context, actor_user_id)
+    account, binding_revision_id = await _execution_account_or_error(db, ref, actor_user_id)
     expected_payload = ExecuteReferenceCommandPayloadV1(
         execution_id=context.execution_id,
         source_binding_revision_id=binding_revision_id,
@@ -1434,13 +1643,11 @@ async def resolve_account_session(
             BrowserLoginSession.workspace_id == ref.workspace_id,
             BrowserLoginSession.account_id == ref.account_id,
             BrowserLoginSession.purpose == "execution",
-            BrowserLoginSession.status.in_(_ACTIVE_SESSION_STATUSES),
+            BrowserLoginSession.status.in_(ACTIVE_BROWSER_SESSION_STATUSES),
         )
         .where(BrowserLoginSession.execution_id == context.execution_id)
     )
-    session = await db.scalar(
-        statement.order_by(BrowserLoginSession.updated_at.desc()).limit(1)
-    )
+    session = await db.scalar(statement.order_by(BrowserLoginSession.updated_at.desc()).limit(1))
     if session is None:
         return waiting("no execution session has been claimed")
     lease = await _active_lease(db, ref.workspace_id, ref.account_id)
@@ -1467,7 +1674,7 @@ async def resolve_account_session(
     ):
         return blocked(BrowserAccountErrorCode.PROFILE_CORRUPT)
     try:
-        envelope = await _session_envelope(account, session)
+        envelope = await session_envelope(account, session)
     except BrowserAccountError as exc:
         if exc.code == "waiting":
             return waiting(str(exc))
@@ -1647,6 +1854,40 @@ async def apply_login_observation(
     session = await _session_or_error(
         db, workspace_id, account_id, observation.session_id, for_update=True
     )
+    lease = await _active_lease(db, workspace_id, account_id)
+    source_command = await db.get(BrowserDurableCommand, observation.claim.command_id)
+    from backend.models.edge_node import EdgeNodeBoot
+
+    current_node = await db.get(EdgeNode, observation.node_identity.node_id)
+    current_boot = await db.scalar(
+        select(EdgeNodeBoot).where(
+            EdgeNodeBoot.node_id == observation.node_identity.node_id,
+            EdgeNodeBoot.boot_id == observation.node_identity.boot_id,
+            EdgeNodeBoot.status == "active",
+        )
+    )
+    if (
+        current_node is None
+        or current_node.quarantined
+        or current_boot is None
+        or current_node.boot_id != observation.node_identity.boot_id
+        or lease is None
+        or _as_utc(lease.expires_at) <= _now()
+        or lease.lease_id != session.lease_id
+        or lease.node_id != observation.node_identity.node_id
+        or lease.node_boot_id != observation.node_identity.boot_id
+        or lease.epoch != observation.epoch
+        or _as_utc(observation.claim.expires_at) <= _now()
+        or source_command is None
+        or source_command.status not in {"claimed", "running"}
+        or source_command.expected_revision != observation.claim.expected_revision
+        or session.status in _TERMINAL_SESSION_STATUSES
+        or observation.rule_id != session.login_rule_id
+        or observation.rule_version != session.login_rule_version
+    ):
+        raise BrowserAccountError(
+            BrowserAccountErrorCode.LEASE_LOST, "observation lease is not current"
+        )
     if (
         observation.epoch != session.epoch
         or observation.view_generation < session.view_generation
@@ -1657,6 +1898,44 @@ async def apply_login_observation(
         raise BrowserAccountError(
             BrowserAccountErrorCode.STALE_GENERATION, "login observation is stale"
         )
+    from pathlib import Path
+
+    from backend.browser_login_rules import load_bundle_login_rule
+
+    bundle = await db.get(BrowserRuntimeBundle, account.runtime_bundle_id)
+    rule = (
+        load_bundle_login_rule(
+            Path(__file__).resolve().parents[2],
+            bundle_name=bundle.name,
+            bundle_version=bundle.version,
+            bundle_manifest=bundle.manifest,
+            rule_id=observation.rule_id,
+            rule_version=observation.rule_version,
+        )
+        if bundle is not None and bundle.trust_level == "trusted"
+        else None
+    )
+    if (
+        rule is None
+        or observation.target.origin
+        not in set(rule.get("allowed_origins", [])) | set(rule.get("allowed_redirect_origins", []))
+        or (session.tab_id is not None and str(session.tab_id) != str(observation.target.tab_id))
+        or (
+            rule.get("authentication_verified") is False
+            and rule.get("identity_probe_supported") is not True
+            and observation.evidence_kind == _SchemaBrowserAuthEvidence.VALID
+        )
+    ):
+        raise BrowserAccountError(
+            BrowserAccountErrorCode.STALE_GENERATION,
+            "observation does not match the installed rule target",
+        )
+    if (
+        str(session.document_id) != str(observation.target.document_id)
+        or session.origin != observation.target.origin
+        or session.view_generation != observation.view_generation
+    ):
+        session.revision += 1
     session.login_rule_id = observation.rule_id
     session.login_rule_version = observation.rule_version
     session.tab_id = str(observation.target.tab_id)
@@ -1665,6 +1944,8 @@ async def apply_login_observation(
     session.origin = observation.target.origin
     session.view_generation = observation.view_generation
     session.status = observation.state
+    if account.status_reason_code in {"browser_login_observed", "browser_session_verified"}:
+        account.status_reason_code = None
     if observation.external_identity is not None:
         identity = _identity_dump(observation.external_identity)
         if account.platform_identity and account.platform_identity != identity:
@@ -1682,25 +1963,34 @@ async def apply_login_observation(
     revision_bumped = False
     if observation.evidence_kind == _SchemaBrowserAuthEvidence.VALID:
         account.auth_evidence = BrowserAuthEvidence.VALID.value
+        account.status_reason_code = None
         account.evidence_source = BrowserEvidenceSource.RULE_VERIFIED.value
         account.evidence_observed_at = observation.observed_at
         account.auth_required = False
-        account.status = BrowserAccountStatus.SAVING.value
-        session.status = BrowserAccountStatus.SAVING.value
-        _set_revision(account)
-        revision_bumped = True
-        command = await _enqueue_command(
-            db,
-            account,
-            BrowserCommandKind.STOP_AND_SAVE,
-            idempotency_scope=f"session:{session.id}:save",
-            idempotency_key=str(observation.view_generation),
-            session_id=session.id,
-            payload=StopAndSaveCommandPayloadV1(expected_profile_version=account.profile_version),
-        )
-        session.command_id = command.id
+        if session.purpose == "browser":
+            # Verified identity is recorded, but a manually controlled browser
+            # stays live until an explicit safe save/stop.
+            account.status = observation.state
+            session.status = observation.state
+        else:
+            account.status = BrowserAccountStatus.SAVING.value
+            session.status = BrowserAccountStatus.SAVING.value
+            _set_revision(account)
+            revision_bumped = True
+            command = await _enqueue_command(
+                db,
+                account,
+                BrowserCommandKind.STOP_AND_SAVE,
+                idempotency_scope=f"session:{session.id}:save",
+                idempotency_key=str(observation.view_generation),
+                session_id=session.id,
+                payload=StopAndSaveCommandPayloadV1(expected_profile_version=account.profile_version),
+            )
+            session.command_id = command.id
     elif observation.evidence_kind == _SchemaBrowserAuthEvidence.INVALID:
         account.auth_evidence = BrowserAuthEvidence.INVALID.value
+        account.evidence_source = None
+        account.evidence_observed_at = observation.observed_at
         account.auth_required = True
         account.status = BrowserAccountStatus.ERROR.value
         account.status_reason_code = (
@@ -1710,7 +2000,31 @@ async def apply_login_observation(
         )
     else:
         account.status = observation.state
-        account.auth_required = observation.state == BrowserAccountStatus.CHALLENGE.value
+        if (
+            observation.browser_session_state in {"signed_in_visible", "session_authenticated"}
+            and observation.rule_id == "xiaohongshu-qr"
+            and observation.target.origin == "https://www.xiaohongshu.com"
+            and observation.state in {"presenting", "unknown", "verifying"}
+        ):
+            account.status_reason_code = (
+                "browser_session_verified"
+                if observation.browser_session_state == "session_authenticated"
+                else "browser_login_observed"
+            )
+        if session.purpose == "browser":
+            # Unknown evidence from a live manual browser revokes any earlier
+            # verified identity without preventing the operator from logging in
+            # again through that same isolated desktop.
+            account.auth_evidence = BrowserAuthEvidence.UNKNOWN.value
+            account.evidence_source = None
+            account.evidence_observed_at = (
+                observation.observed_at
+                if account.status_reason_code == "browser_session_verified"
+                else None
+            )
+            account.auth_required = False
+        else:
+            account.auth_required = observation.state == BrowserAccountStatus.CHALLENGE.value
     if not revision_bumped:
         _set_revision(account)
     await db.flush()
@@ -1940,7 +2254,7 @@ async def _consume_portal_ticket(
         or session.status in _PORTAL_TERMINAL_SESSION_STATUSES
         or (session.expires_at is not None and _as_utc(session.expires_at) <= now)
         or account.paused
-        or (account.auth_required and session.purpose != "login")
+        or (account.auth_required and session.purpose == "execution")
     ):
         return False
     row.consumed_at = now

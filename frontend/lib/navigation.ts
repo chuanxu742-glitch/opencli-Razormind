@@ -113,7 +113,7 @@ export const ROUTE_LABELS: Record<string, string> = {
   '/skills': '技能',
   '/providers': '模型与连接',
   '/workers': 'Worker',
-  '/browser-accounts': 'Browser accounts',
+  '/browser-accounts': '账号集群',
   '/browsers': 'Chrome 池',
   '/control/actions': '控制与审计',
   '/control/kill-switch': '熔断开关',
