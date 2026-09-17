@@ -9,6 +9,17 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 
+@pytest.mark.parametrize("bundle,source", [("1", "script-host-v1.2"), ("2", "script-host-v1.2"), ("3", "script-host"), ("4", "platform-login-bundle4")])
+def test_packaged_script_host_matches_pinned_bundle_version(bundle, source):
+    manifest = json.loads((ROOT / "chrome/runtime-bundles/opencli-default" / bundle / "manifest.json").read_text(encoding="utf-8"))
+    component = next(item for item in manifest["components"] if item["id"] == "opencli-script-host")
+    extension = json.loads((ROOT / "chrome" / source / "manifest.json").read_text(encoding="utf-8"))
+    assert extension["version"] == component["version"]
+    for image in ("agent", "chrome"):
+        dockerfile = (ROOT / image / "Dockerfile").read_text(encoding="utf-8")
+        assert f"COPY chrome/{source}/ /opt/browser-runtime-bundles/opencli-default/{bundle}/extensions/opencli-script-host/" in dockerfile
+
+
 def test_agent_image_packages_runtime_adapter_modules():
     dockerfile = (ROOT / "agent" / "Dockerfile").read_text(encoding="utf-8")
 

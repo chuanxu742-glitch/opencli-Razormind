@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "OpenCLI Script Host",
+  "version": "1.2.0",
+  "description": "Registers packaged, versioned site-script packs and exposes only their declared actions.",
+  "permissions": ["scripting", "tabs"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  }
+}

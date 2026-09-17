@@ -101,11 +101,11 @@ COPY chrome/runtime-bundles/ /opt/browser-runtime-bundles/
 COPY chrome/extension-src/manifest.json /opt/browser-runtime-bundles/opencli-default/1/extensions/opencli-browser-bridge/manifest.json
 COPY chrome/extension-src/icons/ /opt/browser-runtime-bundles/opencli-default/1/extensions/opencli-browser-bridge/icons/
 COPY chrome/extension-src/dist/background.js /opt/browser-runtime-bundles/opencli-default/1/extensions/opencli-browser-bridge/dist/background.js
-COPY chrome/script-host/ /opt/browser-runtime-bundles/opencli-default/1/extensions/opencli-script-host/
+COPY chrome/script-host-v1.2/ /opt/browser-runtime-bundles/opencli-default/1/extensions/opencli-script-host/
 COPY chrome/extension-src/manifest.json /opt/browser-runtime-bundles/opencli-default/2/extensions/opencli-browser-bridge/manifest.json
 COPY chrome/extension-src/icons/ /opt/browser-runtime-bundles/opencli-default/2/extensions/opencli-browser-bridge/icons/
 COPY chrome/extension-src/dist/background.js /opt/browser-runtime-bundles/opencli-default/2/extensions/opencli-browser-bridge/dist/background.js
-COPY chrome/script-host/ /opt/browser-runtime-bundles/opencli-default/2/extensions/opencli-script-host/
+COPY chrome/script-host-v1.2/ /opt/browser-runtime-bundles/opencli-default/2/extensions/opencli-script-host/
 RUN set -eux; \
     curl -fsSL -o /tmp/violentmonkey.zip https://github.com/violentmonkey/violentmonkey/releases/download/v2.48.0/Violentmonkey-mv3-v2.48.0.zip; \
     echo "583ac595bb698a926eadb6064431fce1108dc2f2adb966ed984738824d2d5a54  /tmp/violentmonkey.zip" | sha256sum -c -; \
@@ -196,6 +196,7 @@ ENV PYTHONPATH=/app \
 
 # Account-login bundle 3 uses the current fixed, locally packaged Script Host rules.
 RUN cp -a /opt/browser-runtime-bundles/opencli-default/2/extensions /opt/browser-runtime-bundles/opencli-default/3/extensions
+COPY chrome/script-host/ /opt/browser-runtime-bundles/opencli-default/3/extensions/opencli-script-host/
 RUN cp -a /opt/browser-runtime-bundles/opencli-default/3/extensions /opt/browser-runtime-bundles/opencli-default/4/extensions
 COPY chrome/platform-login-bundle4/ /opt/browser-runtime-bundles/opencli-default/4/extensions/opencli-script-host/
 

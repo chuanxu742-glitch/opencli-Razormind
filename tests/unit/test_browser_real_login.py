@@ -64,7 +64,7 @@ def observation(state, evidence="unknown", at="one"):
 
 @pytest.mark.asyncio
 async def test_observer_deduplicates_while_waiting_then_stops_on_valid_identity():
-    admitted = SimpleNamespace(claim=SimpleNamespace(epoch=1))
+    admitted = SimpleNamespace(claim=SimpleNamespace(epoch=1), session=SimpleNamespace(purpose="login"))
     observe = AsyncMock(
         side_effect=[
             observation("presenting"),
@@ -81,7 +81,7 @@ async def test_observer_deduplicates_while_waiting_then_stops_on_valid_identity(
 
 @pytest.mark.asyncio
 async def test_observer_discards_result_if_lease_revoked_during_read():
-    admitted = SimpleNamespace(claim=SimpleNamespace(epoch=1))
+    admitted = SimpleNamespace(claim=SimpleNamespace(epoch=1), session=SimpleNamespace(purpose="login"))
     current = iter([admitted, None])
     send = AsyncMock()
     await observe_until_terminal(
@@ -94,7 +94,7 @@ async def test_observer_discards_result_if_lease_revoked_during_read():
 
 @pytest.mark.asyncio
 async def test_observer_closed_session_does_not_poll_again():
-    admitted = SimpleNamespace(claim=SimpleNamespace(epoch=1))
+    admitted = SimpleNamespace(claim=SimpleNamespace(epoch=1), session=SimpleNamespace(purpose="login"))
     observe = AsyncMock(return_value=observation("closed"))
     await observe_until_terminal(
         current=lambda: admitted, observe=observe, send=AsyncMock(), sleep=AsyncMock()

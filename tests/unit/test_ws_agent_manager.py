@@ -827,6 +827,7 @@ async def test_agent_event_rejects_foreign_socket_before_persist_or_ack(monkeypa
     foreign = AsyncMock()
     monkeypatch.setitem(mgr._connections, "owner-agent", owner)
     monkeypatch.setitem(mgr._agent_task_callbacks, "owned-request", (callback, "owner-agent"))
+    monkeypatch.setitem(mgr._task_owners, "owned-request", owner)
     frame = {"event": {"type": "evidence"}, "ack_required": True, "event_id": "event-1"}
     await mgr.resolve_agent_event("owned-request", frame, source_ws=foreign)
     callback.assert_not_awaited()

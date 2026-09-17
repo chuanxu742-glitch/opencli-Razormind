@@ -1,6 +1,6 @@
 version: 1
 source: backend.main.app.openapi
-openapi_operation_count: 349
+openapi_operation_count: 426
 
 allowed_dispositions:
 - operator_ui
@@ -266,6 +266,15 @@ capability_groups:
   workflow_node_ids: []
 - capability_id: operator.browser-accounts
   label: 浏览器账号与登录会话
+  projection: operator_resource
+  distribution: builtin
+  lifecycle: active
+  owner: opencli-admin
+  wrapper_names: []
+  workflow_node_ids: []
+
+- capability_id: operator.knowledge
+  label: 知识库与品牌上下文
   projection: operator_resource
   distribution: builtin
   lifecycle: active
@@ -3541,6 +3550,574 @@ operations:
   target_epic: Browser Spaces
   decision: List authorized available browser instances for the workspace space picker.
   capability_id: operator.workspace-governance
+
+- method: DELETE
+  path: /api/v1/platform-browser-accounts/{account_id}
+  operation_id: remove_account_api_v1_platform_browser_accounts__account_id__delete
+  disposition: operator_ui
+  frontend_route: /platform-browser-accounts
+  wrapper: null
+  decision: Manage platform login profiles separately from workspace-fenced accounts.
+  target_epic: Epic 5
+  capability_id: operator.browser-accounts
+- method: DELETE
+  path: /api/v1/workspaces/{workspace_id}/brands/{brand_id}/projects/{project_id}
+  operation_id: unclassify_project_api_v1_workspaces__workspace_id__brands__brand_id__projects__project_id__delete
+  disposition: operator_ui
+  frontend_route: /knowledge
+  wrapper: null
+  decision: Manage workspace knowledge and brand context through the knowledge surface.
+  target_epic: Epic 5
+  capability_id: operator.knowledge
+- method: DELETE
+  path: /api/v1/workspaces/{workspace_id}/browser-accounts/{account_id}
+  operation_id: delete_browser_account_api_v1_workspaces__workspace_id__browser_accounts__account_id__delete
+  disposition: operator_ui
+  frontend_route: /browser-accounts
+  wrapper: null
+  decision: Manage workspace-owned account login and fenced browser access.
+  target_epic: Epic 5
+  capability_id: operator.browser-accounts
+- method: DELETE
+  path: /api/v1/workspaces/{workspace_id}/projects/{project_id}/knowledge-libraries/{library_id}
+  operation_id: delete_project_binding_api_v1_workspaces__workspace_id__projects__project_id__knowledge_libraries__library_id__delete
+  disposition: operator_ui
+  frontend_route: /knowledge
+  wrapper: null
+  decision: Manage workspace knowledge and brand context through the knowledge surface.
+  target_epic: Epic 5
+  capability_id: operator.knowledge
+- method: GET
+  path: /api/v1/chat/options
+  operation_id: chat_options_api_v1_chat_options_get
+  disposition: studio_binding
+  frontend_route: /studio
+  wrapper: null
+  decision: Use the Studio run and conversation surface for scoped research, evidence and terminal operations.
+  target_epic: Epic 8
+  capability_id: studio.workflow
+- method: GET
+  path: /api/v1/chat/sessions/{conversation_id}/terminal
+  operation_id: get_terminal_session_api_v1_chat_sessions__conversation_id__terminal_get
+  disposition: studio_binding
+  frontend_route: /studio
+  wrapper: null
+  decision: Use the Studio run and conversation surface for scoped research, evidence and terminal operations.
+  target_epic: Epic 8
+  capability_id: studio.workflow
+- method: GET
+  path: /api/v1/geo-observations
+  operation_id: list_observations_api_v1_geo_observations_get
+  disposition: studio_binding
+  frontend_route: /studio
+  wrapper: null
+  decision: Use the Studio run and conversation surface for scoped research, evidence and terminal operations.
+  target_epic: Epic 8
+  capability_id: studio.workflow
+- method: GET
+  path: /api/v1/platform-browser-accounts
+  operation_id: list_accounts_api_v1_platform_browser_accounts_get
+  disposition: operator_ui
+  frontend_route: /platform-browser-accounts
+  wrapper: null
+  decision: Manage platform login profiles separately from workspace-fenced accounts.
+  target_epic: Epic 5
+  capability_id: operator.browser-accounts
+- method: GET
+  path: /api/v1/platform-browser-accounts/websites
+  operation_id: website_shortcuts_api_v1_platform_browser_accounts_websites_get
+  disposition: operator_ui
+  frontend_route: /platform-browser-accounts
+  wrapper: null
+  decision: Manage platform login profiles separately from workspace-fenced accounts.
+  target_epic: Epic 5
+  capability_id: operator.browser-accounts
+- method: GET
+  path: /api/v1/platform-browser-accounts/{account_id}/frame
+  operation_id: login_frame_api_v1_platform_browser_accounts__account_id__frame_get
+  disposition: operator_ui
+  frontend_route: /platform-browser-accounts
+  wrapper: null
+  decision: Manage platform login profiles separately from workspace-fenced accounts.
+  target_epic: Epic 5
+  capability_id: operator.browser-accounts
+- method: GET
+  path: /api/v1/workspaces/{workspace_id}/brands
+  operation_id: list_brands_api_v1_workspaces__workspace_id__brands_get
+  disposition: operator_ui
+  frontend_route: /knowledge
+  wrapper: null
+  decision: Manage workspace knowledge and brand context through the knowledge surface.
+  target_epic: Epic 5
+  capability_id: operator.knowledge
+- method: GET
+  path: /api/v1/workspaces/{workspace_id}/brands/{brand_id}/pages
+  operation_id: list_pages_api_v1_workspaces__workspace_id__brands__brand_id__pages_get
+  disposition: operator_ui
+  frontend_route: /knowledge
+  wrapper: null
+  decision: Manage workspace knowledge and brand context through the knowledge surface.
+  target_epic: Epic 5
+  capability_id: operator.knowledge
+- method: GET
+  path: /api/v1/workspaces/{workspace_id}/brands/{brand_id}/pages/{page_id}
+  operation_id: read_page_api_v1_workspaces__workspace_id__brands__brand_id__pages__page_id__get
+  disposition: operator_ui
+  frontend_route: /knowledge
+  wrapper: null
+  decision: Manage workspace knowledge and brand context through the knowledge surface.
+  target_epic: Epic 5
+  capability_id: operator.knowledge
+- method: GET
+  path: /api/v1/workspaces/{workspace_id}/brands/{brand_id}/pages/{page_id}/download
+  operation_id: download_api_v1_workspaces__workspace_id__brands__brand_id__pages__page_id__download_get
+  disposition: operator_ui
+  frontend_route: /knowledge
+  wrapper: null
+  decision: Manage workspace knowledge and brand context through the knowledge surface.
+  target_epic: Epic 5
+  capability_id: operator.knowledge
+- method: GET
+  path: /api/v1/workspaces/{workspace_id}/brands/{brand_id}/pages/{page_id}/revisions
+  operation_id: revisions_api_v1_workspaces__workspace_id__brands__brand_id__pages__page_id__revisions_get
+  disposition: operator_ui
+  frontend_route: /knowledge
+  wrapper: null
+  decision: Manage workspace knowledge and brand context through the knowledge surface.
+  target_epic: Epic 5
+  capability_id: operator.knowledge
+- method: GET
+  path: /api/v1/workspaces/{workspace_id}/brands/{brand_id}/products
+  operation_id: list_products_api_v1_workspaces__workspace_id__brands__brand_id__products_get
+  disposition: operator_ui
+  frontend_route: /knowledge
+  wrapper: null
+  decision: Manage workspace knowledge and brand context through the knowledge surface.
+  target_epic: Epic 5
+  capability_id: operator.knowledge
+- method: GET
+  path: /api/v1/workspaces/{workspace_id}/brands/{brand_id}/projects
+  operation_id: project_scopes_api_v1_workspaces__workspace_id__brands__brand_id__projects_get
+  disposition: operator_ui
+  frontend_route: /knowledge
+  wrapper: null
+  decision: Manage workspace knowledge and brand context through the knowledge surface.
+  target_epic: Epic 5
+  capability_id: operator.knowledge
+- method: GET
+  path: /api/v1/workspaces/{workspace_id}/brands/{brand_id}/search
+  operation_id: search_api_v1_workspaces__workspace_id__brands__brand_id__search_get
+  disposition: operator_ui
+  frontend_route: /knowledge
+  wrapper: null
+  decision: Manage workspace knowledge and brand context through the knowledge surface.
+  target_epic: Epic 5
+  capability_id: operator.knowledge
+- method: GET
+  path: /api/v1/workspaces/{workspace_id}/browser-accounts/login-options
+  operation_id: get_browser_account_login_options_api_v1_workspaces__workspace_id__browser_accounts_login_options_get
+  disposition: operator_ui
+  frontend_route: /browser-accounts
+  wrapper: null
+  decision: Manage workspace-owned account login and fenced browser access.
+  target_epic: Epic 5
+  capability_id: operator.browser-accounts
+- method: GET
+  path: /api/v1/workspaces/{workspace_id}/browser-accounts/native-window-support
+  operation_id: get_browser_native_window_support_api_v1_workspaces__workspace_id__browser_accounts_native_window_support_get
+  disposition: operator_ui
+  frontend_route: /browser-accounts
+  wrapper: null
+  decision: Manage workspace-owned account login and fenced browser access.
+  target_epic: Epic 5
+  capability_id: operator.browser-accounts
+- method: GET
+  path: /api/v1/workspaces/{workspace_id}/browser-accounts/{account_id}/login-readiness
+  operation_id: get_browser_account_login_readiness_api_v1_workspaces__workspace_id__browser_accounts__account_id__login_readiness_get
+  disposition: operator_ui
+  frontend_route: /browser-accounts
+  wrapper: null
+  decision: Manage workspace-owned account login and fenced browser access.
+  target_epic: Epic 5
+  capability_id: operator.browser-accounts
+- method: GET
+  path: /api/v1/workspaces/{workspace_id}/knowledge-libraries
+  operation_id: list_libraries_api_v1_workspaces__workspace_id__knowledge_libraries_get
+  disposition: operator_ui
+  frontend_route: /knowledge
+  wrapper: null
+  decision: Manage workspace knowledge and brand context through the knowledge surface.
+  target_epic: Epic 5
+  capability_id: operator.knowledge
+- method: GET
+  path: /api/v1/workspaces/{workspace_id}/knowledge-libraries/{library_id}/pages
+  operation_id: list_pages_api_v1_workspaces__workspace_id__knowledge_libraries__library_id__pages_get
+  disposition: operator_ui
+  frontend_route: /knowledge
+  wrapper: null
+  decision: Manage workspace knowledge and brand context through the knowledge surface.
+  target_epic: Epic 5
+  capability_id: operator.knowledge
+- method: GET
+  path: /api/v1/workspaces/{workspace_id}/knowledge-libraries/{library_id}/pages/{page_id}
+  operation_id: read_page_api_v1_workspaces__workspace_id__knowledge_libraries__library_id__pages__page_id__get
+  disposition: operator_ui
+  frontend_route: /knowledge
+  wrapper: null
+  decision: Manage workspace knowledge and brand context through the knowledge surface.
+  target_epic: Epic 5
+  capability_id: operator.knowledge
+- method: GET
+  path: /api/v1/workspaces/{workspace_id}/knowledge-libraries/{library_id}/pages/{page_id}/download
+  operation_id: download_api_v1_workspaces__workspace_id__knowledge_libraries__library_id__pages__page_id__download_get
+  disposition: operator_ui
+  frontend_route: /knowledge
+  wrapper: null
+  decision: Manage workspace knowledge and brand context through the knowledge surface.
+  target_epic: Epic 5
+  capability_id: operator.knowledge
+- method: GET
+  path: /api/v1/workspaces/{workspace_id}/knowledge-libraries/{library_id}/pages/{page_id}/revisions
+  operation_id: revisions_api_v1_workspaces__workspace_id__knowledge_libraries__library_id__pages__page_id__revisions_get
+  disposition: operator_ui
+  frontend_route: /knowledge
+  wrapper: null
+  decision: Manage workspace knowledge and brand context through the knowledge surface.
+  target_epic: Epic 5
+  capability_id: operator.knowledge
+- method: GET
+  path: /api/v1/workspaces/{workspace_id}/knowledge-libraries/{library_id}/search
+  operation_id: search_api_v1_workspaces__workspace_id__knowledge_libraries__library_id__search_get
+  disposition: operator_ui
+  frontend_route: /knowledge
+  wrapper: null
+  decision: Manage workspace knowledge and brand context through the knowledge surface.
+  target_epic: Epic 5
+  capability_id: operator.knowledge
+- method: GET
+  path: /api/v1/workspaces/{workspace_id}/projects/{project_id}/agent-data/capabilities
+  operation_id: capabilities_api_v1_workspaces__workspace_id__projects__project_id__agent_data_capabilities_get
+  disposition: studio_binding
+  frontend_route: /studio
+  wrapper: null
+  decision: Use the Studio run and conversation surface for scoped research, evidence and terminal operations.
+  target_epic: Epic 8
+  capability_id: studio.workflow
+- method: GET
+  path: /api/v1/workspaces/{workspace_id}/projects/{project_id}/agent-data/context
+  operation_id: search_context_api_v1_workspaces__workspace_id__projects__project_id__agent_data_context_get
+  disposition: studio_binding
+  frontend_route: /studio
+  wrapper: null
+  decision: Use the Studio run and conversation surface for scoped research, evidence and terminal operations.
+  target_epic: Epic 8
+  capability_id: studio.workflow
+- method: GET
+  path: /api/v1/workspaces/{workspace_id}/projects/{project_id}/agent-data/records
+  operation_id: list_records_api_v1_workspaces__workspace_id__projects__project_id__agent_data_records_get
+  disposition: studio_binding
+  frontend_route: /studio
+  wrapper: null
+  decision: Use the Studio run and conversation surface for scoped research, evidence and terminal operations.
+  target_epic: Epic 8
+  capability_id: studio.workflow
+- method: GET
+  path: /api/v1/workspaces/{workspace_id}/projects/{project_id}/knowledge-libraries
+  operation_id: list_project_bindings_api_v1_workspaces__workspace_id__projects__project_id__knowledge_libraries_get
+  disposition: operator_ui
+  frontend_route: /knowledge
+  wrapper: null
+  decision: Manage workspace knowledge and brand context through the knowledge surface.
+  target_epic: Epic 5
+  capability_id: operator.knowledge
+- method: GET
+  path: /api/v1/workspaces/{workspace_id}/projects/{project_id}/research/readiness
+  operation_id: get_readiness_api_v1_workspaces__workspace_id__projects__project_id__research_readiness_get
+  disposition: studio_binding
+  frontend_route: /studio
+  wrapper: null
+  decision: Use the Studio run and conversation surface for scoped research, evidence and terminal operations.
+  target_epic: Epic 8
+  capability_id: studio.workflow
+- method: GET
+  path: /api/v1/workspaces/{workspace_id}/projects/{project_id}/research/runs
+  operation_id: list_runs_api_v1_workspaces__workspace_id__projects__project_id__research_runs_get
+  disposition: studio_binding
+  frontend_route: /studio
+  wrapper: null
+  decision: Use the Studio run and conversation surface for scoped research, evidence and terminal operations.
+  target_epic: Epic 8
+  capability_id: studio.workflow
+- method: GET
+  path: /api/v1/workspaces/{workspace_id}/projects/{project_id}/research/runs/{run_id}
+  operation_id: get_run_api_v1_workspaces__workspace_id__projects__project_id__research_runs__run_id__get
+  disposition: studio_binding
+  frontend_route: /studio
+  wrapper: null
+  decision: Use the Studio run and conversation surface for scoped research, evidence and terminal operations.
+  target_epic: Epic 8
+  capability_id: studio.workflow
+- method: PATCH
+  path: /api/v1/platform-browser-accounts/{account_id}
+  operation_id: rename_account_api_v1_platform_browser_accounts__account_id__patch
+  disposition: operator_ui
+  frontend_route: /platform-browser-accounts
+  wrapper: null
+  decision: Manage platform login profiles separately from workspace-fenced accounts.
+  target_epic: Epic 5
+  capability_id: operator.browser-accounts
+- method: PATCH
+  path: /api/v1/workspaces/{workspace_id}/brands/{brand_id}/pages/{page_id}
+  operation_id: edit_page_api_v1_workspaces__workspace_id__brands__brand_id__pages__page_id__patch
+  disposition: operator_ui
+  frontend_route: /knowledge
+  wrapper: null
+  decision: Manage workspace knowledge and brand context through the knowledge surface.
+  target_epic: Epic 5
+  capability_id: operator.knowledge
+- method: PATCH
+  path: /api/v1/workspaces/{workspace_id}/knowledge-libraries/{library_id}/pages/{page_id}
+  operation_id: edit_page_api_v1_workspaces__workspace_id__knowledge_libraries__library_id__pages__page_id__patch
+  disposition: operator_ui
+  frontend_route: /knowledge
+  wrapper: null
+  decision: Manage workspace knowledge and brand context through the knowledge surface.
+  target_epic: Epic 5
+  capability_id: operator.knowledge
+- method: POST
+  path: /api/v1/chat/sessions/{conversation_id}/cancel
+  operation_id: cancel_session_turn_api_v1_chat_sessions__conversation_id__cancel_post
+  disposition: studio_binding
+  frontend_route: /studio
+  wrapper: null
+  decision: Use the Studio run and conversation surface for scoped research, evidence and terminal operations.
+  target_epic: Epic 8
+  capability_id: studio.workflow
+- method: POST
+  path: /api/v1/chat/sessions/{conversation_id}/terminal
+  operation_id: create_terminal_session_api_v1_chat_sessions__conversation_id__terminal_post
+  disposition: studio_binding
+  frontend_route: /studio
+  wrapper: null
+  decision: Use the Studio run and conversation surface for scoped research, evidence and terminal operations.
+  target_epic: Epic 8
+  capability_id: studio.workflow
+- method: POST
+  path: /api/v1/chat/sessions/{conversation_id}/terminal/stop
+  operation_id: stop_terminal_session_api_v1_chat_sessions__conversation_id__terminal_stop_post
+  disposition: studio_binding
+  frontend_route: /studio
+  wrapper: null
+  decision: Use the Studio run and conversation surface for scoped research, evidence and terminal operations.
+  target_epic: Epic 8
+  capability_id: studio.workflow
+- method: POST
+  path: /api/v1/chat/sessions/{conversation_id}/terminal/ticket
+  operation_id: create_terminal_ticket_api_v1_chat_sessions__conversation_id__terminal_ticket_post
+  disposition: studio_binding
+  frontend_route: /studio
+  wrapper: null
+  decision: Use the Studio run and conversation surface for scoped research, evidence and terminal operations.
+  target_epic: Epic 8
+  capability_id: studio.workflow
+- method: POST
+  path: /api/v1/platform-browser-accounts
+  operation_id: create_account_api_v1_platform_browser_accounts_post
+  disposition: operator_ui
+  frontend_route: /platform-browser-accounts
+  wrapper: null
+  decision: Manage platform login profiles separately from workspace-fenced accounts.
+  target_epic: Epic 5
+  capability_id: operator.browser-accounts
+- method: POST
+  path: /api/v1/platform-browser-accounts/{account_id}/confirmation
+  operation_id: confirm_account_api_v1_platform_browser_accounts__account_id__confirmation_post
+  disposition: operator_ui
+  frontend_route: /platform-browser-accounts
+  wrapper: null
+  decision: Manage platform login profiles separately from workspace-fenced accounts.
+  target_epic: Epic 5
+  capability_id: operator.browser-accounts
+- method: POST
+  path: /api/v1/platform-browser-accounts/{account_id}/input
+  operation_id: login_input_api_v1_platform_browser_accounts__account_id__input_post
+  disposition: operator_ui
+  frontend_route: /platform-browser-accounts
+  wrapper: null
+  decision: Manage platform login profiles separately from workspace-fenced accounts.
+  target_epic: Epic 5
+  capability_id: operator.browser-accounts
+- method: POST
+  path: /api/v1/platform-browser-accounts/{account_id}/login
+  operation_id: open_login_api_v1_platform_browser_accounts__account_id__login_post
+  disposition: operator_ui
+  frontend_route: /platform-browser-accounts
+  wrapper: null
+  decision: Manage platform login profiles separately from workspace-fenced accounts.
+  target_epic: Epic 5
+  capability_id: operator.browser-accounts
+- method: POST
+  path: /api/v1/platform-browser-accounts/{account_id}/restore
+  operation_id: restore_account_api_v1_platform_browser_accounts__account_id__restore_post
+  disposition: operator_ui
+  frontend_route: /platform-browser-accounts
+  wrapper: null
+  decision: Manage platform login profiles separately from workspace-fenced accounts.
+  target_epic: Epic 5
+  capability_id: operator.browser-accounts
+- method: POST
+  path: /api/v1/workspaces/{workspace_id}/brands
+  operation_id: create_brand_api_v1_workspaces__workspace_id__brands_post
+  disposition: operator_ui
+  frontend_route: /knowledge
+  wrapper: null
+  decision: Manage workspace knowledge and brand context through the knowledge surface.
+  target_epic: Epic 5
+  capability_id: operator.knowledge
+- method: POST
+  path: /api/v1/workspaces/{workspace_id}/brands/{brand_id}/ask
+  operation_id: ask_api_v1_workspaces__workspace_id__brands__brand_id__ask_post
+  disposition: operator_ui
+  frontend_route: /knowledge
+  wrapper: null
+  decision: Manage workspace knowledge and brand context through the knowledge surface.
+  target_epic: Epic 5
+  capability_id: operator.knowledge
+- method: POST
+  path: /api/v1/workspaces/{workspace_id}/brands/{brand_id}/pages
+  operation_id: create_page_api_v1_workspaces__workspace_id__brands__brand_id__pages_post
+  disposition: operator_ui
+  frontend_route: /knowledge
+  wrapper: null
+  decision: Manage workspace knowledge and brand context through the knowledge surface.
+  target_epic: Epic 5
+  capability_id: operator.knowledge
+- method: POST
+  path: /api/v1/workspaces/{workspace_id}/brands/{brand_id}/pages/{page_id}/summarize
+  operation_id: summarize_api_v1_workspaces__workspace_id__brands__brand_id__pages__page_id__summarize_post
+  disposition: operator_ui
+  frontend_route: /knowledge
+  wrapper: null
+  decision: Manage workspace knowledge and brand context through the knowledge surface.
+  target_epic: Epic 5
+  capability_id: operator.knowledge
+- method: POST
+  path: /api/v1/workspaces/{workspace_id}/brands/{brand_id}/products
+  operation_id: create_product_api_v1_workspaces__workspace_id__brands__brand_id__products_post
+  disposition: operator_ui
+  frontend_route: /knowledge
+  wrapper: null
+  decision: Manage workspace knowledge and brand context through the knowledge surface.
+  target_epic: Epic 5
+  capability_id: operator.knowledge
+- method: POST
+  path: /api/v1/workspaces/{workspace_id}/brands/{brand_id}/upload
+  operation_id: upload_api_v1_workspaces__workspace_id__brands__brand_id__upload_post
+  disposition: operator_ui
+  frontend_route: /knowledge
+  wrapper: null
+  decision: Manage workspace knowledge and brand context through the knowledge surface.
+  target_epic: Epic 5
+  capability_id: operator.knowledge
+- method: POST
+  path: /api/v1/workspaces/{workspace_id}/browser-accounts/{account_id}/login-sessions/{session_id}/browser-grant
+  operation_id: issue_browser_desktop_grant_api_v1_workspaces__workspace_id__browser_accounts__account_id__login_sessions__session_id__browser_grant_post
+  disposition: operator_ui
+  frontend_route: /browser-accounts
+  wrapper: null
+  decision: Manage workspace-owned account login and fenced browser access.
+  target_epic: Epic 5
+  capability_id: operator.browser-accounts
+- method: POST
+  path: /api/v1/workspaces/{workspace_id}/browser-accounts/{account_id}/login-sessions/{session_id}/native-window
+  operation_id: open_account_browser_native_window_api_v1_workspaces__workspace_id__browser_accounts__account_id__login_sessions__session_id__native_window_post
+  disposition: operator_ui
+  frontend_route: /browser-accounts
+  wrapper: null
+  decision: Manage workspace-owned account login and fenced browser access.
+  target_epic: Epic 5
+  capability_id: operator.browser-accounts
+- method: POST
+  path: /api/v1/workspaces/{workspace_id}/browser-spaces/{space_id}/control
+  operation_id: change_browser_space_control_api_v1_workspaces__workspace_id__browser_spaces__space_id__control_post
+  disposition: operator_ui
+  frontend_route: /nodes
+  wrapper: null
+  decision: Control the managed browser space through the node operator surface.
+  target_epic: Epic 5
+  capability_id: setup.nodes
+- method: POST
+  path: /api/v1/workspaces/{workspace_id}/knowledge-libraries
+  operation_id: create_library_api_v1_workspaces__workspace_id__knowledge_libraries_post
+  disposition: operator_ui
+  frontend_route: /knowledge
+  wrapper: null
+  decision: Manage workspace knowledge and brand context through the knowledge surface.
+  target_epic: Epic 5
+  capability_id: operator.knowledge
+- method: POST
+  path: /api/v1/workspaces/{workspace_id}/knowledge-libraries/{library_id}/ask
+  operation_id: ask_api_v1_workspaces__workspace_id__knowledge_libraries__library_id__ask_post
+  disposition: operator_ui
+  frontend_route: /knowledge
+  wrapper: null
+  decision: Manage workspace knowledge and brand context through the knowledge surface.
+  target_epic: Epic 5
+  capability_id: operator.knowledge
+- method: POST
+  path: /api/v1/workspaces/{workspace_id}/knowledge-libraries/{library_id}/pages
+  operation_id: create_page_api_v1_workspaces__workspace_id__knowledge_libraries__library_id__pages_post
+  disposition: operator_ui
+  frontend_route: /knowledge
+  wrapper: null
+  decision: Manage workspace knowledge and brand context through the knowledge surface.
+  target_epic: Epic 5
+  capability_id: operator.knowledge
+- method: POST
+  path: /api/v1/workspaces/{workspace_id}/knowledge-libraries/{library_id}/pages/{page_id}/summarize
+  operation_id: summarize_api_v1_workspaces__workspace_id__knowledge_libraries__library_id__pages__page_id__summarize_post
+  disposition: operator_ui
+  frontend_route: /knowledge
+  wrapper: null
+  decision: Manage workspace knowledge and brand context through the knowledge surface.
+  target_epic: Epic 5
+  capability_id: operator.knowledge
+- method: POST
+  path: /api/v1/workspaces/{workspace_id}/knowledge-libraries/{library_id}/upload
+  operation_id: upload_api_v1_workspaces__workspace_id__knowledge_libraries__library_id__upload_post
+  disposition: operator_ui
+  frontend_route: /knowledge
+  wrapper: null
+  decision: Manage workspace knowledge and brand context through the knowledge surface.
+  target_epic: Epic 5
+  capability_id: operator.knowledge
+- method: POST
+  path: /api/v1/workspaces/{workspace_id}/projects/{project_id}/research/runs
+  operation_id: start_run_api_v1_workspaces__workspace_id__projects__project_id__research_runs_post
+  disposition: studio_binding
+  frontend_route: /studio
+  wrapper: null
+  decision: Use the Studio run and conversation surface for scoped research, evidence and terminal operations.
+  target_epic: Epic 8
+  capability_id: studio.workflow
+- method: PUT
+  path: /api/v1/workspaces/{workspace_id}/brands/{brand_id}/projects/{project_id}
+  operation_id: classify_project_api_v1_workspaces__workspace_id__brands__brand_id__projects__project_id__put
+  disposition: operator_ui
+  frontend_route: /knowledge
+  wrapper: null
+  decision: Manage workspace knowledge and brand context through the knowledge surface.
+  target_epic: Epic 5
+  capability_id: operator.knowledge
+- method: PUT
+  path: /api/v1/workspaces/{workspace_id}/projects/{project_id}/knowledge-libraries/{library_id}
+  operation_id: put_project_binding_api_v1_workspaces__workspace_id__projects__project_id__knowledge_libraries__library_id__put
+  disposition: operator_ui
+  frontend_route: /knowledge
+  wrapper: null
+  decision: Manage workspace knowledge and brand context through the knowledge surface.
+  target_epic: Epic 5
+  capability_id: operator.knowledge
 
 unreferenced_wrappers:
 - wrapper: invokeBrowserCapability

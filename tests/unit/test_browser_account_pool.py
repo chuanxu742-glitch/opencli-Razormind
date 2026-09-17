@@ -90,7 +90,7 @@ async def test_redis_rechecks_new_space_reservation_after_leasing_and_releases(m
 async def test_reservations_are_read_from_durable_database(db_session, monkeypatch):
     from backend import database
     from backend.models.browser import BrowserInstance
-    from backend.models.browser_account import BrowserAccount
+    from backend.models.browser_account import PlatformBrowserAccount as BrowserAccount
 
     instance = BrowserInstance(endpoint="account", profile_name="account")
     db_session.add(instance)

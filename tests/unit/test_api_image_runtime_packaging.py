@@ -6,6 +6,13 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 
 
+class ComposeLoader(yaml.SafeLoader):
+    """Read Compose's explicit sequence replacement tag."""
+
+
+ComposeLoader.add_constructor("!override", lambda loader, node: loader.construct_sequence(node))
+
+
 def _docker_stages(source: str) -> list[tuple[str, str, str]]:
     headers = list(
         re.finditer(r"^FROM\s+(.+?)\s+AS\s+([\w-]+)\s*$", source, flags=re.MULTILINE)
@@ -55,7 +62,7 @@ def test_acceptance_target_retains_fixture_tools_and_compose_targets_production(
     assert "OPENCLI_BIN=/opt/non-bypass/opencli-proof" in acceptance
     assert "III_CLI_PATH=/opt/iii/iii" in acceptance
 
-    compose = yaml.safe_load((ROOT / "docker-compose.build.yml").read_text(encoding="utf-8"))
+    compose = yaml.load((ROOT / "docker-compose.build.yml").read_text(encoding="utf-8"), Loader=ComposeLoader)
     for service in ("api", "worker", "beat"):
         assert compose["services"][service]["build"]["target"] == "production"
 
