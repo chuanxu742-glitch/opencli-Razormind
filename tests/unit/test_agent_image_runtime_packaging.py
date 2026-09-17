@@ -232,6 +232,7 @@ def test_vnc_agent_image_is_the_registered_browser_bridge_runtime():
     assert "https://www.doubao.com/chat" in entrypoint
     assert "AGENT_MODE: ${AGENT_MODE:-bridge}" in compose
     assert "AGENT_REGISTER: ${AGENT_REGISTER:-ws}" in compose
+    assert "CENTRAL_API_URL: ${CENTRAL_API_URL:-http://api:8000}" in compose
     assert "AGENT_ADVERTISE_URL: ${AGENT_ADVERTISE_URL:-http://agent-1:19823}" in compose
     assert "agent_profile_1:${CHROME_PROFILE_DIR:-/home/chrome/.config/chromium}" in compose
     assert "agent_profile:${AGENT_PROFILE_DIR:-/home/agent/.config/chromium}" in compose

@@ -1,12 +1,19 @@
 import argparse
 import sys
-import json
 
 
 def main():
-    sys.stdout.reconfigure(encoding='utf-8', newline='\n')
+    sys.stdout.reconfigure(
+        encoding='utf-8',
+        newline='\n',
+    )
     parser = argparse.ArgumentParser()
-    parser.add_argument('--max-items', type=int, default=0, help='Max items to return, 0 for all')
+    parser.add_argument(
+        '--max-items',
+        type=int,
+        default=0,
+        help='Max items to return, 0 for all',
+    )
     args = parser.parse_args()
 
     max_items = args.max_items
@@ -15,13 +22,26 @@ def main():
 (async function() {{
   try {{
     const pd = window.mosaic && window.mosaic.providerData;
-    if (!pd) return JSON.stringify({{error: true, message: "mosaic.providerData not found - page may not be a valid Indeed search results page"}});
+    if (!pd) return JSON.stringify({{
+      error: true,
+      message: "mosaic.providerData not found - page may not be a valid Indeed search results page"
+    }});
     const jc = pd['mosaic-provider-jobcards'];
-    if (!jc) return JSON.stringify({{error: true, message: "mosaic-provider-jobcards not found in providerData"}});
+    if (!jc) return JSON.stringify({{
+      error: true,
+      message: "mosaic-provider-jobcards not found in providerData"
+    }});
     const model = jc.metaData && jc.metaData.mosaicProviderJobCardsModel;
-    if (!model) return JSON.stringify({{error: true, message: "mosaicProviderJobCardsModel not found"}});
+    if (!model) return JSON.stringify({{
+      error: true,
+      message: "mosaicProviderJobCardsModel not found"
+    }});
     const results = model.results;
-    if (!results || results.length === 0) return JSON.stringify({{error: true, message: "No job results found on this page"}});
+    if (!results || results.length === 0) return JSON.stringify({{
+      error: true,
+      message: "No job results found on this page"
+    }});
+
     const maxItems = {max_items};
     const items = (maxItems > 0 ? results.slice(0, maxItems) : results).map(r => ({{
       id: r.jobkey,
@@ -37,7 +57,9 @@ def main():
       jobType: r.jobTypes && r.jobTypes.length > 0 ? r.jobTypes : null,
       rating: r.companyRating || null,
       reviewsCount: r.companyReviewCount || null,
-      companyLogo: r.companyBrandingAttributes ? r.companyBrandingAttributes.logoUrl : null,
+      companyLogo: r.companyBrandingAttributes
+        ? r.companyBrandingAttributes.logoUrl
+        : null,
       snippet: r.snippet || null,
       sponsored: !!r.sponsored,
       expired: !!r.expired,
@@ -45,7 +67,11 @@ def main():
       url: r.jobkey ? "https://www.indeed.com/viewjob?jk=" + r.jobkey : null,
       externalApplyLink: r.thirdPartyApplyUrl || null
     }}));
-    return JSON.stringify({{pageNumber: model.pageNumber, totalResults: items.length, results: items}});
+    return JSON.stringify({{
+      pageNumber: model.pageNumber,
+      totalResults: items.length,
+      results: items
+    }});
   }} catch(e) {{
     return JSON.stringify({{error: true, message: e.message}});
   }}

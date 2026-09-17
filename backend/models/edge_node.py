@@ -30,16 +30,14 @@ class EdgeNode(TimestampMixin):
     node_type: Mapped[str] = mapped_column(String(20), nullable=False, default="docker")
     # "online" | "offline"
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="offline")
-    last_seen_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Detected outbound IP at last registration
-    ip: Mapped[Optional[str]] = mapped_column(String(45), nullable=True)
+    ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
     # Agent-runtime types advertised at last WS register handshake (e.g. ["pi"]),
     # from backend.agent_runtimes.registry.available_runtimes(). NULL when the
     # node hasn't registered since this field was added, or registered over the
     # HTTP (non-WS) path, which doesn't carry runtime advertisement.
-    runtimes: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    runtimes: Mapped[list | None] = mapped_column(JSON, nullable=True)
     # Per-runtime capability names measured by the edge adapter registry.
     runtime_capabilities: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     # Persistent node fencing identity and current supervised process generation.
@@ -107,5 +105,5 @@ class EdgeNodeEvent(TimestampMixin):
     )
     # "registered" | "online" | "offline"
     event: Mapped[str] = mapped_column(String(50), nullable=False)
-    ip: Mapped[Optional[str]] = mapped_column(String(45), nullable=True)
-    event_meta: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
+    event_meta: Mapped[dict | None] = mapped_column(JSON, nullable=True)

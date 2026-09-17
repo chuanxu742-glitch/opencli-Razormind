@@ -31,6 +31,7 @@ from backend.services.automation_starter_service import (
 
 router = APIRouter(prefix="/workspaces/{workspace_id}/automations", tags=["automations"])
 
+
 @router.get(
     "/starters/preview",
     response_model=ApiResponse[StarterInstallationPreview],
@@ -97,7 +98,9 @@ async def create_automation(
     access = await get_workspace_access(db, workspace_id, identity)
     require_permission(access, WorkspacePermission.MANAGE_AGENT_IDENTITIES)
     row = Automation(
-        workspace_id=workspace_id, created_by_user_id=access.user_id, **body.model_dump()
+        workspace_id=workspace_id,
+        created_by_user_id=access.user_id,
+        **body.model_dump(),
     )
     db.add(row)
     await db.flush()
@@ -121,7 +124,10 @@ async def update_automation(
     require_permission(access, WorkspacePermission.MANAGE_AGENT_IDENTITIES)
     row = await db.scalar(
         select(Automation)
-        .where(Automation.workspace_id == workspace_id, Automation.id == automation_id)
+        .where(
+            Automation.workspace_id == workspace_id,
+            Automation.id == automation_id,
+        )
         .with_for_update()
     )
     if row is None:

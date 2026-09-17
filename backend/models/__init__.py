@@ -1,15 +1,36 @@
 from backend.models.acquisition import AcquisitionExecution, AcquisitionExecutionStatus
 from backend.models.agent import AIAgent
-from backend.models.agent_conversation import AgentConversation, AgentConversationTurn
-from backend.models.automation import Automation
 from backend.models.agent_conversation import (
     AgentConversation,
     AgentConversationStatus,
+    AgentTerminalSession,
+    AgentTerminalSessionStatus,
     AgentConversationTurn,
     AgentConversationTurnStatus,
 )
 from backend.models.agent_run import AgentRun, AgentRunEvent, AgentSession
+from backend.models.analysis_finding import (
+    AnalysisFinding,
+    AnalysisFindingEvidenceMetric,
+    AnalysisFindingEvidenceUnit,
+    AnalysisFindingSelectorKind,
+)
+from backend.models.analysis_snapshot import (
+    AnalysisSnapshotFailureCode,
+    AnalysisSnapshotReceipt,
+    AnalysisSnapshotStatus,
+)
+from backend.models.automation import Automation
 from backend.models.base import TimestampMixin
+from backend.models.brand_knowledge import (
+    Brand,
+    BrandProduct,
+    BrandProjectScope,
+    KnowledgeLibrary,
+    KnowledgePage,
+    KnowledgeRevision,
+    ProjectKnowledgeBinding,
+)
 from backend.models.browser import (
     BrowserAccount,
     BrowserAccountLease,
@@ -30,6 +51,7 @@ from backend.models.browser import (
     ProfileInventoryStatus,
 )
 from backend.models.browser_portal import BrowserPortalOwner, BrowserPortalTicket
+from backend.models.browser_account import PlatformBrowserAccount
 from backend.models.browser_space import (
     BrowserSpace,
     BrowserSpaceEvent,
@@ -43,8 +65,21 @@ from backend.models.browser_space import (
 from backend.models.consumer_grant import ConsumerGrant
 from backend.models.control_action import ControlActionRecord
 from backend.models.cookie_jar import CookieJarEntry
+from backend.models.delivery_authorization import (
+    DeliveryAuthorizationDecisionV1,
+    DeliveryTarget,
+    DeliveryTargetRevision,
+)
 from backend.models.delivery_connection import DeliveryAttempt, DeliveryConnection
 from backend.models.edge_node import EdgeNode, EdgeNodeBoot, EdgeNodeCapacity, EdgeNodeEvent
+from backend.models.delivery_execution import (
+    ControlledReceiverDelivery,
+    ControlledReceiverNonce,
+    DeliveryExecution,
+    DeliveryExecutionReconciliation,
+    DeliveryExecutionResult,
+)
+from backend.models.feed_provider import FeedProvider
 from backend.models.gaojixing_collection import (
     GaojixingCollectionRun,
     GaojixingCollectionRunStatus,
@@ -64,20 +99,6 @@ from backend.models.identity import (
     WorkspaceMembership,
     WorkspaceRole,
 )
-from backend.models.delivery_authorization import (
-    DeliveryAuthorizationDecisionV1,
-    DeliveryTarget,
-    DeliveryTargetRevision,
-)
-from backend.models.delivery_execution import (
-    ControlledReceiverDelivery,
-    ControlledReceiverNonce,
-    DeliveryExecution,
-    DeliveryExecutionReconciliation,
-    DeliveryExecutionResult,
-)
-
-
 from backend.models.iii_collection import (
     EvidenceBatchMaterializationEventV1,
     EvidenceBatchMaterializationManifestV1,
@@ -155,11 +176,23 @@ from backend.models.workflow import Project, Workflow, WorkflowDraft, WorkflowVe
 from backend.models.workflow_run import WorkflowRun, WorkflowRunEvent
 
 __all__ = [
+    "Brand",
+    "BrandProduct",
+    "BrandProjectScope",
+    "KnowledgePage",
+    "KnowledgeRevision",
     "TimestampMixin",
     "AcquisitionExecution",
     "AcquisitionExecutionStatus",
     "AgentConversation",
     "AgentConversationTurn",
+    "AnalysisFinding",
+    "AnalysisFindingEvidenceMetric",
+    "AnalysisFindingEvidenceUnit",
+    "AnalysisFindingSelectorKind",
+    "AnalysisSnapshotFailureCode",
+    "AnalysisSnapshotReceipt",
+    "AnalysisSnapshotStatus",
     "AIAgent",
     "AgentConversation",
     "AgentConversationStatus",
@@ -226,6 +259,8 @@ __all__ = [
     "IntelligenceOutbox",
     "IIICollectionCommandV1",
     "DeliveryTarget",
+    "IIICollectionExpectedKeyReportV1",
+    "IIICollectionIngressReceiptV1",
     "DeliveryTargetRevision",
     "DeliveryAuthorizationDecisionV1",
     "DeliveryExecution",
@@ -240,6 +275,8 @@ __all__ = [
     "EvidenceBatchMaterializationEventV1",
     "CanvasDocument",
     "CanvasSnapshot",
+    "IIICollectionExpectedKeyReportV1",
+    "IIICollectionIngressReceiptV1",
     "MediaAsset",
     "ImageGenerationJob",
     "ImageGenerationJobStatus",
@@ -267,6 +304,8 @@ __all__ = [
     "SourceCursor",
     "SourceMeasurement",
     "StudioWorkspace",
+    "KnowledgeLibrary",
+    "ProjectKnowledgeBinding",
     "StudioProject",
     "StudioWorkflow",
     "StudioWorkflowDraft",

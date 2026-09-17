@@ -8,9 +8,9 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from iii_observability import Logger
 
 from iii import InitOptions, register_worker
-from iii_observability import Logger
 
 III_ROOT = Path(__file__).resolve().parents[2]
 if str(III_ROOT) not in sys.path:
@@ -48,7 +48,10 @@ def _emit_ingress_receipt(receipt: dict[str, Any]) -> None:
         headers["x-iii-bridge-token"] = bridge_token
     try:
         response = httpx.post(
-            _admin_callback_url("ingress-receipts"), json=receipt, headers=headers, timeout=10.0
+            _admin_callback_url("ingress-receipts"),
+            json=receipt,
+            headers=headers,
+            timeout=10.0,
         )
         response.raise_for_status()
     except httpx.HTTPError as exc:
@@ -76,7 +79,9 @@ def batch_handler(payload: dict[str, Any]) -> dict[str, Any]:
     metadata = payload.get("admin_collection")
     receipt_context: dict[str, Any] | None = None
     if metadata is not None:
-        if not isinstance(metadata, dict) or not isinstance(metadata.get("expected_key_set_sha256"), str):
+        if not isinstance(metadata, dict) or not isinstance(
+            metadata.get("expected_key_set_sha256"), str
+        ):
             raise ValueError("governed ingress requires immutable receipt context")
         receipt_context = dict(metadata)
 
@@ -94,7 +99,13 @@ def single_handler(payload: dict[str, Any]) -> dict[str, Any]:
     event = payload.get("event")
     if not isinstance(event, dict):
         raise ValueError("event must be an object")
-    return batch_handler({"events": [event], "trace_id": payload.get("trace_id"), "task_id": payload.get("task_id")})
+    return batch_handler(
+        {
+            "events": [event],
+            "trace_id": payload.get("trace_id"),
+            "task_id": payload.get("task_id"),
+        }
+    )
 
 
 def health_handler(_payload: dict[str, Any]) -> dict[str, Any]:

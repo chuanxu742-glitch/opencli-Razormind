@@ -4,16 +4,16 @@ import { test } from 'node:test'
 
 const read = (path) => readFile(new URL(`../${path}`, import.meta.url), 'utf8')
 
-test('Next View Transition integration is enabled and stays locally opt-in', async () => {
-  const [config, localTransition, shell, routeTransition] = await Promise.all([
+test('persistent chrome cannot start native root snapshots alongside SSGOI', async () => {
+  const [config, themeToggle, shell, routeTransition] = await Promise.all([
     read('next.config.mjs'),
-    read('components/motion/local-view-transition.tsx'),
+    read('components/shell/theme-toggle.tsx'),
     read('components/shell/app-shell.tsx'),
     read('components/motion/app-route-transition.tsx'),
   ])
 
   assert.doesNotMatch(config, /viewTransition/)
-  assert.match(localTransition, /<ViewTransition name=\{name\}>/)
+  assert.doesNotMatch(themeToggle, /ViewTransition|startTransition/)
   assert.doesNotMatch(shell, /<ViewTransition\b/)
   assert.doesNotMatch(routeTransition, /<ViewTransition\b/)
 })
@@ -42,7 +42,6 @@ test('sidebar keeps automation separate from Agent surfaces', async () => {
     '概览',
     '任务与通知',
     '项目',
-    'Coding Workbench',
     '插件中心',
     '自动化与智能体',
     '执行资源',
@@ -52,12 +51,17 @@ test('sidebar keeps automation separate from Agent surfaces', async () => {
     assert.match(navigation, new RegExp(`label: '${label}'`))
   }
 
-  assert.match(navigation, /href: '\/inbox'/)
+  assert.doesNotMatch(navigation, /href: '\/agent-workbench'/)
+  assert.match(navigation, /href: '\/inbox\?tab=pending'/)
   assert.match(navigation, /match: \['\/inbox', '\/tasks', '\/notifications'\]/)
-  assert.match(navigation, /match: \['\/schedules', '\/plans', '\/agents', '\/skills'\]/)
+  assert.match(navigation, /match: \['\/operations-agents', '\/schedules'\]/)
+  assert.doesNotMatch(navigation, /label: '自动化与 Agent'/)
+  assert.doesNotMatch(navigation, /match: \[[^\]]*'\/agents'/)
+  assert.doesNotMatch(navigation, /match: \[[^\]]*'\/skills'/)
+  assert.match(navigation, /'\/operations-agents': '自动化与智能体'/)
   assert.match(navigation, /match: \['\/nodes', '\/workers', '\/browsers'\]/)
   assert.match(navigation, /match: \['\/providers'\]/)
-  assert.match(navigation, /href: '\/control\/actions'[\s\S]{0,120}match: \['\/control'\]/)
+  assert.match(navigation, /href: '\/control\/kill-switch'[\s\S]{0,120}match: \['\/control'\]/)
   for (const group of ['工作台', '构建', '运行与数据', '管理']) {
     assert.match(navigation, new RegExp(`label: '${group}'`))
   }
@@ -87,24 +91,25 @@ test('records use a scalable schema-adaptive table with pagination and raw evide
 })
 
 test('task and automation sibling routes share their consolidated route tabs', async () => {
-  const [tabs, inbox, tasks, notifications, schedules, plans, agents, skills] = await Promise.all([
+  const [tabs, inbox, tasks, notifications, sources, schedules, plans, agents, skills] = await Promise.all([
     read('components/shell/route-tabs.tsx'),
     read('app/(app)/inbox/page.tsx'),
     read('app/(app)/tasks/page.tsx'),
     read('app/(app)/notifications/page.tsx'),
+    read('app/(app)/sources/page.tsx'),
     read('app/(app)/schedules/page.tsx'),
     read('app/(app)/plans/page.tsx'),
     read('app/(app)/agents/page.tsx'),
     read('app/(app)/skills/page.tsx'),
   ])
 
-  for (const label of ['待处理', '工作项', '通知规则', '调度', '计划', 'Agent', '技能']) {
+  for (const label of ['待处理', '工作项', '通知规则', '自动化与智能体', 'Agent', '技能']) {
     assert.match(tabs, new RegExp(`label: '${label}'`))
   }
   for (const page of [inbox, tasks, notifications]) {
     assert.match(page, /ACTION_CENTER_TABS/)
   }
-  for (const page of [schedules, plans, agents, skills]) {
+  for (const page of [plans, agents, skills]) {
     assert.match(page, /AUTOMATION_TABS/)
   }
   assert.match(sources, /redirect\('\/records'\)/)
@@ -112,63 +117,70 @@ test('task and automation sibling routes share their consolidated route tabs', a
 })
 
 test('studio keeps Agent conversation global while management has its own entry', async () => {
-  const [studio, templates, shell, header, agentBubble, agentDock, transition] = await Promise.all([
+  const [studio, templates, shell, header, agentDock, transition] = await Promise.all([
     read('app/(app)/studio/page.tsx'),
     read('app/(app)/studio/templates/page.tsx'),
     read('components/shell/app-shell.tsx'),
     read('components/shell/app-header.tsx'),
-    read('components/shell/global-agent-bubble.tsx'),
     read('components/shell/global-agent-dock.tsx'),
     read('components/motion/app-route-transition.tsx'),
   ])
 
-  assert.match(studio, /\/studio\/templates\?workspace=/)
+  assert.match(studio, /\/plugins\?type=template&workspace=/)
   assert.match(studio, /创建空白工作流/)
   assert.match(studio, /setCreateTemplate\('blank'\)/)
   assert.doesNotMatch(studio, /Collection starters/i)
   assert.doesNotMatch(studio, /从采集项目开始/)
   assert.doesNotMatch(studio, /FEATURED_COLLECTION_TEMPLATES/)
   assert.doesNotMatch(studio, /与 Agent 创建/)
-  assert.doesNotMatch(studio, /\/studio\/new\?workspace=/)
-  assert.match(templates, /搜索模板、节点或用途/)
-  assert.match(templates, /可复用的执行链路/)
-  assert.doesNotMatch(templates, /改用 Agent 创建/)
-  assert.match(shell, /<GlobalAgentBubble onClick=\{\(\) => \{ setAgentPrompt\(''\); setAgentOpen\(true\) \}\} \/>/)
-  assert.match(shell, /<GlobalAgentDock open=\{agentOpen\}/)
-  assert.match(header, /href="\/operations-agents"/)
-  assert.doesNotMatch(header, /onOpenAgent/)
-  assert.match(agentBubble, /fixed bottom-4 right-4/)
-  assert.match(agentBubble, /aria-label="打开全局 Agent"/)
+  assert.match(studio, /\/studio\/new\?workspace=/)
+  assert.match(templates, /redirect\(`\/plugins\?\$\{params\.toString\(\)\}`\)/)
+  assert.match(shell, /onOpenAgent=\{\(\) => setAgentOpen\(true\)\}/)
+  assert.match(shell, /<GlobalAgentDock open=\{agentOpen\} onOpenChange=\{setAgentOpen\} \/>/)
+  assert.match(header, /onOpenAgent\?: \(\) => void/)
+  assert.match(header, /aria-label="打开全局 Agent"/)
   assert.match(agentDock, /当前上下文/)
-  assert.match(agentDock, /new URLSearchParams\(window\.location\.search\)/)
+  assert.match(agentDock, /const navigationQuery = searchParams\.toString\(\)/)
+  assert.match(agentDock, /useMemo\(\(\) => new URLSearchParams\(navigationQuery\), \[navigationQuery\]\)/)
   assert.match(agentDock, /workspace_id: workspaceId/)
-  assert.match(agentDock, /const workspaceId = searchParams\.get\('workspace'\)/)
-  assert.match(agentDock, /projectId = searchParams\.get\('project'\)/)
-  assert.match(agentDock, /workflowId = searchParams\.get\('workflow'\)/)
-  assert.match(agentDock, /sourceId = searchParams\.get\('source'\)/)
-  assert.match(agentDock, /project_id: projectId/)
-  assert.match(agentDock, /workflow_id: workflowId/)
-  assert.match(agentDock, /source_id: sourceId/)
-  assert.match(agentDock, /work_item_id\?: string \| null/)
-  assert.match(agentDock, /workspace_id\?: string \| null/)
-  assert.match(agentDock, /proposal_version\?: string \| null/)
-  assert.match(agentDock, /apiClient\.post\('\/chat\/confirm', \{ proposal: proposalToConfirm \}\)/)
+  assert.match(agentDock, /const requestedWorkspaceId = navigationParams\.get\('workspace'\)/)
+  assert.match(agentDock, /project_id: navigationParams\.get\('project'\)/)
+  assert.match(agentDock, /workflow_id: navigationParams\.get\('workflow'\)/)
+  assert.match(agentDock, /source_id: navigationParams\.get\('source'\)/)
+  assert.match(agentDock, /apiClient\.post\('\/chat\/confirm', \{ proposal \}\)/)
   assert.match(agentDock, /status === 409/)
   assert.match(agentDock, /仅在后端能解析出唯一授权范围时允许确认写操作/)
   assert.match(agentDock, /\/chat\/confirm/)
   assert.match(agentDock, /queryClient\.invalidateQueries/)
-  assert.match(transition, /'\/operations-agents'/)
+  assert.match(transition, /on: '\/\*\*'/)
 })
 
-test('SSGOI boundary is pathname-keyed, interruptible, and reduced-motion safe', async () => {
+test('SSGOI boundary is pathname-keyed and every app path shares one history-driven rule', async () => {
   const transition = await read('components/motion/app-route-transition.tsx')
 
   assert.match(transition, /const pathname = usePathname\(\)/)
-  assert.match(transition, /key=\{pathname\}/)
-  assert.match(transition, /data-ssgoi-transition=\{pathname\}/)
+  assert.match(transition, /key=\{transitionKey\}/)
+  assert.match(transition, /data-ssgoi-transition=\{transitionKey\}/)
+  assert.match(transition, /const transitionKey = pathname\s/)
   assert.match(transition, /className="[^"]*h-full[^"]*min-h-full[^"]*"/)
-  assert.match(transition, /ordered: APP_ROUTES, transition: axis\(\{ type: 'x', variant: 'snappy' \}\)/)
-  assert.match(transition, /prefersReducedMotion \? STATIC_CONFIG : MOTION_CONFIG/)
+  assert.match(transition, /on: '\/\*\*'/)
+  assert.match(transition, /transition: createRouteTransition\(/)
+  assert.doesNotMatch(transition, /ordered:|\baxis\(/)
+  assert.doesNotMatch(transition, /\bdrill\(/)
+  assert.match(transition, /<Ssgoi config=\{config\}>/)
+  assert.match(transition, /const \[config\] = useState<SsgoiConfig>/)
+  assert.doesNotMatch(transition, /STATIC_CONFIG|useReducedMotion/)
+})
+
+test('navigation indicators do not introduce separate layout springs or ripple clocks', async () => {
+  const [sidebar, tabs] = await Promise.all([
+    read('components/shell/app-sidebar.tsx'),
+    read('components/shell/route-tabs.tsx'),
+  ])
+
+  for (const component of [sidebar, tabs]) {
+    assert.doesNotMatch(component, /layoutId|stiffness|damping|<Ripple/)
+  }
 })
 
 test('route-level loading, pixel indicators, and recovery boundaries remain available', async () => {
@@ -186,6 +198,12 @@ test('route-level loading, pixel indicators, and recovery boundaries remain avai
   assert.match(matrix, /export const loader:/)
   assert.match(dataStates, /frames=\{loader\}/)
   assert.match(dataStates, /size=\{5\}/)
+  assert.match(dataStates, /animate-none/)
+  assert.match(matrix, /React\.useId\(\)\.replaceAll\(":", ""\)/)
+  assert.match(matrix, /id=\{pixelOnId\}/)
+  assert.match(matrix, /id=\{pixelOffId\}/)
+  assert.match(matrix, /id=\{glowId\}/)
+  assert.doesNotMatch(matrix, /id="matrix-(?:pixel|glow)/)
   assert.match(authGate, /frames=\{loader\}/)
   assert.match(workflowSession, /ariaLabel="正在加载工作流"/)
 })

@@ -1,6 +1,8 @@
-from typing import Literal, Optional
+from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from typing import Literal
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -29,17 +31,37 @@ RecordSortOrder = Literal["asc", "desc"]
 
 @router.get("", response_model=ApiResponse[list[CollectedRecordRead]])
 async def list_records(
-    source_id: Optional[str] = None,
-    task_id: Optional[str] = None,
-    project_id: Optional[str] = None,
-    status: Optional[str] = None,
-    search: Optional[str] = Query(None),
+    request: Request,
+    source_id: str | None = None,
+    task_id: str | None = None,
+    project_id: str | None = None,
+    status: str | None = None,
+    search: str | None = Query(None),
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
     sort_by: RecordSortField = Query("created_at"),
     sort_order: RecordSortOrder = Query("desc"),
     db: AsyncSession = Depends(get_db),
+    workspace_id: str | None = None,
+    brand_id: str | None = None,
+    product_id: str | None = None,
+    unclassified: bool = False,
 ) -> ApiResponse:
+    if (brand_id or product_id or unclassified) and not workspace_id:
+        raise HTTPException(422, "品牌和产品筛选需要选择工作区")
+    if product_id and not brand_id:
+        raise HTTPException(422, "产品筛选需要选择品牌")
+    if unclassified and (brand_id or product_id):
+        raise HTTPException(422, "未分类不能与品牌或产品筛选同时使用")
+    if workspace_id:
+        from backend.security.identity import get_request_identity
+        from backend.security.workspace_rbac import get_workspace_access
+        from backend.services.brand_knowledge_service import brand_scope
+
+        identity = await get_request_identity(request)
+        await get_workspace_access(db, workspace_id, identity)
+        if brand_id:
+            await brand_scope(db, workspace_id, brand_id, product_id)
     records, total = await record_service.list_records(
         db,
         source_id=source_id,
@@ -51,6 +73,10 @@ async def list_records(
         limit=limit,
         sort_by=sort_by,
         sort_order=sort_order,
+        workspace_id=workspace_id,
+        brand_id=brand_id,
+        product_id=product_id,
+        unclassified=unclassified,
     )
     return ApiResponse.ok(
         data=[CollectedRecordRead.model_validate(r) for r in records],
@@ -59,9 +85,7 @@ async def list_records(
 
 
 @router.get("/{record_id}", response_model=ApiResponse[CollectedRecordRead])
-async def get_record(
-    record_id: str, db: AsyncSession = Depends(get_db)
-) -> ApiResponse:
+async def get_record(record_id: str, db: AsyncSession = Depends(get_db)) -> ApiResponse:
     record = await record_service.get_record(db, record_id)
     if not record:
         raise HTTPException(status_code=404, detail="Record not found")
@@ -69,9 +93,7 @@ async def get_record(
 
 
 @router.delete("/{record_id}", response_model=ApiResponse[None])
-async def delete_record(
-    record_id: str, db: AsyncSession = Depends(get_db)
-) -> ApiResponse:
+async def delete_record(record_id: str, db: AsyncSession = Depends(get_db)) -> ApiResponse:
     deleted = await record_service.delete_records(db, [record_id])
     if not deleted:
         raise HTTPException(status_code=404, detail="Record not found")
@@ -90,7 +112,7 @@ async def batch_delete_records(
 
 @router.delete("", response_model=ApiResponse[dict])
 async def clear_all_records(
-    source_id: Optional[str] = Query(None),
+    source_id: str | None = Query(None),
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse:
     deleted = await record_service.delete_all_records(db, source_id=source_id)

@@ -58,6 +58,8 @@ from backend.models.workflow_run import WorkflowRun
 from backend.schemas import workflow as workflow_schemas
 from backend.schemas.common import ApiResponse, PaginationMeta
 from backend.security.identity import RequestIdentity
+from backend.schemas.workflow_runtime import WorkflowRunStatus, WorkflowRunTraceResponse
+from backend.services.agent_project_service import update_workflow_draft
 from backend.services.gaojixing_collection_service import (
     GaojixingCollectionConflictError,
     resume_collection,
@@ -194,6 +196,21 @@ async def _project_runtime_scope(
         .all()
     )
     return workflow_names, {version.id: version.version for version in versions}
+
+
+async def _get_project_workflow_run(
+    db: AsyncSession,
+    *,
+    workspace_id: str,
+    project_id: str,
+    workflow_id: str,
+    run_id: str,
+) -> WorkflowRun:
+    await get_workflow(db, workspace_id, project_id, workflow_id)
+    row = await db.get(WorkflowRun, run_id)
+    if row is None or row.workflow_id != workflow_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Workflow run not found")
+    return row
 
 
 @router.get(
@@ -506,6 +523,7 @@ async def _start_published_version_run(
     idempotency_key: str | None = None,
     run_id: str | None = None,
     request_identity: RequestIdentity | None = None,
+    plugins=None,
 ) -> ApiResponse:
     version_id = version.id
     project = workflow_schemas.WorkflowProject.model_validate(version.graph)
@@ -562,6 +580,7 @@ async def _start_published_version_run(
             request_identity=request_identity,
             requested_by_user_id=requested_by_user_id,
             expected_workspace_id=workspace_id,
+            plugins=plugins,
         )
     except IntegrityError:
         if not idempotency_key:
@@ -615,6 +634,7 @@ async def start_published_workflow_run(
     request_id = body.request_id or request_id_header or str(uuid.uuid4())
     idempotency_key = body.idempotency_key or idempotency_header
     return await _start_published_version_run(
+        plugins=request.app.state.workflow_plugins,
         db=db,
         workspace_id=workspace_id,
         project_id=project_id,
@@ -718,6 +738,7 @@ async def start_published_workflow_run_from_question_bank(
             trigger_node_id=body.trigger_node_id,
             run_id=run_id,
             request_identity=identity,
+            plugins=request_context.app.state.workflow_plugins,
         )
     except Exception:
         if request_owns_run_directory and staged.created:
@@ -774,6 +795,7 @@ async def replay_persisted_gaojixing_source_downstream(
             expected_studio_workflow_version_id=version.id,
             session=db,
             request_identity=identity,
+            plugins=request.app.state.workflow_plugins,
         )
     except ValueError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
@@ -826,7 +848,7 @@ async def get_project_runtime_trace(
             inputs=input_payload.get("payload") or {},
             user=input_payload.get("sourceId"),
             response_mode=request.get("responseMode") or "async",
-            trace=workflow_schemas.WorkflowRunTraceResponse(
+            trace=WorkflowRunTraceResponse(
                 projection=projection,
                 checkpoint=checkpoint,
                 events=events,
@@ -1128,18 +1150,12 @@ async def update_draft(
     body: DraftUpdate,
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse:
-    await get_workflow(db, workspace_id, project_id, workflow_id)
-    row = await db.scalar(
-        select(StudioWorkflowDraft)
-        .where(StudioWorkflowDraft.workflow_id == workflow_id)
-        .with_for_update()
+    row = await update_workflow_draft(
+        db,
+        workspace_id=workspace_id,
+        project_id=project_id,
+        workflow_id=workflow_id,
+        body=body,
+        actor_user_id=LOCAL_USER_ID,
     )
-    if row is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Workflow draft not found")
-    if row.revision != body.revision:
-        raise HTTPException(status.HTTP_409_CONFLICT, "Workflow draft revision conflict")
-    row.graph = canonicalize_studio_graph(body.graph, workflow_id=workflow_id)
-    row.revision += 1
-    row.updated_by_user_id = LOCAL_USER_ID
-    await db.flush()
     return ApiResponse.ok(DraftRead.model_validate(row, from_attributes=True))

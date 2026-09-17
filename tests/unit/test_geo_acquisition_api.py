@@ -191,6 +191,27 @@ async def test_submission_rejects_unsupported_required_artifact(
 
 
 @pytest.mark.asyncio
+async def test_submission_rejects_unauthenticated_workflow_run_correlation(
+    client, acquisition_executor
+):
+    response = await client.post(
+        f"{BASE}/executions",
+        json=_request(
+            workflow_run_correlation={
+                "workspace_id": "missing-workspace",
+                "project_id": "missing-project",
+                "workflow_id": "missing-workflow",
+                "run_id": "missing-run",
+            }
+        ),
+    )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Bearer token required"
+    acquisition_executor.dispatch_acquisition.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_attempt_idempotency_returns_the_existing_execution(
     client, acquisition_executor
 ):

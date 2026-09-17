@@ -9,15 +9,17 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from backend.api.v1 import v1_router
-from backend.config import get_settings
+from backend.api.v1 import create_v1_router
+from backend.config import Settings, get_settings
 from backend.database import run_migrations
 from backend.security.fleet_auth import (
     FleetAuthMiddleware,
     enforce_bind_guard,
     resolve_uvicorn_host,
 )
+from backend.security.log_redaction import install_log_redaction
 from backend.security.question_bank_body_limit import QuestionBankBodyLimitMiddleware
+from backend.workflow.plugin_registry import build_workflow_plugin_registry
 
 
 def _configure_logging() -> None:
@@ -34,12 +36,14 @@ def _configure_logging() -> None:
         if name.startswith("backend") and isinstance(lgr, logging.Logger):
             lgr.disabled = False
             lgr.setLevel(logging.INFO)
+    install_log_redaction()
 
 
 _configure_logging()
 logger = logging.getLogger(__name__)
 
 settings = get_settings()
+
 
 
 def _read_chrome_endpoints() -> list[str]:
@@ -55,6 +59,7 @@ def _read_chrome_endpoints() -> list[str]:
     import os
 
     candidates = [
+        *([os.environ["ENV_FILE_PATH"]] if os.environ.get("ENV_FILE_PATH") else []),
         "/app/.env",
         os.path.join(os.path.dirname(__file__), "..", ".env"),
     ]
@@ -84,6 +89,7 @@ async def lifespan(app: FastAPI):
     mcp_lifespan = mcp_http_app.router.lifespan_context(mcp_http_app)
     await mcp_lifespan.__aenter__()
     await run_migrations()
+    await app.state.workflow_plugins.start()
     # Re-apply logging config: alembic resets root logger level to WARNING during migrations
     # and uvicorn's dictConfig disables pre-existing loggers
     _configure_logging()
@@ -164,6 +170,11 @@ async def lifespan(app: FastAPI):
     )
 
     await recover_operations_agent_runs_on_startup()
+    from backend.services import research_service
+
+    recovered_research = await research_service.recover_queued_runs_on_startup()
+    research_service.start_research_recovery_supervisor()
+    logger.info("Requeued %d research runs", len(recovered_research))
     logger.info("Recovered stale tasks on startup")
 
     # Managed acquisitions are durable submit-and-observe work. Unlike legacy
@@ -244,6 +255,7 @@ async def lifespan(app: FastAPI):
         await account_pool_task
     account_dispatcher.stop_event.set()
     await account_dispatch_task
+    await research_service.shutdown_research_tasks()
     acquisition_sweeper_stop.set()
     await acquisition_sweeper
     await cycle_task.stop()
@@ -251,15 +263,17 @@ async def lifespan(app: FastAPI):
         from backend.scheduler import stop_scheduler
 
         stop_scheduler()
+    await app.state.workflow_plugins.stop()
     await mcp_lifespan.__aexit__(None, None, None)
 
 
-def create_app() -> FastAPI:
+def create_app(*, app_settings: Settings | None = None) -> FastAPI:
     app = FastAPI(
         title="OpenCLI Admin",
         description=(
             "Agent-driven workflow and data collection platform. Authenticate protected REST "
-            "and MCP calls with `Authorization: Bearer <API_AUTH_TOKEN>`. Agent workflow: "
+            "and MCP calls with a user bearer in `Authorization` and, when enabled, "
+            "the separate fleet credential in `X-API-Token`. Agent workflow: "
             "inspect `/api/v1/workflows/capabilities`, draft with "
             "`/api/v1/workflows/demand-draft`, validate with `/api/v1/workflows/compile`, "
             "then review before publishing or running."
@@ -277,6 +291,10 @@ def create_app() -> FastAPI:
     # Bound managed question-bank requests before Starlette parses and spools
     # multipart parts. Fleet auth is added afterwards and remains outermost.
     app.add_middleware(QuestionBankBodyLimitMiddleware)
+    active_settings = app_settings or settings
+
+    workflow_plugins = build_workflow_plugin_registry(active_settings)
+    app.state.workflow_plugins = workflow_plugins
 
     # Fleet auth (ADR-0005): static bearer token on every /api route.
     # Registered BEFORE CORSMiddleware on purpose — Starlette treats the
@@ -289,7 +307,7 @@ def create_app() -> FastAPI:
     # CORS
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"] if settings.debug else ["http://localhost:5173"],
+        allow_origins=["*"] if active_settings.debug else ["http://localhost:5173"],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -305,7 +323,7 @@ def create_app() -> FastAPI:
         )
 
     # Routes
-    app.include_router(v1_router)
+    app.include_router(create_v1_router(workflow_plugins))
     default_openapi = app.openapi
 
     def openapi_schema() -> dict:

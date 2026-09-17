@@ -283,6 +283,10 @@ async def register_node(
     result = await db.execute(select(BrowserInstance).where(BrowserInstance.endpoint == url))
     inst = result.scalar_one_or_none()
     if inst:
+        if inst.profile_kind != body.profile_kind:
+            from backend.services.platform_browser_account_service import require_unassigned
+
+            await require_unassigned(db, inst.id)
         inst.mode = body.mode
         inst.agent_url = url
         inst.agent_protocol = body.agent_protocol
@@ -426,8 +430,6 @@ async def delete_node(node_id: str, db: AsyncSession = Depends(get_db)) -> ApiRe
     if not node:
         raise HTTPException(status_code=404, detail="Node not found")
 
-    _pool_remove(node.url)
-
     # Also remove BrowserInstance record
     from backend.models.browser import BrowserInstance
 
@@ -436,10 +438,14 @@ async def delete_node(node_id: str, db: AsyncSession = Depends(get_db)) -> ApiRe
     )
     bi = bi_result.scalar_one_or_none()
     if bi:
+        from backend.services.platform_browser_account_service import require_unassigned
+
+        await require_unassigned(db, bi.id)
         await db.delete(bi)
 
     await db.delete(node)
     await db.commit()
+    _pool_remove(node.url)
     logger.info("Node deleted: %s", node.url)
     return ApiResponse.ok(None)
 
@@ -965,6 +971,10 @@ async def node_ws_endpoint(ws: WebSocket) -> None:
                 )
                 inst = result.scalar_one_or_none()
                 if inst:
+                    if inst.profile_kind != profile_kind:
+                        from backend.services.platform_browser_account_service import require_unassigned
+
+                        await require_unassigned(db, inst.id)
                     inst.mode = mode
                     inst.agent_url = agent_url
                     inst.agent_protocol = "ws"
@@ -983,6 +993,9 @@ async def node_ws_endpoint(ws: WebSocket) -> None:
                     )
                     db.add(inst)
                 await db.commit()
+        except HTTPException:
+            await ws.close(code=1008, reason="Account Profile is reserved")
+            return
         except Exception as exc:
             logger.warning("WS node %s: DB upsert failed (non-fatal): %s", agent_url, exc)
             if account_capable:
@@ -1047,6 +1060,8 @@ async def node_ws_endpoint(ws: WebSocket) -> None:
                     await ws_agent_manager.resolve_browser_desktop_binary(
                         agent_url, raw_bytes, source_ws=ws
                     )
+                elif raw_bytes[:1] == bytes([2]):
+                    await ws_agent_manager.resolve_terminal_binary(raw_bytes, source_ws=ws)
                 else:
                     await ws_agent_manager.resolve_portal_binary(
                         agent_url, raw_bytes, source_ws=ws
@@ -1110,6 +1125,14 @@ async def node_ws_endpoint(ws: WebSocket) -> None:
                 async with AsyncSessionLocal() as db:
                     await record_capacity(db, node_identity, fact)
                     await db.commit()
+            elif msg_type == "agent_task_status_result":
+                ws_agent_manager.resolve_agent_task_status(
+                    msg.get("request_id", ""), msg, source_ws=ws
+                )
+            elif msg_type == "terminal_response":
+                ws_agent_manager.resolve_terminal_response(msg, source_ws=ws)
+            elif msg_type == "terminal_event":
+                await ws_agent_manager.resolve_terminal_event(msg, source_ws=ws)
             elif msg_type == "ping":
                 await ws.send_json({"type": "pong"})
             else:

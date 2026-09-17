@@ -8,11 +8,11 @@ ODP request bodies never cross this seam.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from hashlib import sha256
 import json
 import os
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from hashlib import sha256
 from typing import Any, Literal
 from uuid import UUID
 
@@ -34,12 +34,18 @@ class OdpQueryError(RuntimeError):
     """Redacted query-service failure safe to surface through Admin."""
 
 
-class OdpQueryUnavailable(OdpQueryError):
+class OdpQueryUnavailableError(OdpQueryError):
     """The read service cannot establish a reconciliation result."""
 
 
-class OdpQueryRejected(OdpQueryError):
+class OdpQueryRejectedError(OdpQueryError):
     """The read service rejected an invalid delegated request."""
+
+
+# Compatibility names for callers migrating to the PEP 8 ``Error`` suffix.
+OdpQueryUnavailable = OdpQueryUnavailableError
+OdpQueryRejected = OdpQueryRejectedError
+
 
 
 @dataclass(frozen=True)
@@ -49,7 +55,7 @@ class OdpRecordKey:
 
     def to_wire(self) -> dict[str, str]:
         if not self.event_id or len(self.event_id) > 512:
-            raise OdpQueryRejected("ODP reconciliation request was rejected")
+            raise OdpQueryRejectedError("ODP reconciliation request was rejected")
         return {"source_id": str(self.source_id), "event_id": self.event_id}
 
 
@@ -95,10 +101,11 @@ class OdpReconciliationDelegation:
             or len(self.allowed_modes) != len(set(self.allowed_modes))
             or any(mode not in {"exact", "attempt_page", "dlq"} for mode in self.allowed_modes)
         ):
-            raise OdpQueryRejected("ODP reconciliation request was rejected")
+            raise OdpQueryRejectedError("ODP reconciliation request was rejected")
         expires_at = _rfc3339_utc(self.expires_at)
-        if self.expires_at.astimezone(timezone.utc) <= datetime.now(timezone.utc):
+        if self.expires_at.astimezone(UTC) <= datetime.now(UTC):
             raise OdpQueryRejected("ODP reconciliation request was rejected")
+
         scope = {
             "workspace_id": self.workspace_id,
             "project_id": self.project_id,
@@ -139,11 +146,11 @@ def build_attempt_page_request(
 ) -> dict[str, Any]:
     scope = delegation.to_wire()
     if "attempt_page" not in delegation.allowed_modes:
-        raise OdpQueryRejected("ODP reconciliation request was rejected")
+        raise OdpQueryRejectedError("ODP reconciliation request was rejected")
     if cursor is not None and (not cursor or len(cursor) > MAX_CURSOR_LENGTH):
-        raise OdpQueryRejected("ODP reconciliation request was rejected")
+        raise OdpQueryRejectedError("ODP reconciliation request was rejected")
     if page_size is not None and not 1 <= page_size <= MAX_PAGE_SIZE:
-        raise OdpQueryRejected("ODP reconciliation request was rejected")
+        raise OdpQueryRejectedError("ODP reconciliation request was rejected")
     request: dict[str, Any] = {"delegation": scope, "mode": "attempt_page"}
     if cursor is not None:
         request["cursor"] = cursor
@@ -158,24 +165,24 @@ async def post_reconciliation_query(request: dict[str, Any]) -> dict[str, Any]:
     base_url = os.environ.get("ODP_QUERY_URL", "").strip().rstrip("/")
     credential = os.environ.get("ODP_QUERY_ADMIN_CREDENTIAL", "").strip()
     if not base_url or not credential:
-        raise OdpQueryUnavailable("ODP reconciliation is unavailable")
+        raise OdpQueryUnavailableError("ODP reconciliation is unavailable")
     try:
         async with httpx.AsyncClient(timeout=_timeout()) as client:
             response = await client.post(
-                f"{base_url}/internal/v1/evidence-records:query",
+                base_url,
                 headers={"Authorization": f"Bearer {credential}"},
                 json=request,
             )
     except httpx.HTTPError as exc:
-        raise OdpQueryUnavailable("ODP reconciliation is unavailable") from exc
+        raise OdpQueryUnavailableError("ODP reconciliation is unavailable") from exc
     if response.status_code >= 500:
-        raise OdpQueryUnavailable("ODP reconciliation is unavailable")
+        raise OdpQueryUnavailableError("ODP reconciliation is unavailable")
     if response.status_code >= 400:
-        raise OdpQueryRejected("ODP reconciliation request was rejected")
+        raise OdpQueryRejectedError("ODP reconciliation request was rejected")
     try:
         return sanitize_query_response(response.json(), request)
     except (TypeError, ValueError, KeyError) as exc:
-        raise OdpQueryUnavailable("ODP reconciliation is unavailable") from exc
+        raise OdpQueryUnavailableError("ODP reconciliation is unavailable") from exc
 
 
 def sanitize_query_response(payload: Any, request: dict[str, Any]) -> dict[str, Any]:
@@ -189,14 +196,14 @@ def sanitize_query_response(payload: Any, request: dict[str, Any]) -> dict[str, 
         or mode not in {"exact", "attempt_page", "dlq"}
         or payload.get("query_fingerprint") != delegation.get("query_fingerprint")
         or payload.get("mode") != mode
-        or payload.get("retention_state") != "unknown"
+        or payload.get("retention_state") not in {"unknown", "retained"}
         or payload.get("redaction_profile_version") != REDACTION_PROFILE_VERSION
     ):
         raise ValueError("invalid odp-query response")
     output: dict[str, Any] = {
         "mode": payload["mode"],
         "query_fingerprint": payload["query_fingerprint"],
-        "retention_state": "unknown",
+        "retention_state": payload["retention_state"],
         "redaction_profile_version": REDACTION_PROFILE_VERSION,
         "records": [_sanitize_reference(record) for record in payload.get("records", [])],
         "results": [_sanitize_result(result) for result in payload.get("results", [])],
@@ -210,6 +217,14 @@ def sanitize_query_response(payload: Any, request: dict[str, Any]) -> dict[str, 
                 raise ValueError("invalid odp-query response")
             output[name] = value
     _validate_response_scope(output, request)
+    if output["retention_state"] == "retained" and (
+        not output["results"]
+        or any(
+            result["classification"] != "dlq" or result["retention_state"] != "retained"
+            for result in output["results"]
+        )
+    ):
+        raise ValueError("invalid odp-query retained response")
     if len(json.dumps(output, separators=(",", ":")).encode()) > MAX_RESPONSE_BYTES:
         raise ValueError("oversized odp-query response")
     return output
@@ -222,12 +237,12 @@ def _request_with_keys(
 ) -> dict[str, Any]:
     scope = delegation.to_wire()
     if mode not in delegation.allowed_modes or not 1 <= len(keys) <= MAX_KEYS:
-        raise OdpQueryRejected("ODP reconciliation request was rejected")
+        raise OdpQueryRejectedError("ODP reconciliation request was rejected")
     if len(set(keys)) != len(keys):
-        raise OdpQueryRejected("ODP reconciliation request was rejected")
+        raise OdpQueryRejectedError("ODP reconciliation request was rejected")
     allowed_sources = set(delegation.allowed_source_ids)
     if any(key.source_id not in allowed_sources for key in keys):
-        raise OdpQueryRejected("ODP reconciliation request was rejected")
+        raise OdpQueryRejectedError("ODP reconciliation request was rejected")
     return {"delegation": scope, "mode": mode, "keys": [key.to_wire() for key in keys]}
 
 
@@ -236,27 +251,44 @@ def _sanitize_reference(value: Any) -> dict[str, Any]:
         raise ValueError("invalid odp-query record reference")
     reference = {
         name: value[name]
-        for name in ("source_id", "event_id", "odp_record_id", "committed_at", "provider", "source_ts")
+        for name in (
+            "source_id",
+            "event_id",
+            "odp_record_id",
+            "committed_at",
+            "provider",
+            "source_ts",
+        )
     }
     if (
         not isinstance(reference["source_id"], str)
         or not isinstance(reference["event_id"], str)
         or not isinstance(reference["odp_record_id"], int)
-        or not all(isinstance(reference[name], str) for name in ("committed_at", "provider", "source_ts"))
+        or not all(
+            isinstance(reference[name], str)
+            for name in ("committed_at", "provider", "source_ts")
+        )
     ):
         raise ValueError("invalid odp-query record reference")
     return reference
 
 
 def _sanitize_result(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict) or value.get("classification") not in {"present", "dlq", "unknown"}:
+    if (
+        not isinstance(value, dict)
+        or value.get("classification") not in {"present", "dlq", "unknown"}
+    ):
         raise ValueError("invalid odp-query reconciliation result")
-    if value.get("retention_state") != "unknown":
+    classification = value["classification"]
+    retention_state = value.get("retention_state")
+    if retention_state not in {"unknown", "retained"} or (
+        classification == "dlq"
+    ) != (retention_state == "retained"):
         raise ValueError("invalid odp-query reconciliation result")
     result = {
         "key": _sanitize_key(value["key"]),
-        "classification": value["classification"],
-        "retention_state": "unknown",
+        "classification": classification,
+        "retention_state": retention_state,
     }
     if "record" in value:
         if value["record"] is None:
@@ -298,7 +330,10 @@ def _validate_response_scope(response: dict[str, Any], request: dict[str, Any]) 
     }
     if actual != expected or len(response["results"]) != len(keys):
         raise ValueError("incomplete reconciliation results")
-    if any((record["source_id"], record["event_id"]) not in expected for record in response["records"]):
+    if any(
+        (record["source_id"], record["event_id"]) not in expected
+        for record in response["records"]
+    ):
         raise ValueError("out-of-scope odp-query record")
     for result in response["results"]:
         record = result.get("record")
@@ -312,7 +347,7 @@ def _validate_response_scope(response: dict[str, Any], request: dict[str, Any]) 
 def _rfc3339_utc(value: datetime) -> str:
     if value.tzinfo is None:
         raise OdpQueryRejected("ODP reconciliation request was rejected")
-    normalized = value.astimezone(timezone.utc)
+    normalized = value.astimezone(UTC)
     if normalized.microsecond:
         return normalized.isoformat(timespec="microseconds").replace("+00:00", "Z")
     return normalized.isoformat(timespec="seconds").replace("+00:00", "Z")

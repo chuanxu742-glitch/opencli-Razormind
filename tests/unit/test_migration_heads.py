@@ -22,7 +22,92 @@ def test_alembic_has_one_head():
     config = Config()
     config.set_main_option("script_location", "backend/migrations")
 
-    assert ScriptDirectory.from_config(config).get_heads() == ["add_browser_session_purpose"]
+    assert ScriptDirectory.from_config(config).get_heads() == ["sync20260917a"]
+
+
+def test_browser_space_control_migration_defaults_existing_spaces_to_agent(monkeypatch):
+    with TemporaryDirectory() as directory:
+        database = Path(directory) / "browser-space-control.db"
+        monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{database.as_posix()}")
+        get_settings.cache_clear()
+        config = Config()
+        config.set_main_option("script_location", "backend/migrations")
+        try:
+            command.upgrade(config, "kb20260914a")
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    "INSERT INTO browser_spaces "
+                    "(id, workspace_id, browser_instance_id, binding_id, owner_type, owner_id, "
+                    "status, granted_capabilities, revision, last_error_code, "
+                    "created_at, updated_at) "
+                    "VALUES ('space-1', 'workspace-1', 'instance-1', NULL, 'operator', 'owner', "
+                    "'idle', '[]', 0, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            command.upgrade(config, "head")
+            connection = sqlite3.connect(database)
+            try:
+                assert connection.execute(
+                    "SELECT control_mode FROM browser_spaces WHERE id = 'space-1'"
+                ).fetchone() == ("agent",)
+            finally:
+                connection.close()
+        finally:
+            get_settings.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("statement", "message"),
+    [
+        (
+            "UPDATE browser_spaces SET control_mode = 'human' WHERE id = 'space-1'",
+            "human control state",
+        ),
+        (
+            "INSERT INTO browser_space_events "
+            "(id, space_id, task_id, sequence, kind, payload, created_at, updated_at) "
+            "VALUES ('event-1', 'space-1', NULL, 1, 'control_changed', '{}', "
+            "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            "control_changed audit events",
+        ),
+    ],
+)
+def test_browser_space_control_migration_refuses_lossy_downgrade(monkeypatch, statement, message):
+    with TemporaryDirectory() as directory:
+        database = Path(directory) / "browser-space-control-downgrade.db"
+        monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{database.as_posix()}")
+        get_settings.cache_clear()
+        config = Config()
+        config.set_main_option("script_location", "backend/migrations")
+        try:
+            command.upgrade(config, "kb20260914a")
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    "INSERT INTO browser_spaces "
+                    "(id, workspace_id, browser_instance_id, binding_id, owner_type, owner_id, "
+                    "status, granted_capabilities, revision, last_error_code, "
+                    "created_at, updated_at) "
+                    "VALUES ('space-1', 'workspace-1', 'instance-1', NULL, 'operator', 'owner', "
+                    "'idle', '[]', 0, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            command.upgrade(config, "head")
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(statement)
+                connection.commit()
+            finally:
+                connection.close()
+            with pytest.raises(RuntimeError, match=message):
+                command.downgrade(config, "kb20260914a")
+        finally:
+            get_settings.cache_clear()
 
 
 def test_ci_downgrade_target_is_unambiguous():
@@ -98,6 +183,12 @@ def test_upgrade_head_creates_identity_and_operations_tables(monkeypatch):
         "browser_portal_tickets",
         "browser_portal_owners",
         "geo_answer_observations",
+        "analysis_snapshot_receipts",
+        "analysis_findings",
+        "browser_spaces",
+        "browser_space_tasks",
+        "browser_space_events",
+        "browser_space_event_counters",
     } <= tables
     assert "requested_by_user_id" in task_columns
     assert any(
@@ -177,6 +268,80 @@ async def test_execution_actor_migrations_upgrade_disposable_postgres():
     }
 
 
+def test_analysis_snapshot_migration_adds_typed_correlation_and_receipts(monkeypatch):
+    with TemporaryDirectory() as directory:
+        database = Path(directory) / "migration.db"
+        monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{database.as_posix()}")
+        get_settings.cache_clear()
+        config = Config()
+        config.set_main_option("script_location", "backend/migrations")
+
+        try:
+            command.upgrade(config, "head")
+        finally:
+            get_settings.cache_clear()
+
+        connection = sqlite3.connect(database)
+        try:
+            acquisition_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(acquisition_executions)"
+                )
+            }
+            acquisition_indexes = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA index_list(acquisition_executions)"
+                )
+            }
+            acquisition_table_sql = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'acquisition_executions'"
+            ).fetchone()[0]
+            receipt_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(analysis_snapshot_receipts)"
+                )
+            }
+            receipt_indexes = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA index_list(analysis_snapshot_receipts)"
+                )
+            }
+        finally:
+            connection.close()
+
+    assert {"workspace_id", "project_id", "workflow_id", "run_id"} <= acquisition_columns
+    assert "ix_acquisition_executions_analysis_scope_started_at" in acquisition_indexes
+    assert "ck_acquisition_executions_complete_run_correlation" in acquisition_table_sql
+    assert {
+        "selection_hash",
+        "workspace_id",
+        "project_id",
+        "workflow_id",
+        "studio_workflow_version_id",
+        "run_id",
+        "requested_by_user_id",
+        "schema_version",
+        "redaction_version",
+        "source_start_at",
+        "source_end_at",
+        "workflow_trace_event_count",
+        "acquisition_execution_metric_count",
+        "total_row_count",
+        "status",
+        "failure_code",
+        "attempt_count",
+        "last_attempt_at",
+        "completed_at",
+        "expires_at",
+    } <= receipt_columns
+    assert "ix_analysis_snapshot_scope_created" in receipt_indexes
+
+
 def test_workflow_run_version_foreign_key_is_restrict(monkeypatch):
     with TemporaryDirectory() as directory:
         database = Path(directory) / "migration.db"
@@ -213,6 +378,73 @@ def test_workflow_run_version_foreign_key_is_restrict(monkeypatch):
         and row[6] == "RESTRICT"
         for row in foreign_keys
     )
+
+
+def test_analysis_finding_migration_adds_durable_scalar_citations(monkeypatch):
+    with TemporaryDirectory() as directory:
+        database = Path(directory) / "migration.db"
+        monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{database.as_posix()}")
+        get_settings.cache_clear()
+        config = Config()
+        config.set_main_option("script_location", "backend/migrations")
+
+        try:
+            command.upgrade(config, "head")
+        finally:
+            get_settings.cache_clear()
+
+        connection = sqlite3.connect(database)
+        try:
+            columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(analysis_findings)")
+            }
+            indexes = {
+                row[1]
+                for row in connection.execute("PRAGMA index_list(analysis_findings)")
+            }
+            foreign_keys = list(
+                connection.execute("PRAGMA foreign_key_list(analysis_findings)")
+            )
+            table_sql = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'analysis_findings'"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+
+    assert {
+        "workspace_id",
+        "project_id",
+        "workflow_id",
+        "studio_workflow_version_id",
+        "run_id",
+        "snapshot_receipt_id",
+        "author_user_id",
+        "observation",
+        "interpretation",
+        "recommendation",
+        "selector_kind",
+        "selector_key",
+        "evidence_metric",
+        "evidence_value",
+        "evidence_unit",
+        "source_start_at",
+        "source_end_at",
+    } <= columns
+    assert {
+        "ix_analysis_findings_scope_created",
+        "ix_analysis_findings_snapshot_receipt",
+    } <= indexes
+    assert any(
+        row[2] == "analysis_snapshot_receipts"
+        and row[3] == "snapshot_receipt_id"
+        and row[4] == "id"
+        and row[6] == "RESTRICT"
+        for row in foreign_keys
+    )
+    assert "ck_analysis_findings_selector_key" in table_sql
+    assert "ck_analysis_findings_evidence_mapping" in table_sql
 
 
 def test_c2_downgrade_removes_only_operations_agent_tables(monkeypatch):

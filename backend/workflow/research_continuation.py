@@ -1,7 +1,5 @@
 """Governed cross-run continuation and ledger projection for research workflows."""
 
-from __future__ import annotations
-
 import hashlib
 import json
 import uuid
@@ -12,23 +10,28 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.workflow_run import WorkflowRun, WorkflowRunEvent
 from backend.schemas.workflow import (
-    WorkflowNodeRunEvent,
     WorkflowProject,
     WorkflowProjectNode,
+    WorkflowRunInput,
+    WorkflowRunStartRequest,
+    WorkflowRunTrigger,
+)
+from backend.schemas.workflow_research import (
     WorkflowResearchContinuationRequest,
     WorkflowResearchContinuationResponse,
     WorkflowResearchLedgerEntry,
     WorkflowResearchLedgerResponse,
-    WorkflowRunInput,
+)
+from backend.schemas.workflow_runtime import (
+    WorkflowNodeRunEvent,
     WorkflowRunProjection,
-    WorkflowRunStartRequest,
-    WorkflowRunTrigger,
 )
 from backend.security.identity import RequestIdentity
 from backend.workflow.opencli_hda_tracer import (
     authorize_workflow_project_actor,
     start_workflow_run,
 )
+from backend.workflow.workflow_plugins import WorkflowPluginRegistry
 
 _MAX_CONTINUATION_ITEMS = 200
 _MAX_LEDGER_ITEMS = 1000
@@ -48,6 +51,7 @@ async def continue_research_workflow_run(
     *,
     session: AsyncSession,
     request_identity: RequestIdentity | None = None,
+    plugins: WorkflowPluginRegistry | None = None,
 ) -> WorkflowResearchContinuationResponse | None:
     parent = await _load_run(parent_run_id, session)
     if parent is None:
@@ -242,6 +246,7 @@ async def continue_research_workflow_run(
     await start_workflow_run(
         child_request,
         session=session,
+        plugins=plugins,
         request_identity=request_identity,
         requested_by_user_id=parent_row.requested_by_user_id,
     )
@@ -315,6 +320,7 @@ async def _continuation_response(
     additional_count: int,
     replayed: bool,
     session: AsyncSession,
+    plugins: WorkflowPluginRegistry | None = None,
 ) -> WorkflowResearchContinuationResponse:
     ledger = await get_research_ledger(child_run_id, session=session)
     loaded = await _load_run(child_run_id, session)

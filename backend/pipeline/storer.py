@@ -13,6 +13,7 @@ from backend.models.record import CollectedRecord
 from backend.models.geo_observation import GeoAnswerObservation
 from backend.pipeline import odp_client
 from backend.pipeline.sinks.base import CollectionLineage
+
 logger = logging.getLogger(__name__)
 
 # SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 999 on older builds (32766 on
