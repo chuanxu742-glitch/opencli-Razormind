@@ -190,8 +190,8 @@ async function mockOperationsPage(page, options = {}) {
             traceId: selectedRun.trace_id,
             valid: true,
             status: selectedRun.status,
-            startedAt: SOURCE_RANGE.startAt,
-            updatedAt: SOURCE_RANGE.endAt,
+            startedAt: selectedRun.started_at,
+            updatedAt: selectedRun.updated_at,
             eventCount: 91,
             nodeStates: [],
             errors: [],
@@ -205,7 +205,7 @@ async function mockOperationsPage(page, options = {}) {
             valid: true,
             eventCount: 91,
             lastSequence: 91,
-            updatedAt: SOURCE_RANGE.endAt,
+            updatedAt: selectedRun.updated_at,
             nodeStates: [],
             sourceOutputNodeIds: [],
             sourceOutputItemCount: 0,
@@ -284,7 +284,7 @@ async function openRunTrace(page) {
   await page.goto(`/studio/projects/${PROJECT_ID}/operations?workspace=${WORKSPACE_ID}`)
   await expect(page.getByText('Daily acquisition')).toBeVisible()
   await page.getByRole('button', { name: 'Trace' }).click()
-  await expect(page.getByRole('heading', { name: /Run Trace/ })).toBeVisible()
+  await expect(page.getByRole('heading', { name: /执行状态 Trace/ })).toBeVisible()
   return page.locator('section[aria-labelledby="run-analysis-snapshot-title"]')
 }
 

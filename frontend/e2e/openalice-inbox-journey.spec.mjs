@@ -50,7 +50,6 @@ test('inbox proposal restores its exact Agent conversation and remains reachable
   expect(followUpBody.context).toEqual({ project_id: projectId, workflow_id: workflowId, run_id: runId, surface: 'inbox_result' })
   await expect(page.getByText('已根据当前运行上下文整理下一步。')).toBeVisible()
   await page.getByRole('link', { name: '继续原会话' }).click()
-  await page.getByRole('button', { name: 'Agent' }).click()
   await expect(page.getByRole('dialog', { name: '全局 Agent' })).toBeVisible()
   await expect(page.getByLabel('选择 Agent 会话')).toHaveValue(conversationId)
   await page.getByRole('button', { name: '确认执行' }).click()

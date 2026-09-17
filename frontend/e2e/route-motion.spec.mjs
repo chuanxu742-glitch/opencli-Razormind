@@ -271,7 +271,7 @@ function routeUrlMatches(href) {
   const expected = new URL(href, 'http://route-motion.test')
   return (url) => {
     const actual = new URL(url)
-    return actual.pathname === expected.pathname && actual.search === expected.search
+    return actual.pathname === expected.pathname && [...expected.searchParams].every(([key, value]) => actual.searchParams.get(key) === value)
   }
 }
 
@@ -678,7 +678,7 @@ test('runtime reduced-motion changes stop the active route and restore the next 
   await page.emulateMedia({ reducedMotion: 'reduce' })
   const reducedFrame = await page.evaluate(() => globalThis.__routeMotionReducedFrame)
   expect(reducedFrame).toEqual({ reduced: true, activeRoots: 0 })
-  await expect.poll(() => new URL(page.url()).search).toBe('?tab=pending')
+  await expect.poll(() => new URL(page.url()).searchParams.get('tab')).toBe('pending')
   const afterReduce = await captureMotion(page)
   console.log(`[route-motion] runtime-reduce ${JSON.stringify({
     before: activeBeforeReduce.routeAnimations,

@@ -274,7 +274,7 @@ async def test_materialization_outage_is_indeterminate_and_recovery_appends_revi
     async def query(request):
         if request["mode"] == "attempt_page":
             if not recovered:
-                raise OdpQueryUnavailable("cursor snapshot unavailable")
+                raise OdpQueryUnavailableError("cursor snapshot unavailable")
             return {
                 **_base(request),
                 "mode": "attempt_page",

@@ -71,7 +71,7 @@ def test_intelligence_migration_renders_postgresql_offline_sql(tmp_path):
     result = _run_alembic(
         "postgresql+asyncpg://opencli:opencli@localhost/opencli",
         "upgrade",
-        "v2c3d4e5f6g7:head",
+        "v2c3d4e5f6g7:w3c4d5e6f7g8",
         "--sql",
     )
     assert result.returncode == 0, result.stderr

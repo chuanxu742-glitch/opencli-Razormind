@@ -10,6 +10,13 @@ depends_on = None
 
 
 def upgrade():
+    # Plugin-hub databases can be stamped past the profile-kind migration
+    # while retaining its older browser table. Repair before creating guards.
+    bind = op.get_bind()
+    if not op.get_context().as_sql:
+        columns = {column["name"] for column in sa.inspect(bind).get_columns("browser_instances")}
+        if "profile_kind" not in columns:
+            op.add_column("browser_instances", sa.Column("profile_kind", sa.String(20), nullable=False, server_default="authenticated"))
     op.create_table(
         "platform_browser_accounts",
         sa.Column("id", sa.String(36), primary_key=True),

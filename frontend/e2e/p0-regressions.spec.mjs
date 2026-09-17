@@ -9,23 +9,23 @@ import {
 const api = (path) => `**/api/v1${path}`
 
 async function installPluginFixtures(page) {
-  await page.route(api('/plugins'), (route) => route.fulfill({
+  await page.route(/\/api\/v1\/(?:workspaces\/[^/]+\/)?plugins$/, (route) => route.fulfill({
     contentType: 'application/json',
     body: JSON.stringify({ success: true, data: [
-      { id: 'e2e-provider', providerKey: 'e2e/test-plugin', name: 'E2E Provider', author: 'E2E', version: '1.0.0', sourceKind: 'bundled', sourceDigest: 'e2e', manifestSpecVersion: '1.0', signatureState: 'bundled', labels: { zh_Hans: 'E2E Provider' }, descriptions: { zh_Hans: 'Deterministic test provider' }, icon: 'globe', pluginTypes: ['adapter'], runtimeStatus: 'READY', capabilities: [{ id: 'browser', family: 'tool', key: 'browser', label: 'Browser', blockers: [], flowCapability: true, status: 'READY' }], nodeDefinitions: [], manifest: {}, permissions: {}, blockers: [], bundled: false, installedAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' },
+      { id: 'e2e-provider', providerKey: 'e2e/test-plugin', name: 'E2E Provider', enabled: true, grantedPermissions: [], author: 'E2E', version: '1.0.0', sourceKind: 'bundled', sourceDigest: 'e2e', manifestSpecVersion: '1.0', signatureState: 'bundled', labels: { zh_Hans: 'E2E Provider' }, descriptions: { zh_Hans: 'Deterministic test provider' }, icon: 'globe', pluginTypes: ['adapter'], runtimeStatus: 'READY', capabilities: [{ id: 'browser', family: 'tool', key: 'browser', label: 'Browser', blockers: [], flowCapability: true, status: 'READY' }], nodeDefinitions: [], manifest: {}, permissions: {}, blockers: [], bundled: false, installedAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' },
     ] }),
   }))
-  await page.route('**/api/workflow/capabilities', (route) => route.fulfill({
+  await page.route('**/api/workflow/capabilities*', (route) => route.fulfill({
     contentType: 'application/json',
     body: JSON.stringify({ success: true, data: { version: 'test', catalog: [], primitives: [], channels: [], notifiers: [], triggers: [], resources: [] } }),
   }))
-  await page.route('**/api/v1/plugins/capabilities', (route) => route.fulfill({
+  await page.route(/\/api\/v1\/(?:workspaces\/[^/]+\/)?plugins\/capabilities$/, (route) => route.fulfill({
     contentType: 'application/json',
     body: JSON.stringify({ success: true, data: { version: 'opencli.node-capabilities.v1', authority: 'backend', nodes: [{
       id: 'e2e-provider.browser', label: 'Browser', description: 'E2E browser capability', category: 'tool', origin: 'plugin', provider: 'e2e/test-plugin', source: 'backend.workflow.node_capabilities', readiness: 'runnable', runtimeBinding: 'workflow.external-tool.capability', kind: 'action', capability: 'tool', icon: 'Globe2', inputPorts: [], outputPorts: [], parameters: [], difyNodeTypes: [], missing: [],
     }], categories: [{ id: 'tool', label: 'Tool', count: 1 }], summary: { total: 1, byReadiness: { runnable: 1 }, byOrigin: { plugin: 1 } } } }),
   }))
-  await page.route('**/api/v1/workspaces', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ success: true, data: [{ id: 'e2e-workspace', name: 'E2E Workspace' }] }) }))
+  await page.route(/\/api\/v1\/(?:governance\/)?workspaces$/, (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ success: true, data: [{ id: 'e2e-workspace', name: 'E2E Workspace' }] }) }))
   await page.route('**/api/v1/workspaces/*/projects', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ success: true, data: [], meta: { total: 0, page: 1, pages: 0, limit: 20 } }) }))
 }
 
@@ -52,14 +52,14 @@ async function goAuthed(page, path) {
 
 test('plugins tabs expose semantic selection and installed capability detail', async ({ page }) => {
   await installPluginFixtures(page)
-  await goAuthed(page, '/plugins')
-  const tabs = page.getByRole('navigation', { name: '插件页面' })
+  await goAuthed(page, '/plugins?type=tool')
+  const tabs = page.getByRole('navigation', { name: '插件中心视图' })
   await expect(tabs.getByRole('button', { name: '已安装' })).toHaveAttribute('aria-current', 'page')
-  await tabs.getByRole('button', { name: '节点能力' }).dispatchEvent('click')
-  await expect(page.getByRole('navigation', { name: '插件页面' }).getByRole('button', { name: '节点能力' })).toHaveAttribute('aria-current', 'page')
-  await page.getByRole('navigation', { name: '插件页面' }).getByRole('button', { name: '探索市场' }).dispatchEvent('click')
-  await expect(page.getByRole('navigation', { name: '插件页面' }).getByRole('button', { name: '探索市场' })).toHaveAttribute('aria-current', 'page')
-  await page.getByRole('navigation', { name: '插件页面' }).getByRole('button', { name: '已安装' }).dispatchEvent('click')
+  await tabs.getByRole('button', { name: '能力目录' }).dispatchEvent('click')
+  await expect(page.getByRole('navigation', { name: '插件中心视图' }).getByRole('button', { name: '能力目录' })).toHaveAttribute('aria-current', 'page')
+  await page.getByRole('navigation', { name: '插件中心视图' }).getByRole('button', { name: '探索市场' }).dispatchEvent('click')
+  await expect(page.getByRole('navigation', { name: '插件中心视图' }).getByRole('button', { name: '探索市场' })).toHaveAttribute('aria-current', 'page')
+  await page.getByRole('navigation', { name: '插件中心视图' }).getByRole('button', { name: '已安装' }).dispatchEvent('click')
   await page.getByRole('button', { name: '查看 E2E Provider 插件' }).click()
   await expect(page.getByText('声明的能力')).toBeVisible()
   await expect(page.getByText('Browser', { exact: true }).first()).toBeVisible()
@@ -67,10 +67,10 @@ test('plugins tabs expose semantic selection and installed capability detail', a
 
 test('plugin CTA carries capability context into Studio and can be removed', async ({ page }) => {
   await installPluginFixtures(page)
-  await goAuthed(page, '/plugins')
+  await goAuthed(page, '/plugins?type=tool')
   await page.getByRole('button', { name: '查看 E2E Provider 插件' }).click()
   await page.getByText('带着能力进入 Studio', { exact: true }).click()
-  await expect(page).toHaveURL(/\/studio\?provider=e2e-provider&capability=/)
+  await expect(page).toHaveURL(/\/studio\?.*provider=e2e-provider&capability=/)
   await expect(page.getByRole('region', { name: '能力上下文' })).toContainText('e2e-provider')
   await expect(page.getByText(/目录 readiness 不等于 run-scoped admission/)).toBeVisible()
   const removeContext = page.getByRole('link', { name: '移除能力上下文' })
@@ -157,18 +157,20 @@ test('Action Center preserves canonical pane state while compatibility routes re
   await expect(page).toHaveURL(/\/inbox\?tab=tasks$/)
 
   await page.goto('/tasks?status=failed')
-  await expect(page).toHaveURL(/\/inbox\?status=failed&tab=tasks$/)
+  await expect(page).toHaveURL(/\/tasks\?status=failed$/)
   await expect(page.getByText('Failed source')).toBeVisible()
   await expect
     .poll(() => taskRequests.filter((status) => status === 'failed').length)
     .toBeGreaterThan(1)
+  await page.goto('/inbox?status=failed&tab=tasks')
   await expect(tabs.getByRole('link', { name: '通知规则' })).toHaveAttribute(
     'href',
     '/inbox?status=failed&tab=notifications',
   )
 
   await page.goto('/notifications?rule_id=e2e')
-  await expect(page).toHaveURL(/\/inbox\?rule_id=e2e&tab=notifications$/)
+  await expect(page).toHaveURL(/\/notifications\?rule_id=e2e$/)
+  await page.goto('/inbox?rule_id=e2e&tab=notifications')
   await expect(page.getByRole('region', { name: '通知规则' })).toBeVisible()
 
   await page.goto('/control/actions?outcome=pending')
@@ -290,7 +292,7 @@ test('task detail rejects a non-canonical return path after loading', async ({ p
   await page.goto('/tasks/task-failed-e2e?returnTo=%2Finbox%3Ftab%3Dtasks-unsafe')
   await expect.poll(() => taskDetailRequests.length).toBe(1)
 
-  await expect(page.getByRole('link', { name: '返回工作项' })).toHaveAttribute('href', '/inbox?tab=tasks')
+  await expect(page.getByRole('link', { name: '返回工作项' })).toHaveAttribute('href', '/tasks')
 })
 test('notifications pane creates, confirms deletes, and keeps a rule after delete failure', async ({ page }) => {
   await installActionCenterFixtures(page)

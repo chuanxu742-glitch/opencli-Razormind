@@ -463,7 +463,8 @@ test('关闭保存期间抵御旧轮询且不重复打开或关闭，完成后�
   await expect(page.getByTestId('browser-saving-status')).toBeVisible()
   await session.getByRole('button', { name: '更多', exact: true }).click()
   await expect(page.getByRole('menuitem', { name: '关闭浏览器并保存', exact: true })).toBeDisabled()
-  await page.keyboard.press('Escape')
+  await session.getByRole('button', { name: '更多', exact: true }).click()
+  await expect(page.getByRole('menu')).toBeHidden()
   await expect(session.getByRole('button', { name: '打开浏览器', exact: true })).toBeDisabled()
   // Even equal-revision stale snapshots cannot undo the acknowledged saving state.
   sessionControl.replace({ status: 'presenting', revision: 2 })

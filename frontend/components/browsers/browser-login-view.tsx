@@ -71,7 +71,7 @@ export function BrowserLoginView({ account, onClose, onDelete }: { account: Brow
     const label = name.trim() || frame.data?.suggested_name?.trim()
     if (label) await renameBrowserAccount(account.id, label.slice(0, 100))
     await confirmBrowserAccount(account.id, 'confirmed')
-  }, onSuccess: () => { void client.invalidateQueries({ queryKey: ['browser-accounts'] }); toast.success('已保存登录确认'); onClose() }, onError: (error: Error) => { setActing(false); toast.error(error.message) } })
+  }, onSuccess: () => { void client.invalidateQueries({ queryKey: ['platform-browser-accounts'] }); toast.success('已保存登录确认'); onClose() }, onError: (error: Error) => { setActing(false); toast.error(error.message) } })
   const refresh = () => {
     inputFailed.current = false
     setInputError('')
