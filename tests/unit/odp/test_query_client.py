@@ -4,8 +4,8 @@ from uuid import UUID
 import pytest
 
 from backend.odp.query_client import (
-    OdpQueryRejected,
-    OdpQueryUnavailable,
+    OdpQueryRejectedError,
+    OdpQueryUnavailableError,
     OdpReconciliationDelegation,
     OdpRecordKey,
     build_attempt_page_request,

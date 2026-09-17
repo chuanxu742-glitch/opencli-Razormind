@@ -149,12 +149,12 @@ async def reconcile_iii_collection_odp(
             page_size=page_size,
         )
         return ApiResponse.ok(await post_reconciliation_query(request))
-    except OdpQueryRejected as exc:
+    except OdpQueryRejectedError as exc:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             "ODP reconciliation request was rejected",
         ) from exc
-    except OdpQueryUnavailable as exc:
+    except OdpQueryUnavailableError as exc:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "ODP reconciliation is unavailable",
