@@ -63,6 +63,7 @@ class BrowserInstance(TimestampMixin):
     # derived from this writable volume.
     profile_kind: Mapped[str] = mapped_column(String(20), nullable=False, default="authenticated")
     profile_name: Mapped[str] = mapped_column(String(100), nullable=False, default="")
+    login_reserved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     runtime_bundle_id: Mapped[str | None] = mapped_column(
         ForeignKey("browser_runtime_bundles.id", ondelete="RESTRICT"),
         nullable=True,
@@ -79,7 +80,9 @@ def _default_profile_name(_mapper, _connection, target: BrowserInstance) -> None
         if len(target.endpoint) <= 100:
             target.profile_name = target.endpoint
         else:
-            target.profile_name = f"endpoint-{hashlib.sha256(target.endpoint.encode()).hexdigest()[:64]}"
+            target.profile_name = (
+                f"endpoint-{hashlib.sha256(target.endpoint.encode()).hexdigest()[:64]}"
+            )
 
 
 class BrowserRuntimeDeployment(TimestampMixin):
@@ -257,7 +260,7 @@ class BrowserLoginSession(TimestampMixin):
     __table_args__ = (
         UniqueConstraint("workspace_id", "id", name="uq_browser_login_sessions_workspace_id"),
         CheckConstraint(
-            "purpose IN ('login', 'execution')",
+            "purpose IN ('login', 'execution', 'browser')",
             name="ck_browser_login_sessions_purpose",
         ),
         CheckConstraint(

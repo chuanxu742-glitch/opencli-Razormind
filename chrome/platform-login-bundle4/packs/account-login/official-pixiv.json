@@ -1,0 +1,27 @@
+{
+  "id": "official-pixiv",
+  "version": "0.1.0",
+  "platform": "pixiv",
+  "allowed_origins": [
+    "https://accounts.pixiv.net"
+  ],
+  "allowed_redirect_origins": [
+    "https://accounts.pixiv.net"
+  ],
+  "login_url": "/login",
+  "modes": [
+    "form"
+  ],
+  "qr_supported": false,
+  "interaction_supported": true,
+  "identity_probe_supported": false,
+  "authentication_verified": false,
+  "selectors": [
+    {
+      "id": "form",
+      "selector": "body",
+      "kind": "form",
+      "frame": "main"
+    }
+  ]
+}

@@ -124,6 +124,15 @@ export default function RecordRelationshipGraphPage() {
   const workspaceId = workspacesQuery.data?.[0]?.id ?? null
   const projectsQuery = useWorkspaceProjects(workspaceId)
   const projects = useMemo(() => projectsQuery.data ?? [], [projectsQuery.data])
+  const projectsLoading = workspacesQuery.isLoading || (!!workspaceId && projectsQuery.isLoading)
+  const projectsError = workspacesQuery.error || projectsQuery.error
+  const projectPlaceholder = projectsLoading
+    ? '正在加载项目…'
+    : projectsError
+      ? '项目加载失败'
+      : projects.length === 0
+        ? '暂无可预览的项目'
+        : '选择要预览的项目'
 
   useEffect(() => {
     if (!projects.length) {
@@ -178,16 +187,17 @@ export default function RecordRelationshipGraphPage() {
         <header className="flex min-w-0 flex-col gap-3 border-b px-4 py-3 lg:flex-row lg:items-center lg:justify-between">
           <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
             <Select
-              value={selectedProjectId ?? ''}
+              value={selectedProjectId}
+              disabled={projects.length === 0}
               onValueChange={(value) => {
                 setSelectedProjectId(value || null)
                 setSelectedNodeId(null)
                 setSearch('')
               }}
             >
-              <SelectTrigger className="w-full min-w-0 sm:w-60">
-                <SelectValue placeholder="选择要预览的项目">
-                  {(value: string | null) => projects.find((project) => project.id === value)?.name ?? '选择要预览的项目'}
+              <SelectTrigger aria-label="预览项目" aria-busy={projectsLoading} className="w-full min-w-0 sm:w-60">
+                <SelectValue placeholder={projectPlaceholder}>
+                  {(value: string | null) => projects.find((project) => project.id === value)?.name ?? projectPlaceholder}
                 </SelectValue>
               </SelectTrigger>
               <SelectContent>
@@ -201,12 +211,14 @@ export default function RecordRelationshipGraphPage() {
 
             <Select
               value={String(maxNodes)}
+              disabled={!selectedProjectId}
               onValueChange={(value) => {
+                if (!value) return
                 setMaxNodes(Number(value))
                 setSelectedNodeId(null)
               }}
             >
-              <SelectTrigger className="w-full min-w-0 sm:w-44">
+              <SelectTrigger aria-label="图谱密度" className="w-full min-w-0 sm:w-44">
                 <SelectValue>
                   {(value: string | null) => DENSITY_OPTIONS.find((option) => option.value === Number(value))?.label ?? '标准 · 700 节点'}
                 </SelectValue>
@@ -223,6 +235,8 @@ export default function RecordRelationshipGraphPage() {
             <div className="relative w-full min-w-0 sm:w-64">
               <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
               <Input
+                aria-label="搜索当前项目预览"
+                disabled={!preview}
                 value={search}
                 onChange={(event) => setSearch(event.target.value)}
                 onKeyDown={(event) => {

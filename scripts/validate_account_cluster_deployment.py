@@ -15,16 +15,17 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_COMPOSE_PATH = ROOT / "docker-compose.account-cluster.yml"
-NODE_NAMES = ("account-node-1", "account-node-2")
+NODE_NAME = re.compile(r"account-node-([1-9][0-9]*)")
 RUNTIME_STATE_DIR = "/var/lib/opencli/account-runtime"
 PROFILE_DIR = "/home/agent/.config/chromium"
 EXPECTED_VOLUME_TARGETS = {PROFILE_DIR, RUNTIME_STATE_DIR}
-IDENTITY_KEYS = ("AGENT_NODE_ID", "AGENT_NODE_CREDENTIAL_ID")
+IDENTITY_KEYS = ("AGENT_NODE_ID", "AGENT_NODE_CREDENTIAL_ID", "AGENT_NODE_CREDENTIAL")
 IMMUTABLE_IMAGE = re.compile(r"(?:sha256:|[^@\s]+@sha256:)[0-9a-f]{64}")
 
 
@@ -37,11 +38,11 @@ def _required_environment(service: dict[str, Any], node_number: int) -> dict[str
     if not isinstance(environment, dict):
         raise DeploymentValidationError(f"account-node-{node_number} has no environment mapping")
     normalized = {
-        str(key): "" if value is None else str(value)
-        for key, value in environment.items()
+        str(key): "" if value is None else str(value) for key, value in environment.items()
     }
     required = {
         "CENTRAL_API_URL",
+        "AGENT_ADVERTISE_URL",
         "API_AUTH_TOKEN",
         "AGENT_NODE_ID",
         "AGENT_NODE_CREDENTIAL_ID",
@@ -110,9 +111,11 @@ def validate_compose_document(document: dict[str, Any], *, require_resolved: boo
     services = document.get("services")
     if not isinstance(services, dict):
         raise DeploymentValidationError("Compose recipe has no services mapping")
-    if set(services) != set(NODE_NAMES):
+    if not services or any(
+        not isinstance(name, str) or not NODE_NAME.fullmatch(name) for name in services
+    ):
         raise DeploymentValidationError(
-            "Compose recipe must define exactly account-node-1 and account-node-2"
+            "Compose recipe must define one or more independent account-node-N services"
         )
 
     networks = document.get("networks")
@@ -126,12 +129,16 @@ def validate_compose_document(document: dict[str, Any], *, require_resolved: boo
 
     actual_volumes: set[str] = set()
     identities = {key: set() for key in IDENTITY_KEYS}
-    for number, node_name in enumerate(NODE_NAMES, start=1):
+    advertised_urls: set[tuple[str, int]] = set()
+    for node_name in services:
+        number = int(NODE_NAME.fullmatch(node_name).group(1))
         service = services[node_name]
         if not isinstance(service, dict):
             raise DeploymentValidationError(f"{node_name} is not a service mapping")
         if service.get("ports"):
             raise DeploymentValidationError(f"{node_name} must not publish host ports")
+        if service.get("network_mode") or service.get("pid") or service.get("ipc"):
+            raise DeploymentValidationError(f"{node_name} must retain independent namespaces")
         if service.get("hostname") != node_name:
             raise DeploymentValidationError(f"{node_name} must retain its stable hostname")
         if _network_names(service, node_name) != {"account-control"}:
@@ -161,9 +168,40 @@ def validate_compose_document(document: dict[str, Any], *, require_resolved: boo
             raise DeploymentValidationError(f"{node_name} must use {RUNTIME_STATE_DIR}")
         if environment["PROFILE_DIR"] != PROFILE_DIR:
             raise DeploymentValidationError(f"{node_name} must use {PROFILE_DIR}")
-        if require_resolved and not environment["CENTRAL_API_URL"].startswith("https://"):
+        if require_resolved:
+            for key in ("CENTRAL_API_URL", "AGENT_ADVERTISE_URL"):
+                try:
+                    url = urlsplit(environment[key])
+                    if (
+                        url.scheme != "https"
+                        or not url.hostname
+                        or url.username
+                        or url.password
+                        or url.query
+                        or url.fragment
+                        or any(ch.isspace() for ch in environment[key])
+                        or (key == "AGENT_ADVERTISE_URL" and url.path not in ("", "/"))
+                    ):
+                        raise ValueError
+                    port = 443 if url.port is None else url.port
+                    if port == 0:
+                        raise ValueError
+                except ValueError:
+                    raise DeploymentValidationError(
+                        f"{node_name} requires a valid HTTPS {key}"
+                    ) from None
+                if key == "AGENT_ADVERTISE_URL":
+                    endpoint = (url.hostname.lower(), port)
+                    if endpoint in advertised_urls:
+                        raise DeploymentValidationError(
+                            f"{node_name} duplicates HTTPS agent endpoint"
+                        )
+                    advertised_urls.add(endpoint)
+        elif not environment["AGENT_ADVERTISE_URL"].startswith(
+            f"${{ACCOUNT_NODE_{number}_ADVERTISE_URL:?"
+        ):
             raise DeploymentValidationError(
-                f"{node_name} must use an HTTPS control-plane URL in production preflight"
+                f"{node_name} must require its own HTTPS advertised URL"
             )
 
         for key in IDENTITY_KEYS:

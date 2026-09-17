@@ -20,7 +20,7 @@ Two things stay where they were on purpose, to keep this slice behavior-only:
 from __future__ import annotations
 
 import logging
-from typing import Sequence
+from collections.abc import Sequence
 
 from backend.pipeline.sinks.base import RunContext, SinkResult
 
@@ -87,6 +87,9 @@ class LegacyDbSink:
                 channel_type=ctx.provider, forward_to_odp=self.forward_to_odp,
                 identities=identities,
                 lineage=ctx.lineage_envelope(),
+                capture_geo_observations=ctx.geo_observation_capture,
+                task_run_id=ctx.run_id,
+                observed_at=ctx.observed_at,
             )
             await session.commit()
 

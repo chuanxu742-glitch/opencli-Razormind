@@ -5,7 +5,10 @@ import time
 
 import pytest
 
+from backend import database
 from backend.browser_pool import LocalBrowserPool
+from backend.models.browser import BrowserInstance
+from backend.models.browser_space import BrowserSpace
 
 
 @pytest.fixture
@@ -347,8 +350,10 @@ async def test_local_cancel_after_profile_lock_wins_restores_slot_once():
     await holder.__aenter__()
 
     waiter = asyncio.create_task(pool.acquire("B").__aenter__())
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
+    for _ in range(20):
+        if not pool.available_for("B"):
+            break
+        await asyncio.sleep(0)
     assert pool.available_for("B") is False
 
     await holder.__aexit__(None, None, None)
@@ -647,3 +652,37 @@ async def test_runtime_drift_slot_never_receives_a_new_session():
 
     async with pool.acquire() as endpoint:
         assert endpoint == ready
+
+
+@pytest.mark.asyncio
+async def test_active_browser_space_blocks_pool_until_closed(db_session, monkeypatch):
+    """A Space reservation remains exclusive even without an account lease."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    endpoint = "http://space-reserved:9222"
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    monkeypatch.setattr(database, "AsyncSessionLocal", factory)
+    instance = BrowserInstance(endpoint=endpoint, profile_name="space-reserved")
+    db_session.add(instance)
+    await db_session.flush()
+    space = BrowserSpace(
+        workspace_id="workspace-space-reservation",
+        browser_instance_id=instance.id,
+        owner_type="operator",
+        owner_id="owner-space-reservation",
+        granted_capabilities=["snapshot"],
+    )
+    db_session.add(space)
+    await db_session.commit()
+
+    pool = LocalBrowserPool([endpoint])
+    pool.enforce_account_reservations = True
+    with pytest.raises(Exception) as exc_info:
+        async with pool.acquire(endpoint):
+            pass
+    assert getattr(exc_info.value, "code", None) == "no_ready_browser_slot"
+
+    space.status = "closed"
+    await db_session.commit()
+    async with pool.acquire(endpoint) as acquired:
+        assert acquired == endpoint

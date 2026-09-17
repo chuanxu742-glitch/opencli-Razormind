@@ -519,7 +519,7 @@ test('session restore retains credentials through network and 5xx recovery', asy
   assert.match(provider, /removeOidcUser\(\)[\s\S]*?oidcUser = null/)
   assert.match(
     provider,
-    /loginWithPassword\(username, password\)[\s\S]*?claimOidcOwnership\(false\)[\s\S]*?await removeOidcUser\(\)[\s\S]*?requireCurrentRecovery\(epoch\)[\s\S]*?persistBootstrapIdentityToken\(result\.access_token\)/,
+    /loginWithPassword\(username, password\)[\s\S]*?claimOidcOwnership\(false\)[\s\S]*?await removeOidcUser\(\)[\s\S]*?requireCurrentRecovery\(epoch\)[\s\S]*?persistLocalIdentityToken\(result\.access_token, rememberLogin\)/,
   )
   assert.match(provider, /if \(!oidcRemoved\) throw new Error\('无法清理旧 OIDC 会话/)
   assert.doesNotMatch(provider, /if \(!oidcUser\.id_token\) throw/)

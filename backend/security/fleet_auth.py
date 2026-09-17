@@ -62,6 +62,7 @@ using the bearer header or query parameter described above.
 
 from __future__ import annotations
 
+import re
 import secrets
 import sys
 from collections.abc import Sequence
@@ -84,14 +85,13 @@ PROTECTED_PREFIXES = ("/api", "/mcp")
 FLEET_AUTH_ERROR_CODE = "fleet_auth_invalid"
 # Receiver v2 supplies independent MAC authentication; Studio remains fleet-authenticated.
 CONTROLLED_RECEIVER_V2_PREFIX = "/api/v1/controlled-receiver/v2/"
+_ACCOUNT_PORTAL_WS_PATH = re.compile(
+    r"/api/v1/workspaces/[^/]+/browser-accounts/[^/]+/login-sessions/[^/]+/(?:portal|browser)"
+)
 
-# Local login is intentionally the only unauthenticated API route. Once the
-# user has a local bearer session, the identity dependency authenticates it.
-PUBLIC_PATHS = frozenset({"/api/v1/auth/login"})
-
-# Local login is intentionally the only unauthenticated API route. Once the
-# user has a local bearer session, the identity dependency authenticates it.
-PUBLIC_PATHS = frozenset({"/api/v1/auth/login"})
+# Local login bootstraps the local bearer session. The native terminal WebSocket
+# performs its own short-lived signed-ticket check before accepting a client.
+PUBLIC_PATHS = frozenset({"/api/v1/auth/login", "/api/v1/chat/terminal/ws"})
 
 _LOCALHOST_HOSTS = frozenset({"localhost", "::1"})
 
@@ -148,18 +148,6 @@ def _is_local_session(credential: str) -> bool:
     return claims.get("auth_method") == "local" and claims.get("sub") == "local-admin"
 
 
-def _is_local_session(credential: str) -> bool:
-    try:
-        claims = jwt.decode(
-            credential,
-            get_settings().secret_key,
-            algorithms=["HS256"],
-        )
-    except JWTError:
-        return False
-    return claims.get("auth_method") == "local" and claims.get("sub") == "local-admin"
-
-
 def _token_matches(candidate: str, token: str) -> bool:
     """Constant-time comparison of a caller-supplied credential against *token*."""
     return secrets.compare_digest(candidate.strip().encode("utf-8"), token.encode("utf-8"))
@@ -200,6 +188,12 @@ class FleetAuthMiddleware:
             await self.app(scope, receive, send)
             return
         path = scope.get("path", "")
+        if scope["type"] == "websocket" and _ACCOUNT_PORTAL_WS_PATH.fullmatch(path):
+            # This one route authenticates its short-lived HttpOnly owner cookie,
+            # origin, live membership and fenced session before accepting. A
+            # browser WebSocket cannot carry the HTTP bearer used to issue it.
+            await self.app(scope, receive, send)
+            return
         if not path.startswith(PROTECTED_PREFIXES) or path in PUBLIC_PATHS:
             await self.app(scope, receive, send)
             return

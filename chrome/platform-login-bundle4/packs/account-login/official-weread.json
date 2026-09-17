@@ -1,0 +1,27 @@
+{
+  "id": "official-weread",
+  "version": "0.1.0",
+  "platform": "weread",
+  "allowed_origins": [
+    "https://weread.qq.com"
+  ],
+  "allowed_redirect_origins": [
+    "https://weread.qq.com"
+  ],
+  "login_url": "/",
+  "modes": [
+    "form"
+  ],
+  "qr_supported": false,
+  "interaction_supported": true,
+  "identity_probe_supported": false,
+  "authentication_verified": false,
+  "selectors": [
+    {
+      "id": "form",
+      "selector": "body",
+      "kind": "form",
+      "frame": "main"
+    }
+  ]
+}

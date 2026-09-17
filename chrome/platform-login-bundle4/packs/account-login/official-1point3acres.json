@@ -1,0 +1,27 @@
+{
+  "id": "official-1point3acres",
+  "version": "0.1.0",
+  "platform": "1point3acres",
+  "allowed_origins": [
+    "https://auth.1point3acres.com"
+  ],
+  "allowed_redirect_origins": [
+    "https://auth.1point3acres.com"
+  ],
+  "login_url": "/login",
+  "modes": [
+    "form"
+  ],
+  "qr_supported": false,
+  "interaction_supported": true,
+  "identity_probe_supported": false,
+  "authentication_verified": false,
+  "selectors": [
+    {
+      "id": "form",
+      "selector": "body",
+      "kind": "form",
+      "frame": "main"
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "id": "official-tiktok",
+  "version": "0.1.0",
+  "platform": "tiktok",
+  "allowed_origins": [
+    "https://www.tiktok.com"
+  ],
+  "allowed_redirect_origins": [
+    "https://www.tiktok.com"
+  ],
+  "login_url": "/login",
+  "modes": [
+    "form"
+  ],
+  "qr_supported": false,
+  "interaction_supported": true,
+  "identity_probe_supported": false,
+  "authentication_verified": false,
+  "selectors": [
+    {
+      "id": "form",
+      "selector": "body",
+      "kind": "form",
+      "frame": "main"
+    }
+  ]
+}

@@ -91,7 +91,7 @@ export default function NodeDetailPage({ params }: { params: Promise<{ id: strin
             <CardDescription>安装脚本不携带凭证；删除前需要二次确认。</CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-2">
-            <Button variant="outline" render={<a href={installUrl} download="opencli-agent.sh" />}>
+            <Button variant="outline" nativeButton={false} render={<a href={installUrl} download="opencli-agent.sh" />}>
               <Download className="size-4" />
               下载 Agent 安装脚本
             </Button>

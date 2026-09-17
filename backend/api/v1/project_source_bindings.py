@@ -51,9 +51,9 @@ async def _account_for_binding(
         select(BrowserAccount).where(
             BrowserAccount.workspace_id == workspace_id,
             BrowserAccount.id == account_id,
-        )
+        ).with_for_update().execution_options(populate_existing=True)
     )
-    if account is None:
+    if account is None or account.status_reason_code == "account_deleted":
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Browser account not found")
     return account
 

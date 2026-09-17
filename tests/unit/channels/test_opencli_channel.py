@@ -613,7 +613,10 @@ async def test_validate_config_missing_both(channel):
 
 @pytest.mark.asyncio
 async def test_health_check_binary_exists(channel):
-    with patch("os.path.isfile", return_value=True):
+    with (
+        patch("os.path.isfile", return_value=True),
+        patch("backend.browser_pool.get_pool", side_effect=RuntimeError("pool not initialized")),
+    ):
         result = await channel.health_check()
     assert result is True
 
@@ -845,7 +848,6 @@ async def test_collect_agent_mode_ws_protocol_not_implemented(channel, db_engine
     mock_pool.acquire.return_value = cm
 
     mock_settings = _make_mock_settings(collection_mode="agent")
-    sm = _sessionmaker(db_engine)
 
     with (
         patch("backend.browser_pool.get_pool", return_value=mock_pool),
@@ -878,7 +880,6 @@ async def test_collect_agent_mode_unknown_protocol(channel, db_engine):
     mock_pool.acquire.return_value = cm
 
     mock_settings = _make_mock_settings(collection_mode="agent")
-    sm = _sessionmaker(db_engine)
 
     with (
         patch("backend.browser_pool.get_pool", return_value=mock_pool),

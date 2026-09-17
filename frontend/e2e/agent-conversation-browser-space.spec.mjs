@@ -148,6 +148,9 @@ test('Browser Space creates, submits a capability task, shows events, and closes
     const request = route.request()
     const path = new URL(request.url()).pathname
     if (path.endsWith('/auth/me')) return route.fulfill(response(identity))
+    if (path.endsWith('/browser-spaces/instances')) {
+      return route.fulfill(response([{ id: 'browser-instance-e2e', capabilities: ['page.metadata'] }]))
+    }
     if (path.endsWith('/workspaces') && request.method() === 'GET') {
       return route.fulfill(response([workspace]))
     }
@@ -191,8 +194,8 @@ test('Browser Space creates, submits a capability task, shows events, and closes
   await page.goto(`/browsers?workspace=${workspaceId}`)
   await expect(page.getByText('Browser Spaces', { exact: true })).toBeVisible()
   const browserInstanceInput = page.getByLabel('BrowserInstance ID')
-  await expect(browserInstanceInput).toBeEditable()
-  await browserInstanceInput.fill('browser-instance-e2e')
+  await expect(browserInstanceInput).toBeEnabled()
+  await browserInstanceInput.selectOption('browser-instance-e2e')
   await page.getByRole('button', { name: '创建 Browser Space', exact: true }).click()
   await expect(page.getByText('Browser Space 已创建')).toBeVisible()
 

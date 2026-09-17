@@ -1,0 +1,27 @@
+{
+  "id": "official-linkedin-learning",
+  "version": "0.1.0",
+  "platform": "linkedin-learning",
+  "allowed_origins": [
+    "https://www.linkedin.com"
+  ],
+  "allowed_redirect_origins": [
+    "https://www.linkedin.com"
+  ],
+  "login_url": "/login?session_redirect=%2Flearning%2F",
+  "modes": [
+    "form"
+  ],
+  "qr_supported": false,
+  "interaction_supported": true,
+  "identity_probe_supported": false,
+  "authentication_verified": false,
+  "selectors": [
+    {
+      "id": "form",
+      "selector": "body",
+      "kind": "form",
+      "frame": "main"
+    }
+  ]
+}

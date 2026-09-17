@@ -7,13 +7,14 @@ const read = (path) => readFile(new URL(`../${path}`, import.meta.url), 'utf8')
 test('inbox combines existing operational signals with server-backed human approvals', async () => {
   const page = await read('app/(app)/inbox/page.tsx')
   const approvalDetail = await read('components/inbox/queue-detail.tsx')
+  const conversationThread = await read('components/inbox/inbox-conversation-thread.tsx')
   const hooks = await read('lib/api/hooks.ts')
   const endpoints = await read('lib/api/endpoints.ts')
 
-  assert.match(page, /useInfiniteTasks\(\{ status: 'failed', limit: 100 \}\)/)
-  assert.match(page, /useInfiniteTasks\(\{ status: 'pending', limit: 100 \}\)/)
-  assert.match(page, /useInfiniteNotificationLogs\(\{ limit: 100 \}\)/)
-  assert.match(page, /useInfiniteControlActions\(\{ outcome: 'pending', limit: 100 \}\)/)
+  assert.match(page, /useInfiniteTasks\(\{ status: 'failed', limit: 100 \}, \{ enabled: pendingActive \}\)/)
+  assert.match(page, /useInfiniteTasks\(\{ status: 'pending', limit: 100 \}, \{ enabled: pendingActive \}\)/)
+  assert.match(page, /useInfiniteNotificationLogs\(\{ limit: 100 \}, \{ enabled: pendingActive \}\)/)
+  assert.match(page, /useInfiniteControlActions\(\s*\{ outcome: 'pending', limit: 100 \},\s*\{ enabled: pendingActive \},?\s*\)/)
   assert.match(hooks, /export function useInfiniteTasks/)
   assert.match(hooks, /export function useInfiniteNotificationLogs/)
   assert.match(hooks, /export function useInfiniteControlActions/)
@@ -21,7 +22,17 @@ test('inbox combines existing operational signals with server-backed human appro
     endpoints,
     /listNotificationLogs = \(params\?: \{\s*rule_id\?: string;\s*page\?: number;\s*limit\?: number;\s*\}\) =>/,
   )
-  assert.doesNotMatch(page, /useMyWorkspaces|useOperationsInbox|\/workspaces|operations-inbox/)
+  assert.match(page, /useOperationsInbox\(workspaceId, 'open'/)
+  assert.match(approvalDetail, /ApprovalQueueDetail/)
+  assert.match(page, /type: 'change_proposal', status: 'open'/)
+  assert.match(page, /proposalToQueueItem/)
+  assert.match(approvalDetail, /ProposalQueueDetail/)
+  assert.match(approvalDetail, /请在原 Agent 会话中确认或调整此提案/)
+  assert.doesNotMatch(approvalDetail, /decideOperationsApproval[\s\S]*ProposalQueueDetail/)
+  assert.match(approvalDetail, /InboxConversationThread/)
+  assert.match(conversationThread, /send\.mutateAsync/)
+  assert.match(conversationThread, /context,/)
+  assert.match(conversationThread, /InboxConversationUnavailable/)
 })
 
 test('inbox uses a Linear-style queue while preserving destinations for underlying records', async () => {
@@ -46,9 +57,10 @@ test('inbox uses a Linear-style queue while preserving destinations for underlyi
   assert.match(page, /scrollIntoView\(\{ block: 'nearest' \}\)/)
   assert.match(page, /\[content-visibility:auto\]/)
   assert.match(page, /href: `\/tasks\/\$\{task\.id\}`/)
-  assert.match(page, /href: '\/notifications'/)
-  assert.match(page, /href: '\/control\/actions'/)
+  assert.match(page, /href: '\/inbox\?tab=notifications'/)
+  assert.match(page, /href: '\/inbox\?tab=controls'/)
   assert.match(detail, /href=\{`\/sources\/\$\{item\.sourceId\}`\}/)
+  assert.match(page, /项目动态/)
 })
 
 test('inbox preserves queue state and progressively loads hundreds-scale signal sets', async () => {
@@ -69,6 +81,7 @@ test('inbox preserves queue state and progressively loads hundreds-scale signal 
 
 test('inbox renders explicit initial, partial, empty, and total failure states', async () => {
   const page = await read('app/(app)/inbox/page.tsx')
+  const tasks = await read('components/action-center/tasks-pane.tsx')
 
   assert.match(page, /const isInitialLoading =\s+queries\.every/)
   assert.match(page, /const isTotalFailure =\s+queries\.every/)
@@ -78,4 +91,9 @@ test('inbox renders explicit initial, partial, empty, and total failure states',
   assert.match(page, /<LoadingState rows=\{5\}/)
   assert.match(page, /<ErrorState/)
   assert.match(page, /重新读取/)
+  assert.match(tasks, /从研究、项目工作流或自动化发起任务后/)
+  assert.match(tasks, /const launchHref = workspaceId \? `\/launch\?workspace=\$\{encodeURIComponent\(workspaceId\)\}` : '\/launch'/)
+  assert.match(tasks, /const studioHref = workspaceId \? `\/studio\?workspace=\$\{encodeURIComponent\(workspaceId\)\}` : '\/studio'/)
+  assert.match(tasks, /<Link href=\{launchHref\}/)
+  assert.match(tasks, /<Link href=\{studioHref\}/)
 })

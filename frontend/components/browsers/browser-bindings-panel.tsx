@@ -233,7 +233,7 @@ export function BrowserBindingsPanel() {
           Legacy site bindings no longer assign browser identities. Select a workspace account and its pinned session from the account manager.
         </CardDescription>
         <CardAction>
-          <Button render={<a href="/browser-accounts" />} variant="outline" size="sm">Open account manager</Button>
+          <Button nativeButton={false} render={<a href="/browser-accounts" />} variant="outline" size="sm">Open account manager</Button>
         </CardAction>
       </CardHeader>
     </Card>

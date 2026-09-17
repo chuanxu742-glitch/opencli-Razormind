@@ -34,8 +34,8 @@ from backend.models.browser import (
     BrowserCommandKind,
     BrowserCommandStatus,
     BrowserDurableCommand,
-    BrowserLoginSession,
     BrowserLeaseStatus,
+    BrowserLoginSession,
 )
 from backend.models.edge_node import EdgeNode, EdgeNodeBoot, EdgeNodeCapacity
 from backend.schemas.browser_account import (
@@ -217,7 +217,7 @@ def _command_wire(command: BrowserDurableCommand) -> dict[str, Any]:
     }
 
 
-def _command_contract(command: BrowserDurableCommand) -> DurableCommandV1:
+def command_contract(command: BrowserDurableCommand) -> DurableCommandV1:
     try:
         return DurableCommandV1.from_wire(_command_wire(command))
     except Exception as exc:
@@ -295,22 +295,27 @@ class BrowserAccountScheduler:
         value = _coerce_command(command)
         await db.flush()
 
-        existing = await db.get(BrowserDurableCommand, value.command_id, with_for_update=True)
-        if existing is not None:
-            if _canonical_command_fields(_command_contract(existing)) != _canonical_command_fields(value):
-                raise SchedulerConflict("command_id is already bound to a different request")
-            return _command_contract(existing)
-
         account = await db.scalar(
             select(BrowserAccount)
             .where(
                 BrowserAccount.workspace_id == value.workspace_id,
                 BrowserAccount.id == value.account_id,
             )
-            .with_for_update()
+            .with_for_update().execution_options(populate_existing=True)
         )
         if account is None:
             raise SchedulerValidationError("account does not belong to workspace")
+        if account.status_reason_code == "account_deleted":
+            raise SchedulerConflict("account has been deleted")
+
+        existing = await db.get(BrowserDurableCommand, value.command_id, with_for_update=True)
+        if existing is not None:
+            if _canonical_command_fields(command_contract(existing)) != _canonical_command_fields(
+                value
+            ):
+                raise SchedulerConflict("command_id is already bound to a different request")
+            return command_contract(existing)
+
         if value.node_id is not None and account.node_id not in (None, value.node_id):
             raise SchedulerConflict("command node does not match account ownership")
         if value.expected_revision != account.revision:
@@ -327,10 +332,10 @@ class BrowserAccountScheduler:
         )
         if duplicate is not None:
             if _canonical_command_fields(
-                _command_contract(duplicate), include_command_id=False
+                command_contract(duplicate), include_command_id=False
             ) != _canonical_command_fields(value, include_command_id=False):
                 raise SchedulerConflict("idempotency key is already bound to a different request")
-            return _command_contract(duplicate)
+            return command_contract(duplicate)
 
         row = BrowserDurableCommand(
             id=value.command_id,
@@ -352,13 +357,17 @@ class BrowserAccountScheduler:
         )
         db.add(row)
         await db.flush()
-        return _command_contract(row)
+        return command_contract(row)
 
     async def _lock_node_for_work(self, db: AsyncSession, identity: NodeIdentity) -> tuple[EdgeNode, EdgeNodeBoot, EdgeNodeCapacity] | None:
         node = await db.scalar(
             select(EdgeNode).where(EdgeNode.id == identity.node_id).with_for_update()
         )
         if node is None:
+            return None
+        from backend.services.browser_account_pool import pool_node_blocked
+
+        if pool_node_blocked(identity.node_id):
             return None
         if (
             node.boot_id != identity.boot_id
@@ -393,10 +402,19 @@ class BrowserAccountScheduler:
 
     @staticmethod
     def _command_can_run(account: BrowserAccount, command: BrowserDurableCommand) -> bool:
-        if account.paused or account.status in {
+        if account.status_reason_code == "account_deleted":
+            return False
+        completion_command = command.kind in {
+            BrowserCommandKind.STOP_AND_SAVE.value,
+            BrowserCommandKind.CLOSE_SESSION.value,
+            BrowserCommandKind.ISOLATE.value,
+        }
+        if account.paused and not completion_command:
+            return False
+        if account.status in {
             BrowserAccountStatus.CLOSED.value,
             BrowserAccountStatus.EXPIRED.value,
-        }:
+        } and not completion_command:
             return False
         if command.kind == BrowserCommandKind.EXECUTE_REFERENCE.value:
             if account.auth_required or account.status not in {
@@ -428,8 +446,6 @@ class BrowserAccountScheduler:
             return []
         _node, boot, capacity = locked
         now = _utc(self.clock())
-        if capacity.occupied_slots >= capacity.slot_limit:
-            return []
 
         commands = list(
             (
@@ -465,7 +481,11 @@ class BrowserAccountScheduler:
                     BrowserAccount.workspace_id == command.workspace_id,
                     BrowserAccount.id == command.account_id,
                 )
-                .with_for_update()
+                # API/service mutations lock account before their queued
+                # command. This allocator already owns the command row, so a
+                # busy account must be skipped instead of waiting in reverse
+                # lock order. The next poll reloads both current rows.
+                .with_for_update(skip_locked=True).execution_options(populate_existing=True)
             )
             if account is None or (
                 account.node_id is not None and account.node_id != identity.node_id
@@ -480,8 +500,6 @@ class BrowserAccountScheduler:
                 command.completed_at = now
                 command.error_code = BrowserAccountErrorCode.STALE_GENERATION.value
                 continue
-            if capacity.occupied_slots >= capacity.slot_limit:
-                break
 
             current_lease = await db.scalar(
                 select(BrowserAccountLease)
@@ -537,6 +555,8 @@ class BrowserAccountScheduler:
                         expires_at=current_lease.expires_at,
                     )
                 )
+                continue
+            if capacity.occupied_slots >= capacity.slot_limit:
                 continue
             if boot.max_epoch < 0:
                 raise SchedulerConflict("node epoch watermark is invalid")

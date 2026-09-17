@@ -55,7 +55,8 @@ const catalogSource = await readFile(new URL('../lib/workflow/node-catalog.ts', 
 const workflowSource = await readFile(new URL('../lib/workflow/gaojixing-doubao-workflow.ts', import.meta.url), 'utf8')
 const templateSource = await readFile(new URL('../lib/workflow/studio-templates.ts', import.meta.url), 'utf8')
 const runProxySource = await readFile(new URL('../app/api/workflow/run/route.ts', import.meta.url), 'utf8')
-const runPanelSource = await readFile(new URL('../components/flow/run-trace-panel.tsx', import.meta.url), 'utf8')
+const runPanelSource = (await readFile(new URL('../components/flow/run-trace-panel.tsx', import.meta.url), 'utf8')).replace(/\r\n/g, '\n')
+const researchPanelSource = await readFile(new URL('../components/flow/run-trace-research-workbenches.tsx', import.meta.url), 'utf8')
 
 test('Gaojixing canvas uses two real deep capabilities instead of a bloated primitive graph', () => {
   assert.match(catalogSource, /id: "package\.gaojixing\.doubao-batch"/)
@@ -320,7 +321,7 @@ test('Studio Run presents the fresh question bank as a file contract instead of 
   )
   assert.match(
     runFlow,
-    /const started = await startWorkflowRun[\s\S]*?setQuestionBankFile\(\(current\) => current === submittedQuestionBankFile \? null : current\)[\s\S]*?monitorActiveRun\(started\)/,
+    /const started =[\s\S]*?await startWorkflowRun[\s\S]*?setQuestionBankFile\(\(current\) => current === submittedQuestionBankFile \? null : current\)[\s\S]*?monitorActiveRun\(started\)/,
   )
   assert.match(runFlow, /const submittedQuestionBankFile = questionBankFile/)
   assert.match(
@@ -334,7 +335,7 @@ test('Studio Run presents the fresh question bank as a file contract instead of 
   assert.doesNotMatch(runPanelSource, /aria-label="本次运行输入 JSON"/)
   assert.match(runPanelSource, /\{!runFileInput \? \([\s\S]*?导入节点输出/)
   assert.match(runPanelSource, /allowSourceOutputs=\{!runFileInput\}/)
-  assert.match(runPanelSource, /const canContinue = allowSourceOutputs\s*&&/)
+  assert.match(researchPanelSource, /const canContinue = allowSourceOutputs\s*&&/)
 })
 
 test('Question bank Run proxy streams the original bounded multipart request', async () => {

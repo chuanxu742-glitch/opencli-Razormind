@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.models.base import TimestampMixin
@@ -9,7 +9,9 @@ class Automation(TimestampMixin):
 
     __tablename__ = "automations"
     __table_args__ = (
-        UniqueConstraint("workspace_id", "starter_key", name="uq_automations_workspace_starter_key"),
+        UniqueConstraint(
+            "workspace_id", "starter_key", name="uq_automations_workspace_starter_key"
+        ),
     )
 
     workspace_id: Mapped[str] = mapped_column(
@@ -32,7 +34,9 @@ class Automation(TimestampMixin):
     schedule: Mapped[str] = mapped_column(String(255), nullable=False)
     timezone: Mapped[str] = mapped_column(String(64), nullable=False, default="UTC")
     session_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="fresh")
-    approval_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="suggest_changes")
+    approval_mode: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="suggest_changes"
+    )
     project: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_by_user_id: Mapped[str] = mapped_column(

@@ -66,9 +66,78 @@ function sameGeneration(left, right) {
   );
 }
 
+// Ephemeral isolated-world state, never read from the page or persisted.
+const platformDocumentId = globalThis.crypto?.randomUUID?.() ?? null;
+let platformViewGeneration = Date.now();
+let platformQrGeneration = platformViewGeneration;
+let platformQrSource = null;
+
+function platformRule(rule) {
+  return rule?.id === "xiaohongshu-qr" && rule.version === "0.1.0" &&
+    rule.platform === "xiaohongshu" && rule.login_url === "/explore" &&
+    rule.authentication_verified === false && JSON.stringify(rule.modes) === '["qr"]' &&
+    JSON.stringify(rule.allowed_origins) === '["https://www.xiaohongshu.com"]' &&
+    JSON.stringify(rule.allowed_redirect_origins) === '["https://www.xiaohongshu.com"]' &&
+    rule.selectors?.length === 1 && rule.selectors[0].selector === "img.qrcode-img" &&
+    window.location.origin === "https://www.xiaohongshu.com";
+}
+
+function platformQr(rule) {
+  const nodes = nodesFor(selectorFor(rule, "qr")).filter((node) => {
+    const style = getComputedStyle(node);
+    return style.visibility !== "hidden" && style.display !== "none" &&
+      Number(style.opacity) !== 0 && rectFor(node) !== null;
+  });
+  if (nodes.length !== 1) return { node: null, ambiguous: nodes.length > 1 };
+  const node = nodes[0];
+  // Only the observed QR element inside the observed login container is eligible.
+  if (!node.parentElement?.matches(".qrcode") || !node.parentElement.parentElement?.matches(".code-area")) {
+    return { node: null, ambiguous: true };
+  }
+  const source = node.currentSrc || node.src || "";
+  let allowed = /^data:image\/(?:png|jpeg|webp);base64,/.test(source);
+  try {
+    const url = new URL(source, window.location.href);
+    allowed ||= url.origin === window.location.origin && ["https:", "blob:"].includes(url.protocol);
+  } catch { /* Invalid sources never create a projection. */ }
+  if (!allowed) return { node: null, ambiguous: true };
+  if (source !== platformQrSource) {
+    platformQrSource = source;
+    platformQrGeneration = Math.max(Date.now(), platformQrGeneration + 1);
+    platformViewGeneration = Math.max(Date.now(), platformViewGeneration + 1);
+  }
+  return { node, ambiguous: false };
+}
+
+function observePlatform(args, target, rule) {
+  if (typeof args.session_id !== "string" || !args.session_id ||
+      !Number.isInteger(args.epoch) || args.epoch < 0) return fail("login_rule_unknown");
+  const { node, ambiguous } = platformQr(rule);
+  if (String(target.documentId) !== platformDocumentId || target.viewGeneration !== platformViewGeneration) {
+    return fail("stale_generation");
+  }
+  const expired = node?.parentElement.parentElement.textContent?.includes("二维码已过期");
+  const region = node && !expired ? rectFor(node) : null;
+  const result = {
+    session_id: args.session_id, epoch: args.epoch, rule_id: rule.id, rule_version: rule.version,
+    target: targetWire(target), view_generation: target.viewGeneration,
+    state: region ? "presenting" : "unknown", evidence_kind: "unknown",
+    observed_at: new Date().toISOString(),
+  };
+  if (region) result.region_focus = {
+    target: targetWire(target), view_generation: target.viewGeneration,
+    region_kind: "qr", approved_regions: [region],
+  };
+  if (ambiguous) result.error_code = "ambiguous_login_region";
+  else if (!region) result.error_code = "auth_required";
+  // QR disappearance is never authentication. Real identity verification is pending.
+  return { ok: true, result };
+}
+
 function fixedRule(message) {
   const rule = message?.rule;
   if (!rule || typeof rule !== "object") return null;
+  if (platformRule(rule)) return rule;
   if (rule.id !== "controlled-login-fixture" || rule.version !== "1.0.0") return null;
   const fixedOrigins = ["http://127.0.0.1:49906", "http://localhost:49906"];
   if (
@@ -248,6 +317,10 @@ async function trustedGeneration(rule) {
 }
 
 async function targetGenerationIsCurrent(target, rule) {
+  if (platformRule(rule)) {
+    platformQr(rule);
+    return String(target.documentId) === platformDocumentId && target.viewGeneration === platformViewGeneration;
+  }
   const current = await trustedGeneration(rule);
   return sameGeneration(current, {
     documentId: target.documentId,
@@ -313,6 +386,7 @@ function approvedRegionFocus(rule, target) {
 }
 
 async function observe(message, args, target, rule) {
+  if (platformRule(rule)) return observePlatform(args, target, rule);
   if (!(await targetGenerationIsCurrent(target, rule))) return fail("stale_generation");
   if (
     typeof args.session_id !== "string" || args.session_id.length === 0 ||
@@ -432,6 +506,11 @@ async function switchMode(message, args, target, rule) {
 }
 
 async function targetProbe(rule) {
+  if (platformRule(rule)) {
+    platformQr(rule);
+    return { ok: true, target: { documentId: platformDocumentId, viewGeneration: platformViewGeneration,
+      origin: window.location.origin, qrGeneration: platformQrGeneration } };
+  }
   const current = await trustedGeneration(rule);
   if (current === null) return fail("stale_generation");
   const qr = document.querySelector("#qr-region img#login-qr");

@@ -44,10 +44,10 @@ async function loadPackIndex() {
         !isSafeAssetPath(pack.rule) ||
         pack.rule !== "packs/account-login/rules.json" ||
         pack.rule_version !== "1.0.0" ||
-        pack.matches.length !== 2 ||
-        new Set(pack.matches).size !== 2 ||
+        pack.matches.length !== 3 ||
+        new Set(pack.matches).size !== 3 ||
         !pack.matches.every((match) =>
-          ["http://127.0.0.1:49906/*", "http://localhost:49906/*"].includes(match),
+          ["http://127.0.0.1:49906/*", "http://localhost:49906/*", "https://www.xiaohongshu.com/*"].includes(match),
         ))
     ) {
       throw new Error("account-login pack requires a fixed local rule manifest");
@@ -80,6 +80,24 @@ async function loadPackIndex() {
         throw new Error("account-login rule manifest is not the fixed deployed rule");
       }
       pack.ruleManifest = Object.freeze(rule);
+      pack.ruleManifests = { [`${rule.id}@${rule.version}`]: pack.ruleManifest };
+      if (!Array.isArray(pack.rules) || pack.rules.length !== 1 ||
+          pack.rules[0].id !== "xiaohongshu-qr" || pack.rules[0].version !== "0.1.0" ||
+          pack.rules[0].path !== "packs/account-login/xiaohongshu-qr.json") {
+        throw new Error("login rules must match the fixed packaged registry");
+      }
+      const platformResponse = await fetch(chrome.runtime.getURL(pack.rules[0].path));
+      if (!platformResponse.ok) throw new Error("packaged platform rule unavailable");
+      const platformRule = await platformResponse.json();
+      if (platformRule.id !== "xiaohongshu-qr" || platformRule.version !== "0.1.0" ||
+          platformRule.platform !== "xiaohongshu" || platformRule.login_url !== "/explore" ||
+          JSON.stringify(platformRule.allowed_origins) !== '["https://www.xiaohongshu.com"]' ||
+          JSON.stringify(platformRule.allowed_redirect_origins) !== '["https://www.xiaohongshu.com"]' ||
+          JSON.stringify(platformRule.modes) !== '["qr"]' || platformRule.authentication_verified !== false ||
+          platformRule.selectors?.length !== 1 || platformRule.selectors[0].selector !== "img.qrcode-img") {
+        throw new Error("platform rule does not match the fixed packaged QR-only policy");
+      }
+      pack.ruleManifests[`${platformRule.id}@${platformRule.version}`] = Object.freeze(platformRule);
     }
     const actionIds = new Set();
     for (const action of pack.actions) {
@@ -344,7 +362,7 @@ async function refreshLogin(tabId, target, args, pack) {
 }
 
 async function invokePackAction({ pack: packId, action: actionId, args, tabId }) {
-  const pack = packs.get(packId);
+  let pack = packs.get(packId);
   const action = pack?.actions.find((candidate) => candidate.id === actionId);
   if (!pack || !action) throw new Error("unknown pack action");
   let resolvedTabId = tabId;
@@ -354,7 +372,11 @@ async function invokePackAction({ pack: packId, action: actionId, args, tabId })
     if (!Number.isInteger(resolvedTabId)) {
       throw new Error("account-login actions require an explicit tabId");
     }
-    loginRule = pack.ruleManifest;
+    const ruleKey = args?.rule_id === undefined && args?.rule_version === undefined
+      ? `${pack.ruleManifest.id}@${pack.ruleManifest.version}`
+      : `${args?.rule_id}@${args?.rule_version}`;
+    loginRule = pack.ruleManifests?.[ruleKey];
+    pack = { ...pack, ruleManifest: loginRule };
     if (!loginRule) throw new Error("account-login fixed rule is unavailable");
     loginTarget = requireLoginTarget(args, resolvedTabId, loginRule);
     const tab = await chrome.tabs.get(resolvedTabId);
@@ -370,7 +392,7 @@ async function invokePackAction({ pack: packId, action: actionId, args, tabId })
     await verifyLoginTarget(resolvedTabId, loginTarget, pack);
     if (actionId === "login.open") {
       const loginUrl = new URL(loginRule.login_url, loginTarget.origin);
-      if (loginUrl.origin !== loginTarget.origin || loginUrl.pathname !== "/login" || loginUrl.search || loginUrl.hash) {
+      if (loginUrl.origin !== loginTarget.origin || loginUrl.pathname !== loginRule.login_url || loginUrl.search || loginUrl.hash) {
         throw new Error("account-login fixed login URL is not allowed");
       }
       if (args?.login_url !== undefined && args.login_url !== loginUrl.href) {
@@ -423,9 +445,43 @@ async function invokePackAction({ pack: packId, action: actionId, args, tabId })
   };
 }
 
+async function verifyBoundLoginTarget(target) {
+  const pack = packs.get('account-login');
+  const rules = Object.values(pack?.ruleManifests || {}).filter(
+    rule => rule.allowed_origins.includes(target?.origin));
+  if (rules.length !== 1 || !Number.isInteger(target?.tabId) || target.frameId !== 0)
+    throw new Error('login target rule is missing or ambiguous');
+  return verifyLoginTarget(target.tabId, target, {...pack, ruleManifest:rules[0]});
+}
+
+async function discoverLoginTarget({rule_id, rule_version, origin, tab_id}) {
+  const pack = packs.get('account-login');
+  const rule = pack?.ruleManifests?.[`${rule_id}@${rule_version}`];
+  if (!rule || !rule.allowed_origins.includes(origin)) throw new Error('login rule unavailable');
+  const tabs = await chrome.tabs.query({});
+  const matches = tabs.filter(tab => {
+    try { const currentOrigin = new URL(tab.url || '').origin; return tab_id == null ? currentOrigin === origin : tab.id === tab_id && rule.allowed_origins.includes(currentOrigin); } catch { return false; }
+  });
+  if (matches.length !== 1 || !Number.isInteger(matches[0].id))
+    throw new Error('login target is ambiguous');
+  const tabId = matches[0].id;
+  origin = new URL(matches[0].url).origin;
+  const probe = await chrome.tabs.sendMessage(tabId, {
+    type:'opencli-script-host.login-target', pack:pack.id, version:pack.version, rule,
+  }, {frameId:0});
+  if (!probe?.ok || probe.target?.origin !== origin) throw new Error('login target probe failed');
+  const target = {tabId,frameId:0,documentId:probe.target.documentId,
+    origin,viewGeneration:probe.target.viewGeneration};
+  await verifyLoginTarget(tabId, target, {...pack,ruleManifest:rule});
+  return {tab_id:tabId,frame_id:0,document_id:target.documentId,origin,
+    view_generation:target.viewGeneration,qr_generation:probe.target.qrGeneration};
+}
+
 globalThis.opencliScriptHost = Object.freeze({
   health,
   invoke: invokePackAction,
+  discoverLoginTarget,
+  verifyLoginTarget: verifyBoundLoginTarget,
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {

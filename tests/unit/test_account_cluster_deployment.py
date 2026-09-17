@@ -1,3 +1,4 @@
+import copy
 import importlib.util
 import subprocess
 from pathlib import Path
@@ -34,13 +35,14 @@ def resolved_document():
             "AGENT_NODE_CREDENTIAL": "node-2-secret",
         },
     }
-    for number, node_name in enumerate(validator.NODE_NAMES, start=1):
+    for number, node_name in enumerate(compose["services"], start=1):
         service = compose["services"][node_name]
         service["image"] = "sha256:" + (str(number) * 64)
         service["networks"] = {"account-control": None}
         service["environment"].update(
             {
                 "CENTRAL_API_URL": "https://control.example.com",
+                "AGENT_ADVERTISE_URL": f"https://account-node-{number}.example.com",
                 "API_AUTH_TOKEN": "control-plane-token",
                 "BROWSER_RUNTIME_BUNDLE_ID": "opencli-default",
                 **values[number],
@@ -61,9 +63,7 @@ def resolved_document():
             },
         ]
     compose["networks"]["account-control"]["name"] = "production_control"
-    compose["volumes"] = {
-        key: {"name": f"production_{key}"} for key in compose["volumes"]
-    }
+    compose["volumes"] = {key: {"name": f"production_{key}"} for key in compose["volumes"]}
     return compose
 
 
@@ -83,6 +83,95 @@ def test_account_cluster_recipe_has_two_isolated_managed_nodes():
 
 def test_account_cluster_validator_accepts_resolved_long_syntax_compose():
     validator.validate_compose_document(resolved_document(), require_resolved=True)
+
+
+@pytest.mark.parametrize("key", ["network_mode", "pid", "ipc"])
+def test_shared_namespace_is_rejected(key):
+    compose = resolved_document()
+    compose["services"]["account-node-1"][key] = "host"
+    with pytest.raises(validator.DeploymentValidationError, match="independent namespaces"):
+        validator.validate_compose_document(compose, require_resolved=True)
+
+
+def test_recipe_requires_https_entry_and_current_bundle():
+    for number, service in enumerate(raw_document()["services"].values(), 1):
+        assert service["environment"]["AGENT_ADVERTISE_URL"].startswith(
+            f"${{ACCOUNT_NODE_{number}_ADVERTISE_URL:?"
+        )
+        assert service["environment"]["BROWSER_RUNTIME_BUNDLE_MANIFEST"] == (
+            "/opt/browser-runtime-bundles/opencli-default/4/manifest.json"
+        )
+
+
+@pytest.mark.parametrize("count", [1, 3, 5])
+def test_any_positive_number_of_isolated_nodes(count):
+    compose = resolved_document()
+    first = copy.deepcopy(compose["services"]["account-node-1"])
+    compose["services"] = {}
+    for number in range(1, count + 1):
+        node = copy.deepcopy(first)
+        node["hostname"] = f"account-node-{number}"
+        for key in validator.IDENTITY_KEYS:
+            node["environment"][key] = f"{key}-{number}"
+        node["environment"]["AGENT_ADVERTISE_URL"] = f"https://node-{number}.example.com"
+        for index, suffix in enumerate(("profile", "runtime_state")):
+            name = f"account_node_{number}_{suffix}"
+            node["volumes"][index]["source"] = name
+            compose["volumes"][name] = {"name": f"deployment_{name}"}
+        compose["services"][node["hostname"]] = node
+    validator.validate_compose_document(compose, require_resolved=True)
+
+
+@pytest.mark.parametrize("name", [None, "account-node-0", "account-node-01", "proxy"])
+def test_empty_or_non_node_recipe_is_rejected(name):
+    compose = resolved_document()
+    compose["services"] = {} if name is None else {name: compose["services"]["account-node-1"]}
+    with pytest.raises(validator.DeploymentValidationError, match="one or more"):
+        validator.validate_compose_document(compose, require_resolved=True)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://node.local",
+        "https://",
+        "https://user:secret@node.local",
+        "https://node.local/path",
+        "https://node.local?x=1",
+        "https://node.local:bad",
+        "https://node.local/#fragment",
+    ],
+)
+def test_invalid_advertised_url_is_rejected_without_echoing_url(url):
+    compose = resolved_document()
+    compose["services"]["account-node-1"]["environment"]["AGENT_ADVERTISE_URL"] = url
+    with pytest.raises(validator.DeploymentValidationError, match="valid HTTPS") as error:
+        validator.validate_compose_document(compose, require_resolved=True)
+    assert url not in str(error.value)
+
+
+def test_shared_https_endpoint_is_rejected_even_with_alias_syntax():
+    compose = resolved_document()
+    compose["services"]["account-node-1"]["environment"]["AGENT_ADVERTISE_URL"] = (
+        "https://NODE.example.com"
+    )
+    compose["services"]["account-node-2"]["environment"]["AGENT_ADVERTISE_URL"] = (
+        "https://node.example.com:443/"
+    )
+    with pytest.raises(validator.DeploymentValidationError, match="duplicates HTTPS"):
+        validator.validate_compose_document(compose, require_resolved=True)
+
+
+def test_nonsequential_raw_node_numbers_keep_own_variable_contract():
+    compose = raw_document()
+    node = copy.deepcopy(compose["services"].pop("account-node-2"))
+    node["hostname"] = "account-node-9"
+    node["environment"] = {
+        key: str(value).replace("ACCOUNT_NODE_2_", "ACCOUNT_NODE_9_")
+        for key, value in node["environment"].items()
+    }
+    compose["services"]["account-node-9"] = node
+    validator.validate_compose_document(compose)
 
 
 @pytest.mark.parametrize("identity_key", validator.IDENTITY_KEYS)

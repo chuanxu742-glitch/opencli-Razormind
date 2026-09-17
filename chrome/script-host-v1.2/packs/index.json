@@ -1,0 +1,10 @@
+[
+  {
+    "id": "page-basics",
+    "version": "1.0.0",
+    "matches": ["http://*/*", "https://*/*"],
+    "js": ["packs/page-basics/content.js"],
+    "run_at": "document_idle",
+    "actions": [{ "id": "page.metadata" }]
+  }
+]

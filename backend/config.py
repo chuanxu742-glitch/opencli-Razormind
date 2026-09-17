@@ -57,6 +57,7 @@ class Settings(BaseSettings):
 
     # Application
     app_name: str = "opencli-admin"
+    native_chat_bindings: list[dict] = Field(default_factory=list)
     app_env: Literal["development", "staging", "production"] = "development"
     debug: bool = False
     secret_key: str = _EPHEMERAL_SECRET_KEY
@@ -97,6 +98,20 @@ class Settings(BaseSettings):
     # instead). Env: LOCAL_MAX_CONCURRENT_PIPELINES.
     local_max_concurrent_pipelines: int = 8
 
+    # Comma-separated workflow adapter keys. Empty explicitly disables optional
+    # workflow plugins while preserving the generic event/runtime core.
+    workflow_plugins: str = "research-graph"
+
+    @property
+    def workflow_plugin_ids(self) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(
+                plugin.strip()
+                for plugin in self.workflow_plugins.split(",")
+                if plugin.strip()
+            )
+        )
+
     # Collection orchestrator:
     # admin — API内置 scheduler.py / Celery Beat 驱动定时采集（默认）
     # iii   — III engine + schedule-bootstrap 驱动 cron；API 仅保留 UI/手动任务
@@ -126,6 +141,10 @@ class Settings(BaseSettings):
     controlled_receiver_inbound_keys_json: str = "{}"
     controlled_receiver_max_clock_skew_seconds: int = 300
 
+
+
+
+
     # Redis / Celery — only required when task_executor="celery"
     redis_url: str = "redis://localhost:6379/0"
     celery_broker_url: str = "redis://localhost:6379/0"
@@ -142,6 +161,16 @@ class Settings(BaseSettings):
     # Empty (default) = auth disabled — dev posture, which the startup bind
     # guard only allows on a localhost bind. Env: API_AUTH_TOKEN.
     api_auth_token: str = ""
+    # MCP uses transport access and caller identity separately. Read these via
+    # Settings so native uvicorn launches honor .env as well as process env.
+    opencli_admin_api_url: str = "http://localhost:8031"
+    opencli_mcp_caller_token: str = ""
+    # Optional operator-configured SearXNG instance. Empty disables search;
+    # explicitly supplied public URLs remain available to the research tools.
+    searxng_url: str = ""
+    # Explicitly permits only the configured search service on a private
+    # network. It never applies to model/user-supplied source URLs.
+    searxng_allow_private: bool = False
     # Emergency first-run/recovery credential. Local administrator setup
     # verifies this value but never persists it as a daily login secret.
     bootstrap_admin_token: str = ""
@@ -215,6 +244,14 @@ class Settings(BaseSettings):
     # If empty, the system tries to derive it from request headers (may give internal URL
     # when behind a reverse proxy with changeOrigin=true).
     public_url: str = ""
+    # Exact browser-facing origin for account portals behind a host-rewriting proxy.
+    # Empty means the request's own origin; forwarded headers are never trusted here.
+    browser_portal_public_origin: str = ""
+    # Optional TigerVNC viewer used by the Windows desktop API process to open
+    # account browsers in a native window. Empty keeps the capability disabled.
+    # The native-window service requires an absolute executable path and never
+    # accepts a viewer path from an HTTP request.
+    browser_native_viewer_executable: str = ""
 
     # Fleet network bootstrap used by the generated edge-agent installer.
     # The collection layer only needs reachability between CENTRAL_API_URL and
@@ -283,6 +320,12 @@ class Settings(BaseSettings):
     # pinned Python 3.10 sidecar instead of the Python 3.13 API process.
     kats_runtime_url: str = "http://localhost:8096"
     kats_runtime_timeout_seconds: float = 120.0
+    # Optional External Analysis Runtime. PostgreSQL/SQLite remain authoritative;
+    # this endpoint is consulted only when an analysis capability is requested.
+    questdb_analysis_runtime_enabled: bool = False
+    questdb_analysis_runtime_url: str = "http://localhost:9000"
+    questdb_analysis_runtime_health_url: str = "http://localhost:9003"
+    questdb_analysis_runtime_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
     # Managed acquisition runtime. The commit/version are code-owned pins;
     # this path merely locates the installed checkout on every platform.
     ohmyopencli_root: str = "/opt/ohmyopencli"

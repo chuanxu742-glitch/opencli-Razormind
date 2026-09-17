@@ -1,0 +1,447 @@
+[
+  {
+    "id": "page-basics",
+    "version": "1.0.0",
+    "matches": [
+      "http://*/*",
+      "https://*/*"
+    ],
+    "js": [
+      "packs/page-basics/content.js"
+    ],
+    "run_at": "document_idle",
+    "actions": [
+      {
+        "id": "page.metadata"
+      }
+    ]
+  },
+  {
+    "id": "account-login",
+    "version": "1.0.0",
+    "matches": [
+      "http://127.0.0.1:49906/*",
+      "http://localhost:49906/*",
+      "https://account.dianping.com/*",
+      "https://accounts.douban.com/*",
+      "https://accounts.google.com/*",
+      "https://accounts.pixiv.net/*",
+      "https://admin.xiaoe-tech.com/*",
+      "https://app.slock.ai/*",
+      "https://auth.1point3acres.com/*",
+      "https://auth.band.us/*",
+      "https://auth.openai.com/*",
+      "https://channels.weixin.qq.com/*",
+      "https://chat.deepseek.com/*",
+      "https://chat.qwen.ai/*",
+      "https://claude.ai/*",
+      "https://clogin.ke.com/*",
+      "https://creator.douyin.com/*",
+      "https://gitee.com/*",
+      "https://github.com/*",
+      "https://grok.com/*",
+      "https://huggingface.co/*",
+      "https://jimeng.jianying.com/*",
+      "https://kyfw.12306.cn/*",
+      "https://linux.do/*",
+      "https://login.1688.com/*",
+      "https://login.coupang.com/*",
+      "https://login.taobao.com/*",
+      "https://login.zhipin.com/*",
+      "https://maimai.cn/*",
+      "https://manus.im/*",
+      "https://mp.toutiao.com/*",
+      "https://pan.quark.cn/*",
+      "https://passport.bilibili.com/*",
+      "https://passport.ctrip.com/*",
+      "https://passport.hupu.com/*",
+      "https://passport.jd.com/*",
+      "https://passport2.chaoxing.com/*",
+      "https://suno.com/*",
+      "https://v.flomoapp.com/*",
+      "https://web.okjike.com/*",
+      "https://weibo.com/*",
+      "https://weread.qq.com/*",
+      "https://www.amazon.com/*",
+      "https://www.bilibili.com/*",
+      "https://www.doubao.com/*",
+      "https://www.facebook.com/*",
+      "https://www.goofish.com/*",
+      "https://www.instagram.com/*",
+      "https://www.jianyu360.cn/*",
+      "https://www.kimi.com/*",
+      "https://www.linkedin.com/*",
+      "https://www.midjourney.com/*",
+      "https://www.nowcoder.com/*",
+      "https://www.reddit.com/*",
+      "https://www.rednote.com/*",
+      "https://www.reuters.com/*",
+      "https://www.tiktok.com/*",
+      "https://www.upwork.com/*",
+      "https://www.v2ex.com/*",
+      "https://www.xiaohongshu.com/*",
+      "https://www.zhihu.com/*",
+      "https://wx.zsxq.com/*",
+      "https://x.com/*",
+      "https://xueqiu.com/*",
+      "https://yuanbao.tencent.com/*",
+      "https://zhaopin.powerchina.cn/*"
+    ],
+    "js": [
+      "packs/account-login/content.js"
+    ],
+    "run_at": "document_idle",
+    "rule": "packs/account-login/rules.json",
+    "rule_version": "1.0.0",
+    "actions": [
+      {
+        "id": "login.observe",
+        "sensitive": false
+      },
+      {
+        "id": "login.open",
+        "sensitive": false
+      },
+      {
+        "id": "login.refresh",
+        "sensitive": false
+      },
+      {
+        "id": "login.switch-mode",
+        "sensitive": false
+      }
+    ],
+    "rules": [
+      {
+        "id": "xiaohongshu-qr",
+        "version": "0.2.0",
+        "path": "packs/account-login/xiaohongshu-qr.json"
+      },
+      {
+        "id": "bilibili-qr",
+        "version": "0.1.0",
+        "path": "packs/account-login/bilibili-qr.json"
+      },
+      {
+        "id": "douyin-qr",
+        "version": "0.1.0",
+        "path": "packs/account-login/douyin-qr.json"
+      },
+      {
+        "id": "official-12306",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-12306.json"
+      },
+      {
+        "id": "official-1688",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-1688.json"
+      },
+      {
+        "id": "official-1point3acres",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-1point3acres.json"
+      },
+      {
+        "id": "official-amazon",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-amazon.json"
+      },
+      {
+        "id": "official-band",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-band.json"
+      },
+      {
+        "id": "official-boss",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-boss.json"
+      },
+      {
+        "id": "official-chaoxing",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-chaoxing.json"
+      },
+      {
+        "id": "official-chatgpt",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-chatgpt.json"
+      },
+      {
+        "id": "official-claude",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-claude.json"
+      },
+      {
+        "id": "official-coupang",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-coupang.json"
+      },
+      {
+        "id": "official-ctrip",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-ctrip.json"
+      },
+      {
+        "id": "official-deepseek",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-deepseek.json"
+      },
+      {
+        "id": "official-dianping",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-dianping.json"
+      },
+      {
+        "id": "official-douban",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-douban.json"
+      },
+      {
+        "id": "official-doubao",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-doubao.json"
+      },
+      {
+        "id": "official-facebook",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-facebook.json"
+      },
+      {
+        "id": "official-flomo",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-flomo.json"
+      },
+      {
+        "id": "official-gemini",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-gemini.json"
+      },
+      {
+        "id": "official-gitee",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-gitee.json"
+      },
+      {
+        "id": "official-github",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-github.json"
+      },
+      {
+        "id": "official-grok",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-grok.json"
+      },
+      {
+        "id": "official-hf",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-hf.json"
+      },
+      {
+        "id": "official-hupu",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-hupu.json"
+      },
+      {
+        "id": "official-instagram",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-instagram.json"
+      },
+      {
+        "id": "official-jd",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-jd.json"
+      },
+      {
+        "id": "official-jianyu",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-jianyu.json"
+      },
+      {
+        "id": "official-jike",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-jike.json"
+      },
+      {
+        "id": "official-jimeng",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-jimeng.json"
+      },
+      {
+        "id": "official-ke",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-ke.json"
+      },
+      {
+        "id": "official-kimi",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-kimi.json"
+      },
+      {
+        "id": "official-linkedin",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-linkedin.json"
+      },
+      {
+        "id": "official-linkedin-learning",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-linkedin-learning.json"
+      },
+      {
+        "id": "official-linux-do",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-linux-do.json"
+      },
+      {
+        "id": "official-maimai",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-maimai.json"
+      },
+      {
+        "id": "official-manus",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-manus.json"
+      },
+      {
+        "id": "official-midjourney",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-midjourney.json"
+      },
+      {
+        "id": "official-notebooklm",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-notebooklm.json"
+      },
+      {
+        "id": "official-nowcoder",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-nowcoder.json"
+      },
+      {
+        "id": "official-pixiv",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-pixiv.json"
+      },
+      {
+        "id": "official-powerchina",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-powerchina.json"
+      },
+      {
+        "id": "official-quark",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-quark.json"
+      },
+      {
+        "id": "official-qwen",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-qwen.json"
+      },
+      {
+        "id": "official-reddit",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-reddit.json"
+      },
+      {
+        "id": "official-rednote",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-rednote.json"
+      },
+      {
+        "id": "official-reuters",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-reuters.json"
+      },
+      {
+        "id": "official-slock",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-slock.json"
+      },
+      {
+        "id": "official-suno",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-suno.json"
+      },
+      {
+        "id": "official-taobao",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-taobao.json"
+      },
+      {
+        "id": "official-tiktok",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-tiktok.json"
+      },
+      {
+        "id": "official-toutiao",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-toutiao.json"
+      },
+      {
+        "id": "official-twitter",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-twitter.json"
+      },
+      {
+        "id": "official-upwork",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-upwork.json"
+      },
+      {
+        "id": "official-v2ex",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-v2ex.json"
+      },
+      {
+        "id": "official-wechat-channels",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-wechat-channels.json"
+      },
+      {
+        "id": "official-weibo",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-weibo.json"
+      },
+      {
+        "id": "official-weread",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-weread.json"
+      },
+      {
+        "id": "official-xianyu",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-xianyu.json"
+      },
+      {
+        "id": "official-xiaoe",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-xiaoe.json"
+      },
+      {
+        "id": "official-xueqiu",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-xueqiu.json"
+      },
+      {
+        "id": "official-youtube",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-youtube.json"
+      },
+      {
+        "id": "official-yuanbao",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-yuanbao.json"
+      },
+      {
+        "id": "official-zhihu",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-zhihu.json"
+      },
+      {
+        "id": "official-zsxq",
+        "version": "0.1.0",
+        "path": "packs/account-login/official-zsxq.json"
+      }
+    ]
+  }
+]

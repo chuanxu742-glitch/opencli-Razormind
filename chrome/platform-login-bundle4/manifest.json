@@ -1,0 +1,90 @@
+{
+  "manifest_version": 3,
+  "name": "OpenCLI Script Host",
+  "version": "1.4.3",
+  "description": "Packaged official login windows and separately verified QR/identity capabilities; catalog source OpenCLI 1.8.7.",
+  "permissions": [
+    "scripting",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "platform-catalog.json"
+      ],
+      "matches": [
+        "https://account.dianping.com/*",
+        "https://accounts.douban.com/*",
+        "https://accounts.google.com/*",
+        "https://accounts.pixiv.net/*",
+        "https://admin.xiaoe-tech.com/*",
+        "https://app.slock.ai/*",
+        "https://auth.1point3acres.com/*",
+        "https://auth.band.us/*",
+        "https://auth.openai.com/*",
+        "https://channels.weixin.qq.com/*",
+        "https://chat.deepseek.com/*",
+        "https://chat.qwen.ai/*",
+        "https://claude.ai/*",
+        "https://clogin.ke.com/*",
+        "https://creator.douyin.com/*",
+        "https://gitee.com/*",
+        "https://github.com/*",
+        "https://grok.com/*",
+        "https://huggingface.co/*",
+        "https://jimeng.jianying.com/*",
+        "https://kyfw.12306.cn/*",
+        "https://linux.do/*",
+        "https://login.1688.com/*",
+        "https://login.coupang.com/*",
+        "https://login.taobao.com/*",
+        "https://login.zhipin.com/*",
+        "https://maimai.cn/*",
+        "https://manus.im/*",
+        "https://mp.toutiao.com/*",
+        "https://pan.quark.cn/*",
+        "https://passport.bilibili.com/*",
+        "https://passport.ctrip.com/*",
+        "https://passport.hupu.com/*",
+        "https://passport.jd.com/*",
+        "https://passport2.chaoxing.com/*",
+        "https://suno.com/*",
+        "https://v.flomoapp.com/*",
+        "https://web.okjike.com/*",
+        "https://weibo.com/*",
+        "https://weread.qq.com/*",
+        "https://www.amazon.com/*",
+        "https://www.bilibili.com/*",
+        "https://www.doubao.com/*",
+        "https://www.facebook.com/*",
+        "https://www.goofish.com/*",
+        "https://www.instagram.com/*",
+        "https://www.jianyu360.cn/*",
+        "https://www.kimi.com/*",
+        "https://www.linkedin.com/*",
+        "https://www.midjourney.com/*",
+        "https://www.nowcoder.com/*",
+        "https://www.reddit.com/*",
+        "https://www.rednote.com/*",
+        "https://www.reuters.com/*",
+        "https://www.tiktok.com/*",
+        "https://www.upwork.com/*",
+        "https://www.v2ex.com/*",
+        "https://www.xiaohongshu.com/*",
+        "https://www.zhihu.com/*",
+        "https://wx.zsxq.com/*",
+        "https://x.com/*",
+        "https://xueqiu.com/*",
+        "https://yuanbao.tencent.com/*",
+        "https://zhaopin.powerchina.cn/*"
+      ]
+    }
+  ],
+  "background": {
+    "service_worker": "background-entry-1.4.3.js",
+    "type": "module"
+  }
+}

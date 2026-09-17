@@ -38,7 +38,10 @@ set -e
 if [ "$1" = "-e" ]; then
   case "$2" in
     *direct*restricted*) printf 'direct' ;;
-    *'filter((target)=>target.type'*) printf '0' ;;
+    *'filter((target)=>target.type'*)
+      # The real CI image adds its Browser Bridge directory to the bundle.
+      [ -d /opt/browser-bridge-extension ] && printf '1' || printf '0'
+      ;;
   esac
   exit 0
 fi

@@ -31,21 +31,36 @@ async def test_sync_upserts_every_cookie_into_domain_keyed_jar(db_engine, monkey
     decrypted = {
         "cookie_data": {
             "example.com": [
-                {"name": "session_id", "value": "abc", "domain": ".example.com", "path": "/", "sameSite": "unspecified"},
-                {"name": "csrf", "value": "xyz", "domain": "example.com", "path": "/", "secure": True},
+                {
+                    "name": "session_id",
+                    "value": "abc",
+                    "domain": ".example.com",
+                    "path": "/",
+                    "sameSite": "unspecified",
+                },
+                {
+                    "name": "csrf",
+                    "value": "xyz",
+                    "domain": "example.com",
+                    "path": "/",
+                    "secure": True,
+                },
             ]
         },
         "local_storage_data": {"example.com": {"ignored": "not v1 scope"}},
     }
-    with patch("backend.database.AsyncSessionLocal", _sessionmaker(db_engine)), \
-         patch("PyCookieCloud.PyCookieCloud", return_value=_fake_client(decrypted)):
+    with (
+        patch("backend.database.AsyncSessionLocal", _sessionmaker(db_engine)),
+        patch("PyCookieCloud.PyCookieCloud", return_value=_fake_client(decrypted)),
+    ):
         synced = await sync_from_cookiecloud("http://cc.local", "uuid-1", "pw")
         assert synced == 2
         cookies = await AuthManager().resolve_cookies("example.com")
 
     by_name = {c["name"]: c for c in cookies}
     assert by_name["session_id"]["value"] == "abc"
-    assert by_name["session_id"]["sameSite"] == "Lax"  # CookieCloud's own "unspecified" normalization
+    # CookieCloud's own "unspecified" normalization
+    assert by_name["session_id"]["sameSite"] == "Lax"
     assert by_name["csrf"]["secure"] is True
 
 
@@ -68,7 +83,9 @@ async def test_sync_skips_cookies_missing_domain_or_name(db_engine, monkeypatch)
             ]
         }
     }
-    with patch("backend.database.AsyncSessionLocal", _sessionmaker(db_engine)), \
-         patch("PyCookieCloud.PyCookieCloud", return_value=_fake_client(decrypted)):
+    with (
+        patch("backend.database.AsyncSessionLocal", _sessionmaker(db_engine)),
+        patch("PyCookieCloud.PyCookieCloud", return_value=_fake_client(decrypted)),
+    ):
         synced = await sync_from_cookiecloud("http://cc.local", "uuid-1", "pw")
     assert synced == 0

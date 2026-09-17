@@ -1,0 +1,27 @@
+{
+  "id": "official-wechat-channels",
+  "version": "0.1.0",
+  "platform": "wechat-channels",
+  "allowed_origins": [
+    "https://channels.weixin.qq.com"
+  ],
+  "allowed_redirect_origins": [
+    "https://channels.weixin.qq.com"
+  ],
+  "login_url": "/login.html?from=assistant",
+  "modes": [
+    "form"
+  ],
+  "qr_supported": false,
+  "interaction_supported": true,
+  "identity_probe_supported": false,
+  "authentication_verified": false,
+  "selectors": [
+    {
+      "id": "form",
+      "selector": "body",
+      "kind": "form",
+      "frame": "main"
+    }
+  ]
+}

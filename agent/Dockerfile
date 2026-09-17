@@ -46,7 +46,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fi \
     && rm -rf /var/lib/apt/lists/*
 RUN mkdir -p /etc/chromium/policies/managed \
-    && printf '%s\n' '{"PasswordManagerEnabled":false,"AutofillAddressEnabled":false,"AutofillCreditCardEnabled":false}' \
+    && printf '%s\n' '{"PasswordManagerEnabled":false,"AutofillAddressEnabled":false,"AutofillCreditCardEnabled":false,"DeveloperToolsAvailability":0,"RemoteDebuggingAllowed":true,"AllowFileSelectionDialogs":false,"DefaultFileSystemReadGuardSetting":2,"DefaultFileSystemWriteGuardSetting":2,"URLBlocklist":["file:///*","file://*","view-source:*"]}' \
        > /etc/chromium/policies/managed/opencli-account-runtime.json \
     && chmod 0644 /etc/chromium/policies/managed/opencli-account-runtime.json
 
@@ -101,11 +101,11 @@ COPY chrome/runtime-bundles/ /opt/browser-runtime-bundles/
 COPY chrome/extension-src/manifest.json /opt/browser-runtime-bundles/opencli-default/1/extensions/opencli-browser-bridge/manifest.json
 COPY chrome/extension-src/icons/ /opt/browser-runtime-bundles/opencli-default/1/extensions/opencli-browser-bridge/icons/
 COPY chrome/extension-src/dist/background.js /opt/browser-runtime-bundles/opencli-default/1/extensions/opencli-browser-bridge/dist/background.js
-COPY chrome/script-host/ /opt/browser-runtime-bundles/opencli-default/1/extensions/opencli-script-host/
+COPY chrome/script-host-v1.2/ /opt/browser-runtime-bundles/opencli-default/1/extensions/opencli-script-host/
 COPY chrome/extension-src/manifest.json /opt/browser-runtime-bundles/opencli-default/2/extensions/opencli-browser-bridge/manifest.json
 COPY chrome/extension-src/icons/ /opt/browser-runtime-bundles/opencli-default/2/extensions/opencli-browser-bridge/icons/
 COPY chrome/extension-src/dist/background.js /opt/browser-runtime-bundles/opencli-default/2/extensions/opencli-browser-bridge/dist/background.js
-COPY chrome/script-host/ /opt/browser-runtime-bundles/opencli-default/2/extensions/opencli-script-host/
+COPY chrome/script-host-v1.2/ /opt/browser-runtime-bundles/opencli-default/2/extensions/opencli-script-host/
 RUN set -eux; \
     curl -fsSL -o /tmp/violentmonkey.zip https://github.com/violentmonkey/violentmonkey/releases/download/v2.48.0/Violentmonkey-mv3-v2.48.0.zip; \
     echo "583ac595bb698a926eadb6064431fce1108dc2f2adb966ed984738824d2d5a54  /tmp/violentmonkey.zip" | sha256sum -c -; \
@@ -131,7 +131,13 @@ WORKDIR /app
 COPY backend/agent_server.py ./backend/agent_server.py
 COPY backend/browser_account_runtime.py ./backend/browser_account_runtime.py
 COPY backend/browser_account_process.py ./backend/browser_account_process.py
+COPY backend/browser_desktop_protocol.py ./backend/browser_desktop_protocol.py
 COPY backend/browser_account_errors.py ./backend/browser_account_errors.py
+COPY backend/browser_login_rules.py ./backend/browser_login_rules.py
+COPY backend/browser_login_catalog.json ./backend/browser_login_catalog.json
+COPY backend/browser_login_refresh.py ./backend/browser_login_refresh.py
+COPY backend/browser_login_observer.py ./backend/browser_login_observer.py
+COPY backend/browser_target_mapping.py ./backend/browser_target_mapping.py
 COPY backend/agent_runtime_dispatch.py ./backend/agent_runtime_dispatch.py
 COPY backend/agent_runtimes/ ./backend/agent_runtimes/
 COPY backend/miniflow/ ./backend/miniflow/
@@ -187,6 +193,13 @@ ENV PYTHONPATH=/app \
     RUNTIME_STATE_DIR=/var/lib/opencli/account-runtime \
     CHROMIUM_POLICY_FILE=/etc/chromium/policies/managed/opencli-account-runtime.json \
     CLOAKBROWSER_CACHE_DIR=/opt/cloakbrowser/cache
+
+# Account-login bundle 3 uses the current fixed, locally packaged Script Host rules.
+RUN cp -a /opt/browser-runtime-bundles/opencli-default/2/extensions /opt/browser-runtime-bundles/opencli-default/3/extensions
+COPY chrome/script-host/ /opt/browser-runtime-bundles/opencli-default/3/extensions/opencli-script-host/
+RUN cp -a /opt/browser-runtime-bundles/opencli-default/3/extensions /opt/browser-runtime-bundles/opencli-default/4/extensions
+COPY chrome/platform-login-bundle4/ /opt/browser-runtime-bundles/opencli-default/4/extensions/opencli-script-host/
+
 USER agent
 
 # Unified VNC Agent ports: noVNC, CDP proxy, Agent WS/HTTP, and legacy OpenCLI.

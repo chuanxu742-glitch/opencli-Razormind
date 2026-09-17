@@ -17,6 +17,23 @@ from typing import Any
 
 from backend.browser_account_errors import BrowserRuntimeError
 
+_CONTROL_PLANE_SECRET_NAMES = {
+    "AGENT_API_TOKEN",
+    "AGENT_NODE_CREDENTIAL",
+    "AGENT_NODE_CREDENTIAL_ID",
+    "API_AUTH_TOKEN",
+    "BOOTSTRAP_ADMIN_TOKEN",
+    "DATABASE_URL",
+    "REDIS_URL",
+    "SECRET_KEY",
+}
+_CONTROL_PLANE_SECRET_SUFFIXES = ("_TOKEN", "_SECRET", "_PASSWORD", "_CREDENTIAL")
+
+
+def _is_control_plane_secret(name: str) -> bool:
+    upper = name.upper()
+    return upper in _CONTROL_PLANE_SECRET_NAMES or upper.endswith(_CONTROL_PLANE_SECRET_SUFFIXES)
+
 
 @dataclass(frozen=True)
 class StackIsolation:
@@ -26,6 +43,7 @@ class StackIsolation:
     cdp_port: int
     bbx_port: int
     daemon_port: int
+    vnc_port: int
     home_dir: Path
     cache_dir: Path
     profile_dir: Path
@@ -39,6 +57,7 @@ class StackIsolation:
             ("cdp_port", self.cdp_port),
             ("bbx_port", self.bbx_port),
             ("daemon_port", self.daemon_port),
+            ("vnc_port", self.vnc_port),
         ):
             if not 1 <= value <= 65535:
                 raise BrowserRuntimeError(
@@ -61,7 +80,11 @@ class StackIsolation:
 
     def environment(self, base: Mapping[str, str] | None = None) -> dict[str, str]:
         self.validate()
-        env = dict(base or os.environ)
+        env = {
+            name: value
+            for name, value in (os.environ if base is None else base).items()
+            if not _is_control_plane_secret(name)
+        }
         env.pop("OPENCLI_DAEMON_PORT", None)
         env.update(
             {
@@ -75,6 +98,7 @@ class StackIsolation:
                 "BBX_TCP_HOST": "127.0.0.1",
                 "BBX_TCP_BIND_HOST": "127.0.0.1",
                 "BBX_TCP_PORT": str(self.bbx_port),
+                "ACCOUNT_RUNTIME_VNC_PORT": str(self.vnc_port),
                 "OPENCLI_BROWSER_PROFILE_KIND": "authenticated",
             }
         )
@@ -85,7 +109,7 @@ def validate_parallel_isolation(stacks: Iterable[StackIsolation]) -> None:
     """Reject any active sessions that would share an isolation boundary."""
 
     seen: dict[str, set[str]] = {
-        key: set() for key in ("display", "cdp", "bbx", "daemon", "home", "cache", "profile")
+        key: set() for key in ("display", "cdp", "bbx", "daemon", "vnc", "home", "cache", "profile")
     }
     for stack in stacks:
         stack.validate()
@@ -94,6 +118,7 @@ def validate_parallel_isolation(stacks: Iterable[StackIsolation]) -> None:
             "cdp": str(stack.cdp_port),
             "bbx": str(stack.bbx_port),
             "daemon": str(stack.daemon_port),
+            "vnc": str(stack.vnc_port),
             "home": str(stack.home_dir.resolve()),
             "cache": str(stack.cache_dir.resolve()),
             "profile": str(stack.profile_dir.resolve()),

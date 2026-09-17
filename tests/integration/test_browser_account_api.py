@@ -8,6 +8,7 @@ from httpx import AsyncClient
 from backend.main import app
 from backend.models.identity import User, Workspace, WorkspaceMembership, WorkspaceRole
 from backend.security.identity import RequestIdentity, get_request_identity
+from tests.fixtures.browser_account_login import seed_login_resources
 
 _WORKSPACE_ID = "portal-api-workspace"
 _USER_ID = "portal-api-user"
@@ -45,6 +46,7 @@ async def test_account_crud_session_portal_ticket_and_close_use_real_http_contra
             ),
         ]
     )
+    login_resources = await seed_login_resources(db_session)
     await db_session.commit()
 
     async def identity_override() -> RequestIdentity:
@@ -57,7 +59,7 @@ async def test_account_crud_session_portal_ticket_and_close_use_real_http_contra
                 _route(),
                 json={
                     "workspace_id": _WORKSPACE_ID,
-                    "site": "fixture.test",
+                    **login_resources,
                     "label": "Fixture account",
                 },
             )

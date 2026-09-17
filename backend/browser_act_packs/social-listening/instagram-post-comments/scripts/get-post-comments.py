@@ -1,6 +1,7 @@
 import argparse
 import sys
 
+
 def main():
     sys.stdout.reconfigure(encoding='utf-8', newline='\n')
     parser = argparse.ArgumentParser()
@@ -13,7 +14,9 @@ def main():
     js = f"""
     (async function() {{
       try {{
-        var url = 'https://www.instagram.com/api/v1/media/{args.media_id}/comments/?can_support_threading=true&permalink_enabled=false{min_id_param}';
+        var url = 'https://www.instagram.com/api/v1/media/'
+          + '{args.media_id}/comments/?can_support_threading=true'
+          + '&permalink_enabled=false{min_id_param}';
         var r = await fetch(url, {{
           headers: {{
             'X-IG-App-ID': '936619743392459',
@@ -22,7 +25,11 @@ def main():
         }});
         if (!r.ok) {{
           var errText = await r.text();
-          return JSON.stringify({{ error: true, message: 'HTTP ' + r.status, detail: errText.slice(0, 200) }});
+          return JSON.stringify({{
+            error: true,
+            message: 'HTTP ' + r.status,
+            detail: errText.slice(0, 200)
+          }});
         }}
         var data = await r.json();
         if (data.require_login) return JSON.stringify({{ error: true, message: 'Login required' }});

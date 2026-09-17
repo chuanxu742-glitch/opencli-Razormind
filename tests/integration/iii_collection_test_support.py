@@ -8,6 +8,8 @@ import uuid
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
+from backend.main import app
+from backend.models.identity import User, Workspace, WorkspaceMembership, WorkspaceRole
 from backend.models.iii_collection import IIICollectionAttemptV1, IIICollectionCommandV1
 from backend.models.studio import (
     StudioProject,
@@ -17,7 +19,11 @@ from backend.models.studio import (
     StudioWorkspace,
 )
 from backend.models.workflow_run import WorkflowRun
-from backend.schemas.iii_collection import CollectorFinalExpectedKeyReportV1, ODPIngressOutcomeReceiptV1
+from backend.schemas.iii_collection import (
+    CollectorFinalExpectedKeyReportV1,
+    ODPIngressOutcomeReceiptV1,
+)
+from backend.security.identity import RequestIdentity, get_request_identity
 from backend.workflow.iii_collection_store import (
     _attempt_and_outbound,
     _expected_key_set_hash,
@@ -67,9 +73,38 @@ async def create_scoped_run(db_session):
         request={},
         projection={},
     )
-    db_session.add_all([workspace, project, workflow, validation, version, run])
+    identity_workspace = Workspace(id=workspace.id, name="III", slug="iii")
+    operator = User(id="iii-test-operator", subject="iii-test-operator")
+    db_session.add_all(
+        [
+            workspace,
+            project,
+            workflow,
+            validation,
+            version,
+            run,
+            identity_workspace,
+            operator,
+            WorkspaceMembership(
+                workspace_id=identity_workspace.id,
+                user_id=operator.id,
+                role=WorkspaceRole.OPERATOR,
+            ),
+        ]
+    )
     await db_session.commit()
-    return {"workspace": workspace, "project": project, "workflow": workflow, "version": version, "run": run}
+
+    async def override_identity() -> RequestIdentity:
+        return RequestIdentity(subject=operator.subject)
+
+    app.dependency_overrides[get_request_identity] = override_identity
+    return {
+        "workspace": workspace,
+        "project": project,
+        "workflow": workflow,
+        "version": version,
+        "run": run,
+    }
 
 
 def route(scope: dict) -> str:
@@ -117,7 +152,14 @@ def _fact_identity(command, attempt) -> dict:
     }
 
 
-def report_body(command, attempt, *, event_id: str | None = "event-1", event_ids: list[str] | None = None, rejected_count: int = 0) -> dict:
+def report_body(
+    command,
+    attempt,
+    *,
+    event_id: str | None = "event-1",
+    event_ids: list[str] | None = None,
+    rejected_count: int = 0,
+) -> dict:
     expected_keys = (
         [{"sourceId": command.odp_source_id, "eventId": value} for value in event_ids]
         if event_ids is not None
@@ -145,12 +187,17 @@ def report_body(command, attempt, *, event_id: str | None = "event-1", event_ids
 
 
 def sign_receipt_body(body: dict) -> dict:
-    signed = {**body, "receiptHash": "0" * 64, "signature": "sha256=placeholder"}
+    signed = {
+        **body,
+        "receiptHash": "0" * 64,
+        "signature": "sha256=placeholder",
+    }
     receipt = ODPIngressOutcomeReceiptV1.model_validate(signed)
     signed["receiptHash"] = _receipt_hash(receipt)
-    signed["signature"] = "sha256=" + hmac.new(
-        b"receipt-secret", signed["receiptHash"].encode(), hashlib.sha256
-    ).hexdigest()
+    signed["signature"] = (
+        "sha256="
+        + hmac.new(b"receipt-secret", signed["receiptHash"].encode(), hashlib.sha256).hexdigest()
+    )
     return signed
 
 
@@ -164,7 +211,11 @@ def receipt_body(command, attempt, report: dict) -> dict:
             "producerKeyId": "odp-ingest-v1",
             "expectedKeySetSha256": report["expectedKeySetSha256"],
             "outcomes": [
-                {"sourceId": key["sourceId"], "eventId": key["eventId"], "outcome": "accepted"}
+                {
+                    "sourceId": key["sourceId"],
+                    "eventId": key["eventId"],
+                    "outcome": "accepted",
+                }
                 for key in report["expectedKeys"]
             ],
             "issuedAt": datetime(2026, 8, 30, tzinfo=UTC).isoformat(),
@@ -172,7 +223,14 @@ def receipt_body(command, attempt, report: dict) -> dict:
     )
 
 
-async def submit_report_and_receipt(client, db_session, monkeypatch, *, outcome: str = "accepted", event_ids: list[str] | None = None):
+async def submit_report_and_receipt(
+    client,
+    db_session,
+    monkeypatch,
+    *,
+    outcome: str = "accepted",
+    event_ids: list[str] | None = None,
+):
     scope = await create_scoped_run(db_session)
     scope["run"].trace_id = str(uuid.uuid4())
     await db_session.commit()
@@ -181,22 +239,45 @@ async def submit_report_and_receipt(client, db_session, monkeypatch, *, outcome:
         _, outbound = await _attempt_and_outbound(db, command.id)
         return outbound
 
-    monkeypatch.setattr("backend.api.v1.iii_collections.dispatch_collection_attempt", no_dispatch)
+    monkeypatch.setattr(
+        "backend.api.v1.iii_collections.dispatch_collection_attempt",
+        no_dispatch,
+    )
     monkeypatch.setattr(
         "backend.api.v1.iii_collections.get_settings",
-        lambda: SimpleNamespace(iii_lifecycle_token="bridge-token", iii_ingress_receipt_secret="receipt-secret"),
+        lambda: SimpleNamespace(
+            iii_lifecycle_token="bridge-token",
+            iii_ingress_receipt_secret="receipt-secret",
+        ),
     )
     monkeypatch.setattr(
         "backend.workflow.iii_collection_store.get_settings",
         lambda: SimpleNamespace(iii_ingress_receipt_secret="receipt-secret"),
     )
     submitted = await client.post(route(scope), json=submit_body())
-    command = await db_session.get(IIICollectionCommandV1, submitted.json()["data"]["commandId"])
-    attempt = await db_session.get(IIICollectionAttemptV1, submitted.json()["data"]["attemptId"])
+    command = await db_session.get(
+        IIICollectionCommandV1,
+        submitted.json()["data"]["commandId"],
+    )
+    attempt = await db_session.get(
+        IIICollectionAttemptV1,
+        submitted.json()["data"]["attemptId"],
+    )
     assert command is not None and attempt is not None
-    report = report_body(command, attempt, event_ids=event_ids, rejected_count=int(outcome == "rejected"))
+    report = report_body(
+        command,
+        attempt,
+        event_ids=event_ids,
+        rejected_count=int(outcome == "rejected"),
+    )
     headers = {"x-iii-bridge-token": "bridge-token"}
-    assert (await client.post("/api/v1/iii-collections/expected-key-reports", json=report, headers=headers)).status_code == 200
+    assert (
+        await client.post(
+            "/api/v1/iii-collections/expected-key-reports",
+            json=report,
+            headers=headers,
+        )
+    ).status_code == 200
     receipt = receipt_body(command, attempt, report)
     if outcome == "rejected":
         receipt["outcomes"][0] = {
@@ -206,5 +287,11 @@ async def submit_report_and_receipt(client, db_session, monkeypatch, *, outcome:
             "rejectionReason": "validation_failed",
         }
         receipt = sign_receipt_body(receipt)
-    assert (await client.post("/api/v1/iii-collections/ingress-receipts", json=receipt, headers=headers)).status_code == 200
+    assert (
+        await client.post(
+            "/api/v1/iii-collections/ingress-receipts",
+            json=receipt,
+            headers=headers,
+        )
+    ).status_code == 200
     return scope, command

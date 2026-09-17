@@ -1,0 +1,27 @@
+{
+  "id": "official-chatgpt",
+  "version": "0.1.0",
+  "platform": "chatgpt",
+  "allowed_origins": [
+    "https://auth.openai.com"
+  ],
+  "allowed_redirect_origins": [
+    "https://auth.openai.com"
+  ],
+  "login_url": "/log-in",
+  "modes": [
+    "form"
+  ],
+  "qr_supported": false,
+  "interaction_supported": true,
+  "identity_probe_supported": false,
+  "authentication_verified": false,
+  "selectors": [
+    {
+      "id": "form",
+      "selector": "body",
+      "kind": "form",
+      "frame": "main"
+    }
+  ]
+}

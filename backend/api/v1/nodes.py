@@ -110,6 +110,30 @@ async def _upsert_node(
         )
         db.add(node)
     await db.flush()
+    if account_capable and boot_id:
+        from backend.models.edge_node import EdgeNodeBoot, EdgeNodeCapacity
+
+        boot = await db.scalar(select(EdgeNodeBoot).where(
+            EdgeNodeBoot.node_id == node.id, EdgeNodeBoot.boot_id == boot_id,
+        ))
+        if boot is not None and boot.status != "active":
+            raise HTTPException(status_code=409, detail="retired node boot cannot reconnect")
+        if boot is None:
+            previous = list((await db.scalars(select(EdgeNodeBoot).where(
+                EdgeNodeBoot.node_id == node.id,
+            ).with_for_update())).all())
+            watermark = max((item.max_epoch for item in previous), default=0)
+            for item in previous:
+                if item.status == "active":
+                    item.status = "stopped"
+                    item.stopped_at = now
+            for capacity in (await db.scalars(select(EdgeNodeCapacity).where(
+                EdgeNodeCapacity.node_id == node.id,
+            ))).all():
+                capacity.valid = False
+            db.add(EdgeNodeBoot(node_id=node.id, boot_id=boot_id, max_epoch=watermark,
+                                started_at=now, status="active"))
+        await db.flush()
     return node
 
 
@@ -259,6 +283,10 @@ async def register_node(
     result = await db.execute(select(BrowserInstance).where(BrowserInstance.endpoint == url))
     inst = result.scalar_one_or_none()
     if inst:
+        if inst.profile_kind != body.profile_kind:
+            from backend.services.platform_browser_account_service import require_unassigned
+
+            await require_unassigned(db, inst.id)
         inst.mode = body.mode
         inst.agent_url = url
         inst.agent_protocol = body.agent_protocol
@@ -402,8 +430,6 @@ async def delete_node(node_id: str, db: AsyncSession = Depends(get_db)) -> ApiRe
     if not node:
         raise HTTPException(status_code=404, detail="Node not found")
 
-    _pool_remove(node.url)
-
     # Also remove BrowserInstance record
     from backend.models.browser import BrowserInstance
 
@@ -412,10 +438,14 @@ async def delete_node(node_id: str, db: AsyncSession = Depends(get_db)) -> ApiRe
     )
     bi = bi_result.scalar_one_or_none()
     if bi:
+        from backend.services.platform_browser_account_service import require_unassigned
+
+        await require_unassigned(db, bi.id)
         await db.delete(bi)
 
     await db.delete(node)
     await db.commit()
+    _pool_remove(node.url)
     logger.info("Node deleted: %s", node.url)
     return ApiResponse.ok(None)
 
@@ -941,6 +971,10 @@ async def node_ws_endpoint(ws: WebSocket) -> None:
                 )
                 inst = result.scalar_one_or_none()
                 if inst:
+                    if inst.profile_kind != profile_kind:
+                        from backend.services.platform_browser_account_service import require_unassigned
+
+                        await require_unassigned(db, inst.id)
                     inst.mode = mode
                     inst.agent_url = agent_url
                     inst.agent_protocol = "ws"
@@ -959,8 +993,14 @@ async def node_ws_endpoint(ws: WebSocket) -> None:
                     )
                     db.add(inst)
                 await db.commit()
+        except HTTPException:
+            await ws.close(code=1008, reason="Account Profile is reserved")
+            return
         except Exception as exc:
             logger.warning("WS node %s: DB upsert failed (non-fatal): %s", agent_url, exc)
+            if account_capable:
+                await ws.close(code=1008, reason="account node registration rejected")
+                return
 
         if not account_capable:
             _pool_add(agent_url, mode, "ws", node_type, profile_kind)
@@ -1014,7 +1054,18 @@ async def node_ws_endpoint(ws: WebSocket) -> None:
                 return
             raw_bytes = received.get("bytes")
             if raw_bytes is not None:
-                await ws_agent_manager.resolve_portal_binary(agent_url, raw_bytes, source_ws=ws)
+                from backend.browser_desktop_protocol import DESKTOP_MAGIC
+
+                if raw_bytes.startswith(DESKTOP_MAGIC):
+                    await ws_agent_manager.resolve_browser_desktop_binary(
+                        agent_url, raw_bytes, source_ws=ws
+                    )
+                elif raw_bytes[:1] == bytes([2]):
+                    await ws_agent_manager.resolve_terminal_binary(raw_bytes, source_ws=ws)
+                else:
+                    await ws_agent_manager.resolve_portal_binary(
+                        agent_url, raw_bytes, source_ws=ws
+                    )
                 continue
             try:
                 msg = json.loads(received.get("text") or "{}")
@@ -1034,21 +1085,54 @@ async def node_ws_endpoint(ws: WebSocket) -> None:
                 await ws_agent_manager.resolve_portal_ready(agent_url, msg, source_ws=ws)
             elif msg_type in {"portal_prepared", "portal_prepare_error"}:
                 ws_agent_manager.resolve_portal_prepared(agent_url, msg, source_ws=ws)
+            elif msg_type in {
+                "browser_desktop_ready",
+                "browser_desktop_error",
+                "browser_desktop_closed",
+            }:
+                ws_agent_manager.resolve_browser_desktop_ready(
+                    agent_url, msg, source_ws=ws
+                )
             elif msg_type == "login_observation":
                 from backend.schemas.browser_account import LoginObservationV1
-                from backend.services.browser_account_service import apply_login_observation
+                from backend.services.browser_account_service import (
+                    BrowserAccountError,
+                    apply_login_observation,
+                )
 
                 observation = LoginObservationV1.model_validate(msg.get("observation"))
                 if observation.node_identity != node_identity:
                     raise ValueError("login observation node identity is not authenticated")
                 async with AsyncSessionLocal() as db:
-                    await apply_login_observation(
-                        db,
-                        observation.account_ref.workspace_id,
-                        observation.account_ref.account_id,
-                        observation,
-                    )
+                    try:
+                        await apply_login_observation(
+                            db,
+                            observation.account_ref.workspace_id,
+                            observation.account_ref.account_id,
+                            observation,
+                        )
+                        await db.commit()
+                    except BrowserAccountError:
+                        await db.rollback()
+                        logger.info("Rejected stale login observation from node %s", node_id)
+            elif msg_type == "account_capacity":
+                from backend.schemas.browser_account import NodeCapacityFactV1
+                from backend.services.browser_account_dispatcher import record_capacity
+
+                if node_identity is None:
+                    raise ValueError("capacity requires an authenticated account node")
+                fact = NodeCapacityFactV1.model_validate(msg.get("capacity"))
+                async with AsyncSessionLocal() as db:
+                    await record_capacity(db, node_identity, fact)
                     await db.commit()
+            elif msg_type == "agent_task_status_result":
+                ws_agent_manager.resolve_agent_task_status(
+                    msg.get("request_id", ""), msg, source_ws=ws
+                )
+            elif msg_type == "terminal_response":
+                ws_agent_manager.resolve_terminal_response(msg, source_ws=ws)
+            elif msg_type == "terminal_event":
+                await ws_agent_manager.resolve_terminal_event(msg, source_ws=ws)
             elif msg_type == "ping":
                 await ws.send_json({"type": "pong"})
             else:

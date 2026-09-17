@@ -57,10 +57,15 @@ import re
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from dataclasses import dataclass, field
+from pathlib import Path
+from time import monotonic
 from typing import Any
 from urllib.parse import urlparse
 from urllib.request import proxy_bypass
@@ -78,6 +83,7 @@ from backend.agent_runtime_dispatch import (
     observe_login_runtime,
     parse_output,
     prepare_portal_route,
+    release_portal_pointer,
     resolve_account_runtime_context,
     resolve_portal_target,
     snapshot_tab_ids,
@@ -107,8 +113,16 @@ from backend.browser_account_runtime import (
     session_portal_registry,
     session_runtime_registry,
 )
+from backend.browser_desktop_protocol import (
+    DESKTOP_MAGIC,
+    DESKTOP_MAX_BUFFERED_FRAMES,
+    BrowserDesktopRouteV1,
+    decode_desktop_frame,
+    encode_desktop_frame,
+)
 from backend.schemas.browser_account import (
     DurableCommandV1,
+    NodeCapacityFactV1,
     NodeClaimV1,
     NodeIdentityV1,
     NodeResultV1,
@@ -123,6 +137,11 @@ from backend.services.browser_portal_contract import (
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger("agent_server")
+
+if os.name != "nt":
+    import fcntl
+    import pty
+    import termios
 
 _OPENCLI_BIN = os.environ.get("OPENCLI_BIN") or "opencli"
 
@@ -152,6 +171,7 @@ _AGENT_DEPLOY_TYPE = os.environ.get("AGENT_DEPLOY_TYPE", "docker")
 # Anonymous collection may use an explicitly supplied endpoint; account
 # dispatch never reaches this legacy host-remapping path.
 _AGENT_HAS_CHROME = os.environ.get("AGENT_HAS_CHROME", "false").lower() == "true"
+_AGENT_EVENT_ACK_TIMEOUT_SECONDS = 30.0
 _RUNTIME_BUNDLE_MANIFEST = os.environ.get(
     "BROWSER_RUNTIME_BUNDLE_MANIFEST",
     "/opt/browser-runtime-bundles/opencli-default/1/manifest.json",
@@ -516,6 +536,87 @@ async def _handle_ws_collect(ws, msg: dict) -> None:
         logger.error("WS: failed to send result for request_id=%s: %s", request_id, exc)
 
 
+_PENDING_AGENT_EVENT_ACKS: dict[tuple[str, str], asyncio.Future[dict[str, Any]]] = {}
+
+
+def _requires_durable_event_ack(event: dict[str, Any]) -> bool:
+    evidence = event.get("evidence")
+    return (
+        event.get("type") == "evidence"
+        and isinstance(evidence, dict)
+        and evidence.get("kind") == "doubao.capture.pre_cleanup"
+    )
+
+
+def _resolve_ws_agent_event_ack(msg: dict[str, Any]) -> None:
+    request_id = msg.get("request_id")
+    event_id = msg.get("event_id")
+    if not isinstance(request_id, str) or not isinstance(event_id, str):
+        logger.warning("WS: malformed agent_event_ack frame")
+        return
+    future = _PENDING_AGENT_EVENT_ACKS.get((request_id, event_id))
+    if future is None or future.done():
+        logger.warning(
+            "WS: unexpected agent_event_ack request_id=%s event_id=%s",
+            request_id,
+            event_id,
+        )
+        return
+    future.set_result(msg)
+
+
+async def _send_ws_agent_event(
+    ws,
+    *,
+    request_id: str,
+    event: dict[str, Any],
+) -> None:
+    frame: dict[str, Any] = {
+        "type": "agent_event",
+        "request_id": request_id,
+        "event": event,
+    }
+    if not _requires_durable_event_ack(event):
+        await ws.send(json.dumps(frame))
+        return
+
+    event_id = str(uuid.uuid4())
+    frame.update({"event_id": event_id, "ack_required": True})
+    key = (request_id, event_id)
+    acknowledgement = asyncio.get_running_loop().create_future()
+    _PENDING_AGENT_EVENT_ACKS[key] = acknowledgement
+    try:
+        await ws.send(json.dumps(frame))
+        try:
+            receipt = await asyncio.wait_for(
+                acknowledgement,
+                timeout=_AGENT_EVENT_ACK_TIMEOUT_SECONDS,
+            )
+        except TimeoutError as exc:
+            raise RuntimeInvocationError(
+                "control plane did not acknowledge durable capture before cleanup",
+                error_type="AgentEventAcknowledgementTimeout",
+            ) from exc
+        if receipt.get("status") != "persisted":
+            raise RuntimeInvocationError(
+                "control plane rejected durable capture before cleanup",
+                error_type="AgentEventAcknowledgementRejected",
+            )
+    finally:
+        _PENDING_AGENT_EVENT_ACKS.pop(key, None)
+
+
+async def _complete_agent_cleanup(operation):
+    pending = asyncio.ensure_future(operation)
+    while not pending.done():
+        try:
+            await asyncio.shield(pending)
+        except asyncio.CancelledError:
+            continue
+    return pending.result()
+
+
+
 class _PortalRuntime:
     """One short-lived route bound to one real CDP page target."""
 
@@ -532,10 +633,483 @@ class _PortalRuntime:
         self.cdp_endpoint = cdp_endpoint
         self.websocket_url = websocket_url
         self.pixel_sequence = 0
+        self.pixel_lock = asyncio.Lock()
         self.control_sequence = 0
+        self.pointer_pressed = False
 
 
-_ACTIVE_PORTAL_RECORDS: dict[str, Any] = {}
+class _BrowserDesktopRuntime:
+    """One raw RFB bridge whose TCP destination comes from the live binding."""
+
+    def __init__(self, route: BrowserDesktopRouteV1, reader, writer, owner_ws) -> None:
+        self.route = route
+        self.owner_ws = owner_ws
+        self.reader = reader
+        self.writer = writer
+        self.input_sequence = 0
+        self.output_sequence = 0
+        self.input_queue: asyncio.Queue[bytes | None] = asyncio.Queue(
+            maxsize=DESKTOP_MAX_BUFFERED_FRAMES
+        )
+        self.writer_task: asyncio.Task | None = None
+        self.closed = False
+
+
+_ACTIVE_BROWSER_DESKTOPS: dict[str, _BrowserDesktopRuntime] = {}
+_STOPPING_BROWSER_DESKTOPS: set[tuple[str, str, str, int]] = set()
+_DESKTOP_IO_TIMEOUT_SECONDS = 0.75
+
+
+def _desktop_route_is_current(runtime: _BrowserDesktopRuntime) -> bool:
+    route = runtime.route
+    if (route.session_id, route.node_id, route.boot_id, route.epoch) in _STOPPING_BROWSER_DESKTOPS:
+        return False
+    if datetime.now(UTC) >= route.expires_at:
+        return False
+    admission = runtime_lease_book().current(route.command_id)
+    running = account_runtime_allocator().get(route.session_id)
+    if admission is None or running is None or not running.lease.is_valid():
+        return False
+    return (
+        admission.claim.workspace_id == route.workspace_id
+        and admission.claim.account_id == route.account_id
+        and admission.claim.session_id == route.session_id
+        and admission.claim.node_id == route.node_id
+        and admission.claim.boot_id == route.boot_id
+        and admission.claim.epoch == route.epoch
+        and admission.session.lease_id == route.lease_id
+        and admission.session.purpose in {"login", "browser"}
+        and running.profile_id == route.profile_id
+        and running.binding.node_id == route.node_id
+        and running.binding.boot_id == route.boot_id
+        and running.binding.epoch == route.epoch
+    )
+
+
+async def _desktop_ws_send(ws, payload) -> None:
+    async with asyncio.timeout(_DESKTOP_IO_TIMEOUT_SECONDS):
+        await ws.send(payload)
+
+
+def _abort_desktop_writer(writer) -> None:
+    transport = getattr(writer, "transport", None)
+    abort = getattr(transport, "abort", None)
+    if callable(abort):
+        abort()
+
+
+async def _close_browser_desktop(
+    route_id: str,
+    *,
+    owner_ws=None,
+    expected_runtime: _BrowserDesktopRuntime | None = None,
+) -> None:
+    runtime = _ACTIVE_BROWSER_DESKTOPS.get(route_id)
+    if (
+        runtime is None
+        or (owner_ws is not None and runtime.owner_ws is not owner_ws)
+        or (expected_runtime is not None and runtime is not expected_runtime)
+    ):
+        return
+    if _ACTIVE_BROWSER_DESKTOPS.get(route_id) is runtime:
+        _ACTIVE_BROWSER_DESKTOPS.pop(route_id, None)
+    if runtime.closed:
+        return
+    runtime.closed = True
+    while not runtime.input_queue.empty():
+        try:
+            runtime.input_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+    runtime.input_queue.put_nowait(None)
+    current = asyncio.current_task()
+    if runtime.writer_task is not None and runtime.writer_task is not current:
+        runtime.writer_task.cancel()
+        try:
+            async with asyncio.timeout(_DESKTOP_IO_TIMEOUT_SECONDS):
+                await asyncio.gather(runtime.writer_task, return_exceptions=True)
+        except TimeoutError:
+            pass
+    runtime.writer.close()
+    try:
+        async with asyncio.timeout(_DESKTOP_IO_TIMEOUT_SECONDS):
+            await runtime.writer.wait_closed()
+    except (TimeoutError, ConnectionError, OSError):
+        _abort_desktop_writer(runtime.writer)
+
+
+async def _desktop_write_loop(runtime: _BrowserDesktopRuntime) -> None:
+    while not runtime.closed:
+        payload = await runtime.input_queue.get()
+        if payload is None:
+            return
+        if not _desktop_route_is_current(runtime):
+            raise RuntimeError("desktop route generation is no longer current")
+        runtime.writer.write(payload)
+        async with asyncio.timeout(_DESKTOP_IO_TIMEOUT_SECONDS):
+            await runtime.writer.drain()
+
+
+async def _block_browser_desktop_for_stop(session, claim) -> tuple[str, str, str, int]:
+    generation = (session.session_id, claim.node_id, claim.boot_id, claim.epoch)
+    _STOPPING_BROWSER_DESKTOPS.add(generation)
+    for route_id, runtime in tuple(_ACTIVE_BROWSER_DESKTOPS.items()):
+        route = runtime.route
+        if (route.session_id, route.node_id, route.boot_id, route.epoch) == generation:
+            await _close_browser_desktop(route_id, expected_runtime=runtime)
+    return generation
+
+
+async def _handle_ws_browser_desktop(
+    ws,
+    msg: dict,
+    authenticated_identity: NodeIdentityV1 | None,
+    *,
+    tunnel_handle: str,
+    tunnel_auth_digest: str,
+) -> None:
+    route_id = ""
+    created = False
+    runtime: _BrowserDesktopRuntime | None = None
+    end_reason = "desktop route ended"
+    try:
+        route = BrowserDesktopRouteV1.model_validate(msg.get("route"))
+        route_id = route.route_id
+        if authenticated_identity is None or (
+            route.node_id,
+            route.boot_id,
+        ) != (authenticated_identity.node_id, authenticated_identity.boot_id):
+            raise ValueError("desktop route node identity is not authenticated")
+        if (route.tunnel_handle, route.tunnel_auth_digest) != (
+            tunnel_handle,
+            tunnel_auth_digest,
+        ):
+            raise ValueError("desktop route is not bound to this node connection")
+        route_generation = (
+            route.session_id,
+            route.node_id,
+            route.boot_id,
+            route.epoch,
+        )
+        if route_generation in _STOPPING_BROWSER_DESKTOPS:
+            raise ValueError("desktop session is stopping")
+        if route_id in _ACTIVE_BROWSER_DESKTOPS or any(
+            item.route.session_id == route.session_id
+            for item in _ACTIVE_BROWSER_DESKTOPS.values()
+        ):
+            raise ValueError("desktop session already has an active route")
+        lease_book = runtime_lease_book()
+        admission = lease_book.current(route.command_id)
+        if admission is not None and admission.session.purpose == "login":
+            # Opening an already authorized browser route is the immediate
+            # in-place promotion signal. Do not wait for the next periodic
+            # lease renewal before the long-lived identity observer sees it.
+            admission = lease_book.renew(
+                claim=admission.claim,
+                session=admission.session.model_copy(update={"purpose": "browser"}),
+                node_identity=admission.node_identity,
+            )
+        binding = session_runtime_registry().resolve(
+            session_id=route.session_id,
+            node_id=route.node_id,
+            boot_id=route.boot_id,
+            epoch=route.epoch,
+        )
+        running = account_runtime_allocator().get(route.session_id)
+        if (
+            admission is None
+            or running is None
+            or admission.claim.workspace_id != route.workspace_id
+            or admission.claim.account_id != route.account_id
+            or admission.session.lease_id != route.lease_id
+            or admission.session.purpose not in {"login", "browser"}
+            or running.profile_id != route.profile_id
+            or binding is not running.binding
+        ):
+            raise ValueError("desktop route does not match the live runtime lease")
+        # The only TCP destination is the loopback VNC port in the validated
+        # SessionRuntimeBinding. No address from the route is accepted here.
+        reader, writer = await asyncio.open_connection("127.0.0.1", binding.vnc_port)
+        runtime = _BrowserDesktopRuntime(route, reader, writer, ws)
+        if not _desktop_route_is_current(runtime):
+            writer.close()
+            try:
+                async with asyncio.timeout(_DESKTOP_IO_TIMEOUT_SECONDS):
+                    await writer.wait_closed()
+            except (TimeoutError, ConnectionError, OSError):
+                _abort_desktop_writer(writer)
+            raise ValueError("desktop route expired before opening")
+        _ACTIVE_BROWSER_DESKTOPS[route_id] = runtime
+        created = True
+        runtime.writer_task = asyncio.create_task(_desktop_write_loop(runtime))
+        await _desktop_ws_send(
+            ws, json.dumps({"type": "browser_desktop_ready", "route_id": route_id})
+        )
+        while _ACTIVE_BROWSER_DESKTOPS.get(route_id) is runtime:
+            if not _desktop_route_is_current(runtime):
+                raise RuntimeError("desktop route generation is no longer current")
+            if runtime.writer_task.done():
+                error = runtime.writer_task.exception()
+                if error is not None:
+                    raise error
+                raise RuntimeError("desktop input bridge ended")
+            try:
+                payload = await asyncio.wait_for(
+                    reader.read(64 * 1024), timeout=0.5
+                )
+            except TimeoutError:
+                continue
+            if not payload:
+                end_reason = "desktop VNC connection closed"
+                return
+            runtime.output_sequence += 1
+            await _desktop_ws_send(
+                ws,
+                encode_desktop_frame(route_id, 1, runtime.output_sequence, payload)
+            )
+    except Exception as exc:
+        end_reason = "desktop route failed"
+        logger.warning("WS desktop route rejected or ended: %s", type(exc).__name__)
+        if route_id and route_id not in _ACTIVE_BROWSER_DESKTOPS:
+            try:
+                await _desktop_ws_send(
+                    ws,
+                    json.dumps(
+                        {
+                            "type": "browser_desktop_error",
+                            "route_id": route_id,
+                            "error": "desktop route admission failed",
+                        }
+                    )
+                )
+            except Exception:
+                pass
+    finally:
+        if route_id and created and runtime is not None:
+            await _close_browser_desktop(route_id, expected_runtime=runtime)
+            try:
+                await _desktop_ws_send(
+                    ws,
+                    json.dumps(
+                        {
+                            "type": "browser_desktop_closed",
+                            "route_id": route_id,
+                            "reason": end_reason,
+                        }
+                    ),
+                )
+            except Exception:
+                logger.debug("WS: failed to report desktop route end", exc_info=True)
+
+
+async def _handle_ws_browser_desktop_binary(ws, data: bytes) -> None:
+    runtime: _BrowserDesktopRuntime | None = None
+    try:
+        route_id, direction, sequence, payload = decode_desktop_frame(data)
+        runtime = _ACTIVE_BROWSER_DESKTOPS.get(route_id)
+        if (
+            runtime is None
+            or runtime.owner_ws is not ws
+            or direction != 0
+            or not _desktop_route_is_current(runtime)
+        ):
+            raise ValueError("desktop input is outside the active route")
+        if sequence <= runtime.input_sequence:
+            raise ValueError("desktop input sequence did not increase")
+        runtime.input_sequence = sequence
+        runtime.input_queue.put_nowait(payload)
+    except (ValueError, asyncio.QueueFull):
+        logger.warning("WS: invalid or overflowing desktop input frame")
+        if runtime is not None:
+            await _close_browser_desktop(
+                runtime.route.route_id,
+                owner_ws=ws,
+                expected_runtime=runtime,
+            )
+
+
+
+
+_LOGIN_OBSERVERS: dict[str, asyncio.Task] = {}
+
+
+def _current_login_admission(command_id: str):
+    admission = runtime_lease_book().current(command_id)
+    if admission is None:
+        return None
+    running = account_runtime_allocator().get(admission.session.session_id)
+    if (
+        running is None
+        or not running.lease.is_valid()
+        or running.binding.epoch != admission.claim.epoch
+        or running.binding.node_id != admission.claim.node_id
+        or running.binding.boot_id != admission.claim.boot_id
+    ):
+        return None
+    return admission
+
+
+async def _watch_login(ws, command_id: str, initial=None, expected_tab_id=None) -> None:
+    from backend.browser_login_observer import observe_until_terminal
+    from backend.browser_login_refresh import ExpiredQrRefresher
+
+    refresher = ExpiredQrRefresher()
+
+    async def refresh(admission, observation):
+        running = account_runtime_allocator().get(admission.session.session_id)
+        if running is None:
+            return
+        try:
+            await refresher.refresh(
+                admission=admission, observation=observation,
+                cdp_endpoint=running.binding.cdp_endpoint,
+                current=lambda: _current_login_admission(command_id),
+            )
+        except Exception:
+            # A scanned QR or challenge may supersede expiration while probing.
+            # Keep observing; never reload blindly or log authentication payloads.
+            logger.info("Expired QR refresh deferred for command %s", command_id)
+
+    async def observe(admission):
+        for attempt in range(15):
+            current = _current_login_admission(command_id)
+            if current is None:
+                raise BrowserRuntimeError("claim_expired", "login observer lease ended")
+            running = account_runtime_allocator().get(current.session.session_id)
+            try:
+                return await observe_login_runtime(
+                    cdp_endpoint=running.binding.cdp_endpoint,
+                    session=current.session,
+                    claim=current.claim,
+                    node_identity=current.node_identity,
+                    expected_origin=running.bundle.login_origin,
+                    expected_tab_id=expected_tab_id,
+                )
+            except BrowserRuntimeError:
+                if attempt == 14:
+                    raise
+                await asyncio.sleep(1)
+
+    async def send(message):
+        await ws.send(json.dumps(message))
+
+    try:
+        await observe_until_terminal(
+            current=lambda: _current_login_admission(command_id),
+            observe=observe,
+            send=send,
+            initial=initial,
+            refresh=refresh,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # Never log DOM, QR bytes or identity payloads.
+        logger.warning("Login observation stopped for command %s", command_id)
+
+
+def _measured_account_capacity(identity: NodeIdentityV1) -> NodeCapacityFactV1:
+    from backend.browser_login_rules import PACKAGED_RULE_FILES, load_packaged_rule
+
+    allocator = account_runtime_allocator()
+    configuration = allocator.configuration
+    manifest = json.loads(configuration.bundle_manifest.read_text(encoding="utf-8"))
+    root = configuration.bundle_root.resolve()
+    manifest_path = configuration.bundle_manifest.resolve()
+    if root not in manifest_path.parents or configuration.bundle_manifest.is_symlink():
+        raise ValueError("runtime manifest escapes deployment root")
+    installed = []
+    for component in manifest.get("components", []):
+        if component.get("id") != "opencli-script-host":
+            continue
+        script_host = (manifest_path.parent / component["path"]).resolve()
+        if manifest_path.parent not in script_host.parents:
+            raise ValueError("script host escapes runtime bundle")
+        for rule_id, version in PACKAGED_RULE_FILES:
+            rule = load_packaged_rule(script_host, rule_id, version)
+            if rule is not None:
+                installed.append(
+                    {
+                        "id": rule_id,
+                        "version": version,
+                        "platform": rule.get("platform", rule_id),
+                        "identity_probe_supported": rule.get("identity_probe_supported", False),
+                        "qr_only": rule.get("modes") == ["qr"],
+                        "authentication_verified": False,
+                    }
+                )
+    if not installed or not isinstance(manifest.get("version"), str):
+        raise ValueError("no packaged account login rule installed")
+    disk_path = configuration.runtime_root
+    while not disk_path.exists() and disk_path.parent != disk_path:
+        disk_path = disk_path.parent
+    now = datetime.now(UTC)
+    occupied = allocator.occupied_slots()
+    if occupied > 1:
+        raise ValueError("fixed-port account node exceeds its single slot")
+    return NodeCapacityFactV1(
+        node_id=identity.node_id,
+        boot_id=identity.boot_id,
+        slot_limit=1,
+        occupied_slots=occupied,
+        disk_available=shutil.disk_usage(disk_path).free,
+        observed_at=now,
+        expires_at=now + timedelta(seconds=30),
+        capabilities={
+            "browser_login_bundles": [
+                {"id": configuration.bundle_id, "version": manifest["version"], "rules": installed}
+            ]
+        },
+    )
+
+
+async def _send_account_capacity(ws, identity: NodeIdentityV1) -> None:
+    try:
+        while True:
+            capacity = _measured_account_capacity(identity)
+            await ws.send(
+                json.dumps(
+                    {"type": "account_capacity", "capacity": capacity.model_dump(mode="json")}
+                )
+            )
+            await asyncio.sleep(10)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning("Account capacity reporting stopped; stale capacity will expire")
+
+
+async def _accept_ws_lease_renewal(message: dict, authenticated_identity: NodeIdentityV1) -> None:
+    claim = NodeClaimV1.model_validate(message.get("claim"))
+    session = SessionEnvelopeV1.model_validate(message.get("session"))
+    identity = NodeIdentityV1.model_validate(message.get("node_identity"))
+    if identity != authenticated_identity:
+        raise ValueError("renewal identity does not match authenticated node")
+    current = runtime_lease_book().current(claim.command_id)
+    if current is None or (
+        session.workspace_id,
+        session.account_id,
+        session.session_id,
+        session.node_id,
+        session.node_boot_id,
+        session.epoch,
+        session.lease_id,
+    ) != (
+        current.session.workspace_id,
+        current.session.account_id,
+        current.session.session_id,
+        current.session.node_id,
+        current.session.node_boot_id,
+        current.session.epoch,
+        current.session.lease_id,
+    ):
+        raise ValueError("renewal changes session lineage")
+    admission = runtime_lease_book().renew(
+        claim=claim, session=session, node_identity=identity
+    )
+    await account_runtime_allocator().renew(
+        claim=claim, session=admission.session, node_identity=identity
+    )
 
 
 async def _register_login_portal_runtime(
@@ -547,7 +1121,20 @@ async def _register_login_portal_runtime(
 ) -> None:
     """Bind the login session to the real page RecordSession before portal use."""
 
-    if session.purpose != "login" or session.session_id in _ACTIVE_PORTAL_RECORDS:
+    if session.purpose != "login":
+        return
+    try:
+        session_portal_registry().resolve(
+            session_id=session.session_id,
+            node_id=session.node_id,
+            boot_id=session.node_boot_id,
+            epoch=session.epoch,
+            agent_url=agent_url,
+        )
+    except BrowserRuntimeError as exc:
+        if exc.code != "portal_record_missing":
+            raise
+    else:
         return
     owner_endpoint = _CENTRAL_API_URL
     if not agent_url.startswith("https://") or not owner_endpoint.startswith("https://"):
@@ -589,11 +1176,20 @@ async def _register_login_portal_runtime(
     except BaseException:
         await record_session.stop(status="failed", note="portal registration failed")
         raise
-    _ACTIVE_PORTAL_RECORDS[session.session_id] = record_session
 
 
 _ACTIVE_PORTALS: dict[str, _PortalRuntime] = {}
 _PORTAL_MAX_WIRE_BYTES = 4_200_000
+
+
+async def _close_portal_runtime(portal_id: str) -> None:
+    runtime = _ACTIVE_PORTALS.pop(portal_id, None)
+    if runtime is not None and runtime.pointer_pressed:
+        runtime.pointer_pressed = False
+        try:
+            await asyncio.wait_for(release_portal_pointer(runtime.websocket_url), timeout=2)
+        except Exception:
+            logger.debug("Portal pointer target already closed")
 
 
 async def _send_ws_binary(ws, data: bytes) -> None:
@@ -605,16 +1201,17 @@ async def _send_ws_binary(ws, data: bytes) -> None:
 
 
 async def _send_portal_pixel(ws, runtime: _PortalRuntime) -> None:
-    runtime.pixel_sequence += 1
-    frame = await capture_portal_frame(
-        websocket_url=runtime.websocket_url,
-        route=runtime.route,
-        sequence=runtime.pixel_sequence,
-    )
-    encoded = encode_portal_wire_frame(frame)
-    if len(encoded) > _PORTAL_MAX_WIRE_BYTES:
-        raise RuntimeError("portal pixel exceeds transport limit")
-    await _send_ws_binary(ws, encoded)
+    async with runtime.pixel_lock:
+        runtime.pixel_sequence += 1
+        frame = await capture_portal_frame(
+            websocket_url=runtime.websocket_url,
+            route=runtime.route,
+            sequence=runtime.pixel_sequence,
+        )
+        encoded = encode_portal_wire_frame(frame)
+        if len(encoded) > _PORTAL_MAX_WIRE_BYTES:
+            raise RuntimeError("portal pixel exceeds transport limit")
+        await _send_ws_binary(ws, encoded)
 
 
 def _portal_frame_matches_route(
@@ -661,7 +1258,7 @@ async def _handle_ws_portal(ws, msg: dict, authenticated_identity: NodeIdentityV
         await ws.send(json.dumps({"type": "portal_ready", "portal_id": portal_id}))
         await _send_portal_pixel(ws, runtime)
     except Exception as exc:
-        _ACTIVE_PORTALS.pop(portal_id, None)
+        await _close_portal_runtime(portal_id)
         try:
             await ws.send(
                 json.dumps(
@@ -690,6 +1287,7 @@ async def _handle_ws_portal_binary(ws, data: bytes) -> None:
     runtime = _ACTIVE_PORTALS.get(portal_id)
     if runtime is None:
         logger.warning("WS: control for inactive portal session=%s", portal_id)
+        return
     try:
         if runtime.route.route_expires_at <= datetime.now(UTC):
             raise ValueError("portal route expired")
@@ -705,12 +1303,18 @@ async def _handle_ws_portal_binary(ws, data: bytes) -> None:
         current_target = await resolve_portal_target(runtime.cdp_endpoint, runtime.route)
         if current_target != runtime.websocket_url:
             raise ValueError("portal browser target changed")
+        if control.kind == "pointer" and control.sensitive_payload is not None:
+            if control.sensitive_payload.pointer_action == "down":
+                runtime.pointer_pressed = True
         await apply_portal_control(
             websocket_url=runtime.websocket_url,
             cdp_endpoint=runtime.cdp_endpoint,
             route=runtime.route,
             control=control,
         )
+        if control.kind == "pointer" and control.sensitive_payload is not None:
+            if control.sensitive_payload.pointer_action in {None, "up"}:
+                runtime.pointer_pressed = False
         runtime.control_sequence = frame.sequence
         if control.kind == "request_view":
             await _send_portal_pixel(ws, runtime)
@@ -722,7 +1326,7 @@ async def _handle_ws_portal_binary(ws, data: bytes) -> None:
             )
     except Exception:
         logger.warning("WS: portal control rejected for session=%s", portal_id, exc_info=True)
-        _ACTIVE_PORTALS.pop(portal_id, None)
+        await _close_portal_runtime(portal_id)
         try:
             await ws.send(
                 json.dumps(
@@ -808,6 +1412,13 @@ async def _handle_ws_agent_task(
     request_id = msg.get("request_id", "")
 
     async def _send_result(result: dict) -> None:
+        if msg.get("require_cancel_ack") is True:
+            result = {
+                **result,
+                "task_id": request_id,
+                "cleanup_complete": cleanup_complete,
+            }
+            _cache_agent_task_terminal(request_id, result)
         try:
             await ws.send(
                 json.dumps(
@@ -821,7 +1432,9 @@ async def _handle_ws_agent_task(
         except Exception as exc:
             logger.error("WS: failed to send agent_result for request_id=%s: %s", request_id, exc)
 
+    cleanup_complete = True
     runtime_type = msg.get("runtime", "")
+    terminal_event: dict | None = None
     # Everything below is one outer try/except: get_runtime() lookup, adapter
     # construction of AgentTask, and the invoke() stream are all treated the
     # same way — any exception must resolve the center's pending future.
@@ -885,6 +1498,13 @@ async def _handle_ws_agent_task(
             }
             command_kind = runtime_request.command.kind.value
             if command_kind in {"stop_and_save", "close_session"}:
+                stopping_generation = await _block_browser_desktop_for_stop(
+                    runtime_request.session, runtime_request.claim
+                )
+                watcher = _LOGIN_OBSERVERS.pop(runtime_request.session.session_id, None)
+                if watcher is not None:
+                    watcher.cancel()
+                    await asyncio.gather(watcher, return_exceptions=True)
                 try:
                     registration = session_portal_registry().resolve(
                         session_id=runtime_request.session.session_id,
@@ -903,6 +1523,28 @@ async def _handle_ws_agent_task(
                         runtime_request.session.session_id,
                         exc_info=True,
                     )
+                pre_save_login_observation = None
+                if (
+                    command_kind == "stop_and_save"
+                    and runtime_request.session.purpose == "browser"
+                ):
+                    running_before_stop = account_runtime_allocator().get(
+                        runtime_request.session.session_id
+                    )
+                    if running_before_stop is not None:
+                        try:
+                            observed = await observe_login_runtime(
+                                cdp_endpoint=running_before_stop.binding.cdp_endpoint,
+                                session=runtime_request.session,
+                                claim=runtime_request.claim,
+                                node_identity=authenticated_identity,
+                                expected_origin=running_before_stop.bundle.login_origin,
+                            )
+                            pre_save_login_observation = observed.model_dump(mode="json")
+                        except BrowserRuntimeError:
+                            # Saving the browser environment remains allowed, but
+                            # the center must clear any earlier authentication.
+                            pass
                 manifest = await account_runtime_allocator().stop(
                     session_id=runtime_request.session.session_id,
                     node_id=runtime_request.claim.node_id,
@@ -920,6 +1562,7 @@ async def _handle_ws_agent_task(
                     epoch=runtime_request.claim.epoch,
                 )
                 runtime_lease_book().revoke(runtime_request.command.command_id)
+                _STOPPING_BROWSER_DESKTOPS.discard(stopping_generation)
                 await _send_result(
                     {
                         "type": "done",
@@ -928,6 +1571,7 @@ async def _handle_ws_agent_task(
                             "runtime_status": "stopped",
                             "session_id": runtime_request.session.session_id,
                             "profile_manifest": manifest,
+                            "pre_save_login_observation": pre_save_login_observation,
                         },
                     }
                 )
@@ -945,21 +1589,78 @@ async def _handle_ws_agent_task(
                     tunnel_handle=tunnel_handle,
                     tunnel_auth_digest=tunnel_auth_digest,
                 )
-                observation = await observe_login_runtime(
-                    cdp_endpoint=running.binding.cdp_endpoint,
-                    session=runtime_request.session,
-                    claim=runtime_request.claim,
-                    node_identity=authenticated_identity,
-                    expected_origin=running.bundle.login_origin,
-                )
-                await ws.send(
-                    json.dumps(
+                if runtime_request.session.purpose == "browser":
+                    # A full desktop is ready when the isolated Chromium/VNC
+                    # stack is healthy. Login target discovery is useful
+                    # evidence, but it must never gate desktop availability.
+                    old_watcher = _LOGIN_OBSERVERS.pop(
+                        runtime_request.session.session_id, None
+                    )
+                    if old_watcher is not None:
+                        old_watcher.cancel()
+                    _LOGIN_OBSERVERS[runtime_request.session.session_id] = (
+                        asyncio.create_task(
+                            _watch_login(ws, runtime_request.command.command_id)
+                        )
+                    )
+                    await _send_result(
                         {
-                            "type": "login_observation",
-                            "observation": observation.model_dump(mode="json"),
+                            "type": "done",
+                            "task_id": request_id,
+                            "result": {
+                                "runtime_status": "healthy",
+                                "session_id": running.binding.session_id,
+                                "profile_id": running.profile_id,
+                            },
                         }
                     )
+                    return
+                # Chrome health precedes document injection; wait briefly for the
+                # exact installed rule to produce its first real observation.
+                for attempt in range(15):
+                    try:
+                        first = await observe_login_runtime(
+                            cdp_endpoint=running.binding.cdp_endpoint,
+                            session=runtime_request.session,
+                            claim=runtime_request.claim,
+                            node_identity=authenticated_identity,
+                            expected_origin=running.bundle.login_origin,
+                        )
+                        break
+                    except BrowserRuntimeError:
+                        if (
+                            attempt == 14
+                            or _current_login_admission(runtime_request.command.command_id) is None
+                        ):
+                            raise
+                        await asyncio.sleep(1)
+                first_wire = first.model_dump(mode="json")
+                await ws.send(json.dumps({"type": "login_observation", "observation": first_wire}))
+                initial_fingerprint = json.dumps(
+                    {
+                        key: first_wire.get(key)
+                        for key in (
+                            "state",
+                            "evidence_kind",
+                            "browser_session_state",
+                            "external_identity",
+                            "target",
+                            "view_generation",
+                            "error_code",
+                        )
+                    },
+                    sort_keys=True,
                 )
+                old_watcher = _LOGIN_OBSERVERS.pop(runtime_request.session.session_id, None)
+                if old_watcher is not None:
+                    old_watcher.cancel()
+                watcher = asyncio.create_task(
+                    _watch_login(
+                        ws, runtime_request.command.command_id,
+                        initial_fingerprint, first.target.tab_id,
+                    )
+                )
+                _LOGIN_OBSERVERS[runtime_request.session.session_id] = watcher
                 await _send_result(
                     {
                         "type": "done",
@@ -1029,35 +1730,63 @@ async def _handle_ws_agent_task(
         config_errors = adapter.validate_config(task.config)
         if config_errors:
             raise RuntimeInvocationError("; ".join(config_errors), error_type="ConfigError")
-        readiness = await adapter.readiness(task.config)
+        cleanup_complete = False
+        readiness_task = asyncio.create_task(adapter.readiness(task.config))
+        try:
+            readiness = await asyncio.shield(readiness_task)
+        except asyncio.CancelledError:
+            readiness_task.cancel()
+            try:
+                await _complete_agent_cleanup(readiness_task)
+            except asyncio.CancelledError:
+                cleanup_complete = True
+            else:
+                cleanup_complete = True
+            raise
+        else:
+            cleanup_complete = True
         if readiness.status != "ready":
             raise RuntimeInvocationError(
                 readiness.reason or f"runtime {runtime_type!r} is not ready",
                 error_type=readiness.reason_code or "RuntimeNotReady",
             )
 
-        terminal_event: dict | None = None
-        async for event in adapter.invoke(task):
-            terminal_event = event
-            try:
-                await ws.send(
-                    json.dumps(
-                        {
-                            "type": "agent_event",
-                            "request_id": request_id,
-                            "event": event,
-                        }
+        stream = adapter.invoke(task)
+        cleanup_complete = False
+        iteration_failed = False
+        delivery_failed = False
+        try:
+            async for event in stream:
+                terminal_event = event
+                try:
+                    await _send_ws_agent_event(
+                        ws,
+                        request_id=request_id,
+                        event=event,
                     )
-                )
-            except Exception as exc:
-                logger.error(
-                    "WS: failed to send agent_event for request_id=%s: %s",
-                    request_id,
-                    exc,
-                )
-        # Contract violation (adapter yielded nothing) — still must resolve
-        # the center's pending future rather than hang it until timeout.
-        if terminal_event is None:
+                except RuntimeInvocationError:
+                    delivery_failed = True
+                    raise
+                except Exception as exc:
+                    delivery_failed = True
+                    logger.error(
+                        "WS: failed to send agent_event for request_id=%s: %s",
+                        request_id,
+                        exc,
+                    )
+                    raise RuntimeInvocationError(
+                        "failed to deliver agent event to the control plane",
+                        error_type="AgentEventDeliveryError",
+                    ) from exc
+        except Exception:
+            iteration_failed = True
+            raise
+        finally:
+            await _complete_agent_cleanup(stream.aclose())
+            cleanup_complete = not iteration_failed or delivery_failed
+        if terminal_event is None or terminal_event.get("type") not in {"done", "error"}:
+            # Contract violation (adapter yielded nothing) — still must resolve
+            # the center's pending future rather than hang it until timeout.
             terminal_event = {
                 "type": "error",
                 "task_id": request_id,
@@ -1071,6 +1800,16 @@ async def _handle_ws_agent_task(
             runtime_type,
             terminal_event.get("type"),
         )
+    except asyncio.CancelledError:
+        result = terminal_event
+        if result is None or result.get("type") not in {"done", "error"}:
+            result = {
+                "type": "error",
+                "task_id": request_id,
+                "message": "Agent execution stopped after runtime cleanup",
+                "error_type": "CancelledError",
+            }
+        await _complete_agent_cleanup(_send_result(result))
     except RuntimeInvocationError as exc:
         logger.exception(
             "WS agent_task request_id=%s: adapter invocation error: %s",
@@ -1098,6 +1837,72 @@ async def _handle_ws_agent_task(
 
 
 _ACTIVE_AGENT_TASKS: dict[str, asyncio.Task[None]] = {}
+_AGENT_TASK_TERMINAL_LIMIT = 1024
+_AGENT_TASK_TERMINAL_TTL_SECONDS = 3600
+_AGENT_TASK_TERMINALS: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
+
+
+def _prune_agent_task_terminals(now: float) -> None:
+    while _AGENT_TASK_TERMINALS:
+        expires_at, _result = next(iter(_AGENT_TASK_TERMINALS.values()))
+        if expires_at > now:
+            break
+        _AGENT_TASK_TERMINALS.popitem(last=False)
+
+
+def _cache_agent_task_terminal(task_id: str, result: dict) -> None:
+    if (
+        not isinstance(task_id, str)
+        or not 0 < len(task_id) <= 256
+        or result.get("type") not in {"done", "error"}
+        or result.get("task_id") != task_id
+        or not isinstance(result.get("cleanup_complete"), bool)
+    ):
+        return
+    terminal = {
+        "type": result["type"],
+        "task_id": task_id,
+        "cleanup_complete": result["cleanup_complete"],
+    }
+    error_type = result.get("error_type")
+    if isinstance(error_type, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", error_type):
+        terminal["error_type"] = error_type
+    now = monotonic()
+    _prune_agent_task_terminals(now)
+    _AGENT_TASK_TERMINALS.pop(task_id, None)
+    _AGENT_TASK_TERMINALS[task_id] = (now + _AGENT_TASK_TERMINAL_TTL_SECONDS, terminal)
+    while len(_AGENT_TASK_TERMINALS) > _AGENT_TASK_TERMINAL_LIMIT:
+        _AGENT_TASK_TERMINALS.popitem(last=False)
+
+
+async def _handle_ws_agent_task_status(ws, msg: dict) -> None:
+    request_id = msg.get("request_id")
+    task_id = msg.get("task_id")
+    if any(
+        not isinstance(value, str) or not 0 < len(value) <= 256 for value in (request_id, task_id)
+    ):
+        return
+    _prune_agent_task_terminals(monotonic())
+    cached = _AGENT_TASK_TERMINALS.get(task_id)
+    active = _ACTIVE_AGENT_TASKS.get(task_id)
+    if cached is not None and cached[1]["cleanup_complete"] is True:
+        result = cached[1]
+    elif active is not None and not active.done():
+        result = {"status": "running"}
+    elif cached is not None:
+        result = cached[1]
+    else:
+        result = {"status": "unknown"}
+    await ws.send(
+        json.dumps(
+            {
+                "type": "agent_task_status_result",
+                "request_id": request_id,
+                "task_id": task_id,
+                "result": result,
+            }
+        )
+    )
 
 
 def _forget_ws_agent_task(request_id: str, task: asyncio.Task[None]) -> None:
@@ -1126,9 +1931,539 @@ def _start_ws_agent_task(
             tunnel_handle=tunnel_handle,
             tunnel_auth_digest=tunnel_auth_digest,
         )
+    _AGENT_TASK_TERMINALS.pop(request_id, None)
     task = asyncio.create_task(coroutine)
     _ACTIVE_AGENT_TASKS[request_id] = task
     task.add_done_callback(lambda completed: _forget_ws_agent_task(request_id, completed))
+
+
+_TERMINAL_FRAME_HEADER = struct.Struct("!B36s36sQ")
+_TERMINAL_INPUT = 1
+_TERMINAL_OUTPUT = 2
+_TERMINAL_BROADCAST_ATTACHMENT = "00000000-0000-0000-0000-000000000000"
+_TERMINAL_MAX_PAYLOAD = 64 * 1024
+_TERMINAL_REPLAY_LIMIT = 4 * 1024 * 1024
+_TERMINAL_RETAINED_LIMIT = 32
+_TERMINAL_RUNTIME_ENV = {
+    "codex": ("AGENT_CODEX_ISOLATED_RUNNER", "AGENT_CODEX_ALLOWED_ROOTS"),
+    "omp": ("AGENT_OMP_ISOLATED_RUNNER", "AGENT_OMP_ALLOWED_ROOTS"),
+}
+
+
+@dataclass
+class _NativeTerminalSession:
+    session_id: str
+    runtime: str
+    process: asyncio.subprocess.Process
+    master_fd: int
+    status: str = "active"
+    exit_code: int | None = None
+    cleanup_complete: bool = False
+    controller_id: str | None = None
+    controller_attachment_id: str | None = None
+    attachments: dict[str, str] = field(default_factory=dict)
+    replay: bytearray = field(default_factory=bytearray)
+    sequence: int = 0
+    replay_truncated: bool = False
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    reader_task: asyncio.Task[None] | None = None
+    wait_task: asyncio.Task[None] | None = None
+
+
+_NATIVE_TERMINALS: dict[str, _NativeTerminalSession] = {}
+_NATIVE_TERMINALS_LOCK = asyncio.Lock()
+_STARTING_NATIVE_TERMINALS: set[str] = set()
+_ACTIVE_TERMINAL_WS: Any | None = None
+
+
+def _canonical_terminal_uuid(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("terminal identifier must be a UUID")
+    parsed = str(uuid.UUID(value))
+    if parsed != value:
+        raise ValueError("terminal identifier must be canonical")
+    return parsed
+
+
+def _terminal_dimensions(msg: dict) -> tuple[int, int]:
+    cols = msg.get("cols")
+    rows = msg.get("rows")
+    if (
+        not isinstance(cols, int)
+        or isinstance(cols, bool)
+        or not isinstance(rows, int)
+        or isinstance(rows, bool)
+        or not 1 <= cols <= 1000
+        or not 1 <= rows <= 1000
+    ):
+        raise ValueError("terminal dimensions are invalid")
+    return cols, rows
+
+
+def _terminal_runner_command(runtime: str, cwd: str, initial_input: str) -> list[str]:
+    if os.name == "nt":
+        raise RuntimeError("native PTY terminals require Linux or WSL")
+    env_names = _TERMINAL_RUNTIME_ENV.get(runtime)
+    if env_names is None:
+        raise ValueError("unsupported terminal runtime")
+    runner_value = os.environ.get(env_names[0], "").strip()
+    runner = Path(runner_value)
+    if not runner_value or not runner.is_absolute() or not runner.is_file():
+        raise RuntimeError("isolated terminal runner is unavailable")
+    try:
+        allowed_values = json.loads(os.environ.get(env_names[1], ""))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("isolated terminal roots are invalid") from exc
+    if not isinstance(allowed_values, list) or not allowed_values:
+        raise RuntimeError("isolated terminal roots are unavailable")
+    if any(not isinstance(value, str) or not Path(value).is_absolute() for value in allowed_values):
+        raise RuntimeError("isolated terminal roots are invalid")
+    working_directory = Path(cwd).resolve(strict=True)
+    allowed_roots = [Path(value).resolve(strict=True) for value in allowed_values]
+    if not any(
+        working_directory == root or working_directory.is_relative_to(root)
+        for root in allowed_roots
+    ):
+        raise PermissionError("terminal working directory is outside the reserved root")
+    if runtime == "codex":
+        arguments = [
+            "--terminal",
+            "--sandbox",
+            "read-only",
+            "--ask-for-approval",
+            "never",
+            "--cd",
+            str(working_directory),
+            "-c",
+            "features.shell_tool=false",
+            "-c",
+            "features.unified_exec=false",
+            "-c",
+            "features.multi_agent=false",
+            "-c",
+            "features.apps=false",
+            "-c",
+            "features.plugins=false",
+            "-c",
+            "features.skill_search=false",
+            "-c",
+            "features.skill_mcp_dependency_install=false",
+            "-c",
+            'web_search="disabled"',
+        ]
+    else:
+        arguments = [
+            "--terminal",
+            "--no-session",
+            "--no-tools",
+            "--no-lsp",
+            "--no-extensions",
+            "--no-skills",
+            "--no-rules",
+        ]
+    return [str(runner), *arguments, initial_input]
+
+
+def _set_terminal_size(master_fd: int, cols: int, rows: int) -> None:
+    if os.name == "nt":
+        raise RuntimeError("native PTY terminals require Linux or WSL")
+    fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+
+async def _write_terminal_fd(master_fd: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        written = await asyncio.to_thread(os.write, master_fd, payload[offset:])
+        if written <= 0:
+            raise OSError("terminal input write failed")
+        offset += written
+
+
+def _encode_terminal_output(
+    session_id: str, attachment_id: str, sequence: int, payload: bytes
+) -> bytes:
+    return _TERMINAL_FRAME_HEADER.pack(
+        _TERMINAL_OUTPUT,
+        session_id.encode("ascii"),
+        attachment_id.encode("ascii"),
+        sequence,
+    ) + payload
+
+
+async def _send_terminal_event(
+    session_id: str, event: dict[str, Any], *, attachment_id: str | None = None
+) -> None:
+    ws = _ACTIVE_TERMINAL_WS
+    if ws is None:
+        return
+    frame: dict[str, Any] = {"type": "terminal_event", "session_id": session_id, "event": event}
+    if attachment_id is not None:
+        frame["attachment_id"] = attachment_id
+    try:
+        await ws.send(json.dumps(frame))
+    except Exception:
+        return
+
+
+async def _send_terminal_output(
+    session_id: str, attachment_id: str, sequence: int, payload: bytes
+) -> None:
+    ws = _ACTIVE_TERMINAL_WS
+    if ws is None:
+        return
+    try:
+        await ws.send(_encode_terminal_output(session_id, attachment_id, sequence, payload))
+    except Exception:
+        return
+
+
+async def _read_native_terminal(session: _NativeTerminalSession) -> None:
+    try:
+        while True:
+            try:
+                payload = await asyncio.to_thread(os.read, session.master_fd, _TERMINAL_MAX_PAYLOAD)
+            except OSError:
+                break
+            if not payload:
+                break
+            async with session.lock:
+                session.sequence += len(payload)
+                session.replay.extend(payload)
+                if len(session.replay) > _TERMINAL_REPLAY_LIMIT:
+                    overflow = len(session.replay) - _TERMINAL_REPLAY_LIMIT
+                    del session.replay[:overflow]
+                    session.replay_truncated = True
+                should_send = bool(session.attachments)
+                sequence = session.sequence
+            if should_send:
+                await _send_terminal_output(
+                    session.session_id,
+                    _TERMINAL_BROADCAST_ATTACHMENT,
+                    sequence,
+                    payload,
+                )
+    finally:
+        try:
+            os.close(session.master_fd)
+        except OSError:
+            pass
+
+
+_TERMINAL_CLEANUP_POLL_ATTEMPTS = 40
+_TERMINAL_CLEANUP_POLL_INTERVAL_SECONDS = 0.05
+
+
+async def _cleanup_terminal_process_group(session: _NativeTerminalSession) -> bool:
+    if os.name == "nt":
+        return True
+    try:
+        os.killpg(session.process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    for _attempt in range(_TERMINAL_CLEANUP_POLL_ATTEMPTS):
+        try:
+            os.killpg(session.process.pid, 0)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False
+        await asyncio.sleep(_TERMINAL_CLEANUP_POLL_INTERVAL_SECONDS)
+    return False
+
+
+async def _wait_native_terminal(session: _NativeTerminalSession) -> None:
+    exit_code = await session.process.wait()
+    cleanup_complete = await _cleanup_terminal_process_group(session)
+    if session.reader_task is not None:
+        await asyncio.gather(session.reader_task, return_exceptions=True)
+    async with session.lock:
+        session.exit_code = exit_code
+        session.cleanup_complete = cleanup_complete
+        session.status = "exited"
+    await _send_terminal_event(
+        session.session_id,
+        {
+            "type": "exit",
+            "status": "exited",
+            "exit_code": exit_code,
+            "cleanup_complete": cleanup_complete,
+        },
+    )
+    async with _NATIVE_TERMINALS_LOCK:
+        completed = [
+            session_id
+            for session_id, candidate in _NATIVE_TERMINALS.items()
+            if candidate.status == "exited"
+        ]
+        for session_id in completed[:-_TERMINAL_RETAINED_LIMIT]:
+            _NATIVE_TERMINALS.pop(session_id, None)
+
+
+def _terminal_status(session: _NativeTerminalSession) -> dict[str, Any]:
+    return {
+        "status": session.status,
+        "exit_code": session.exit_code,
+        "cleanup_complete": session.cleanup_complete,
+    }
+
+
+async def _send_terminal_response(ws: Any, msg: dict, response: dict[str, Any]) -> None:
+    request_id = msg.get("request_id")
+    session_id = msg.get("session_id")
+    if not isinstance(request_id, str) or not isinstance(session_id, str):
+        return
+    await ws.send(
+        json.dumps(
+            {
+                "type": "terminal_response",
+                "request_id": request_id,
+                "session_id": session_id,
+                "response": response,
+            }
+        )
+    )
+
+
+async def _handle_terminal_start(ws: Any, msg: dict) -> None:
+    master_fd: int | None = None
+    slave_fd: int | None = None
+    process: asyncio.subprocess.Process | None = None
+    session_id: str | None = None
+    try:
+        session_id = _canonical_terminal_uuid(msg.get("session_id"))
+        async with _NATIVE_TERMINALS_LOCK:
+            conflict = session_id in _NATIVE_TERMINALS or session_id in _STARTING_NATIVE_TERMINALS
+            if not conflict:
+                _STARTING_NATIVE_TERMINALS.add(session_id)
+        if conflict:
+            await _send_terminal_response(ws, msg, {"status": "conflict"})
+            return
+        runtime = msg.get("runtime")
+        cwd = msg.get("cwd")
+        initial_input = msg.get("initial_input")
+        cols, rows = _terminal_dimensions(msg)
+        if (
+            runtime not in _TERMINAL_RUNTIME_ENV
+            or not isinstance(cwd, str)
+            or not isinstance(initial_input, str)
+            or not initial_input.strip()
+            or len(initial_input) > 20_000
+            or "\x00" in initial_input
+        ):
+            raise ValueError("invalid terminal start request")
+        command = _terminal_runner_command(runtime, cwd, initial_input)
+        master_fd, slave_fd = pty.openpty()
+        _set_terminal_size(master_fd, cols, rows)
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=cwd,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            start_new_session=True,
+        )
+        os.close(slave_fd)
+        slave_fd = None
+        session = _NativeTerminalSession(
+            session_id=session_id,
+            runtime=runtime,
+            process=process,
+            master_fd=master_fd,
+        )
+        async with _NATIVE_TERMINALS_LOCK:
+            _NATIVE_TERMINALS[session_id] = session
+        session.reader_task = asyncio.create_task(_read_native_terminal(session))
+        session.wait_task = asyncio.create_task(_wait_native_terminal(session))
+        await _send_terminal_response(ws, msg, _terminal_status(session))
+    except BaseException as exc:
+        logger.warning("Native terminal start failed: %s", type(exc).__name__)
+        if process is not None:
+            await _kill_process_tree(process)
+        if session_id is not None:
+            async with _NATIVE_TERMINALS_LOCK:
+                candidate = _NATIVE_TERMINALS.get(session_id)
+                if candidate is not None and candidate.process is process:
+                    _NATIVE_TERMINALS.pop(session_id, None)
+        for file_descriptor in (master_fd, slave_fd):
+            if file_descriptor is not None:
+                try:
+                    os.close(file_descriptor)
+                except OSError:
+                    pass
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        await _send_terminal_response(ws, msg, {"status": "failed"})
+    finally:
+        if session_id is not None:
+            async with _NATIVE_TERMINALS_LOCK:
+                _STARTING_NATIVE_TERMINALS.discard(session_id)
+
+
+async def _handle_terminal_attach(ws: Any, msg: dict) -> None:
+    try:
+        session_id = _canonical_terminal_uuid(msg.get("session_id"))
+        attachment_id = _canonical_terminal_uuid(msg.get("attachment_id"))
+        controller_id = _canonical_terminal_uuid(msg.get("controller_id"))
+        session = _NATIVE_TERMINALS.get(session_id)
+        if session is None:
+            await _send_terminal_response(ws, msg, {"status": "unknown"})
+            return
+        async with session.lock:
+            old_attachment = session.controller_attachment_id
+            takeover = msg.get("takeover") is True
+            controls = session.controller_id in {None, controller_id} or takeover
+            session.attachments[attachment_id] = controller_id
+            if controls:
+                session.controller_id = controller_id
+                session.controller_attachment_id = attachment_id
+            status = _terminal_status(session)
+            replay_truncated = session.replay_truncated
+            sequence = session.sequence
+            snapshot = bytes(session.replay)
+        await _send_terminal_response(ws, msg, {**status, "controls": controls})
+        if takeover and old_attachment and old_attachment != attachment_id:
+            await _send_terminal_event(
+                session_id,
+                {"type": "kicked"},
+                attachment_id=old_attachment,
+            )
+        await _send_terminal_event(
+            session_id,
+            {
+                "type": "attached" if controls else "locked",
+                "controls": controls,
+                **status,
+                "replay_truncated": replay_truncated,
+            },
+            attachment_id=attachment_id,
+        )
+        await _send_terminal_event(
+            session_id,
+            {"type": "snapshot_begin", "sequence": sequence},
+            attachment_id=attachment_id,
+        )
+        for offset in range(0, len(snapshot), _TERMINAL_MAX_PAYLOAD):
+            await _send_terminal_output(
+                session_id,
+                attachment_id,
+                sequence,
+                snapshot[offset : offset + _TERMINAL_MAX_PAYLOAD],
+            )
+        await _send_terminal_event(
+            session_id,
+            {"type": "snapshot_end", "sequence": sequence},
+            attachment_id=attachment_id,
+        )
+    except (ValueError, TypeError):
+        await _send_terminal_response(ws, msg, {"status": "failed"})
+
+
+async def _handle_terminal_takeover(ws: Any, msg: dict) -> None:
+    try:
+        session_id = _canonical_terminal_uuid(msg.get("session_id"))
+        attachment_id = _canonical_terminal_uuid(msg.get("attachment_id"))
+        controller_id = _canonical_terminal_uuid(msg.get("controller_id"))
+        session = _NATIVE_TERMINALS.get(session_id)
+        if session is None or session.attachments.get(attachment_id) != controller_id:
+            await _send_terminal_response(ws, msg, {"status": "unknown"})
+            return
+        async with session.lock:
+            old_attachment = session.controller_attachment_id
+            session.controller_id = controller_id
+            session.controller_attachment_id = attachment_id
+            if old_attachment and old_attachment != attachment_id:
+                await _send_terminal_event(
+                    session_id, {"type": "kicked"}, attachment_id=old_attachment
+                )
+            await _send_terminal_event(
+                session_id,
+                {"type": "control_granted", "controls": True},
+                attachment_id=attachment_id,
+            )
+            await _send_terminal_response(
+                ws, msg, {**_terminal_status(session), "controls": True}
+            )
+    except (ValueError, TypeError):
+        await _send_terminal_response(ws, msg, {"status": "failed"})
+
+
+async def _handle_terminal_resize(msg: dict) -> None:
+    try:
+        session = _NATIVE_TERMINALS[_canonical_terminal_uuid(msg.get("session_id"))]
+        attachment_id = _canonical_terminal_uuid(msg.get("attachment_id"))
+        cols, rows = _terminal_dimensions(msg)
+        async with session.lock:
+            if session.controller_attachment_id != attachment_id or session.status != "active":
+                return
+            _set_terminal_size(session.master_fd, cols, rows)
+    except (KeyError, ValueError, OSError, TypeError):
+        return
+
+
+async def _handle_terminal_detach(msg: dict) -> None:
+    try:
+        session = _NATIVE_TERMINALS[_canonical_terminal_uuid(msg.get("session_id"))]
+        attachment_id = _canonical_terminal_uuid(msg.get("attachment_id"))
+    except (KeyError, ValueError, TypeError):
+        return
+    async with session.lock:
+        session.attachments.pop(attachment_id, None)
+        if session.controller_attachment_id == attachment_id:
+            session.controller_attachment_id = None
+
+
+async def _handle_terminal_status(ws: Any, msg: dict) -> None:
+    try:
+        session = _NATIVE_TERMINALS.get(_canonical_terminal_uuid(msg.get("session_id")))
+    except (ValueError, TypeError):
+        session = None
+    await _send_terminal_response(
+        ws, msg, _terminal_status(session) if session is not None else {"status": "unknown"}
+    )
+
+
+async def _handle_terminal_stop(ws: Any, msg: dict) -> None:
+    try:
+        session = _NATIVE_TERMINALS.get(_canonical_terminal_uuid(msg.get("session_id")))
+    except (ValueError, TypeError):
+        session = None
+    if session is None:
+        await _send_terminal_response(ws, msg, {"status": "unknown"})
+        return
+    async with session.lock:
+        if session.status == "active":
+            session.status = "stopping"
+    if session.process.returncode is None:
+        await _kill_process_tree(session.process)
+    if session.wait_task is not None:
+        await asyncio.gather(session.wait_task, return_exceptions=True)
+    await _send_terminal_response(ws, msg, _terminal_status(session))
+
+
+async def _handle_terminal_input(frame: bytes) -> None:
+    if len(frame) <= _TERMINAL_FRAME_HEADER.size:
+        return
+    try:
+        kind, session_raw, attachment_raw, _sequence = _TERMINAL_FRAME_HEADER.unpack_from(frame)
+        session_id = _canonical_terminal_uuid(session_raw.decode("ascii"))
+        attachment_id = _canonical_terminal_uuid(attachment_raw.decode("ascii"))
+    except (ValueError, UnicodeDecodeError, struct.error):
+        return
+    payload = frame[_TERMINAL_FRAME_HEADER.size :]
+    if kind != _TERMINAL_INPUT or not 0 < len(payload) <= _TERMINAL_MAX_PAYLOAD:
+        return
+    session = _NATIVE_TERMINALS.get(session_id)
+    if session is None:
+        return
+    async with session.lock:
+        if session.controller_attachment_id != attachment_id or session.status != "active":
+            return
+        try:
+            await _write_terminal_fd(session.master_fd, payload)
+        except OSError:
+            return
 
 
 async def _register_via_ws(advertise_url: str) -> None:
@@ -1137,6 +2472,8 @@ async def _register_via_ws(advertise_url: str) -> None:
     Keeps reconnecting with exponential back-off so transient outages are
     recovered automatically.  The loop exits only when the process shuts down.
     """
+    global _ACTIVE_TERMINAL_WS
+
     import websockets  # requires: pip install websockets
 
     ws_url = (
@@ -1174,6 +2511,7 @@ async def _register_via_ws(advertise_url: str) -> None:
     attempt = 0
     while True:
         attempt += 1
+        connection_ws = None
         try:
             logger.info("WS connecting to center %s (attempt %d)", ws_url, attempt)
             connect_kwargs: dict = {"ping_interval": 30, "ping_timeout": 10}
@@ -1191,6 +2529,7 @@ async def _register_via_ws(advertise_url: str) -> None:
             else:
                 connector = websockets.connect(ws_url, **connect_kwargs)
             async with connector as ws:
+                connection_ws = ws
                 attempt = 0  # reset on successful connect
                 await ws.send(register_payload)
 
@@ -1221,11 +2560,21 @@ async def _register_via_ws(advertise_url: str) -> None:
                     connection_tunnel_handle = ""
                     connection_tunnel_digest = ""
                 logger.info("WS registered with center as %s", advertise_url)
+                _ACTIVE_TERMINAL_WS = ws
+
+                if identity is not None and _account_runtime_prerequisite(advertise_url)[0]:
+                    asyncio.create_task(_send_account_capacity(ws, identity))
 
                 # Main receive loop
                 async for raw_msg in ws:
                     if isinstance(raw_msg, (bytes, bytearray)):
-                        await _handle_ws_portal_binary(ws, bytes(raw_msg))
+                        wire = bytes(raw_msg)
+                        if wire.startswith(DESKTOP_MAGIC):
+                            await _handle_ws_browser_desktop_binary(ws, wire)
+                        elif wire[:1] == bytes([_TERMINAL_INPUT]):
+                            await _handle_terminal_input(wire)
+                        else:
+                            await _handle_ws_portal_binary(ws, wire)
                         continue
                     try:
                         msg = json.loads(raw_msg)
@@ -1233,7 +2582,18 @@ async def _register_via_ws(advertise_url: str) -> None:
                         logger.warning("WS: invalid JSON from center: %r", raw_msg[:200])
                         continue
                     msg_type = msg.get("type")
-                    if msg_type == "collect":
+                    if msg_type == "account_lease_renewed":
+                        current_identity = _node_identity(required=True)
+                        try:
+                            await _accept_ws_lease_renewal(msg, current_identity)
+                        except (BrowserRuntimeError, ValueError) as exc:
+                            logger.warning(
+                                "Account lease renewal rejected: %s; WS remains connected",
+                                exc.code
+                                if isinstance(exc, BrowserRuntimeError)
+                                else "invalid_renewal",
+                            )
+                    elif msg_type == "collect":
                         asyncio.create_task(_handle_ws_collect(ws, msg))
                     elif msg_type == "portal_open":
                         asyncio.create_task(
@@ -1244,7 +2604,21 @@ async def _register_via_ws(advertise_url: str) -> None:
                             _handle_ws_portal_prepare(ws, msg, _node_identity(required=False))
                         )
                     elif msg_type == "portal_close":
-                        _ACTIVE_PORTALS.pop(msg.get("portal_id", ""), None)
+                        await _close_portal_runtime(msg.get("portal_id", ""))
+                    elif msg_type == "browser_desktop_open":
+                        asyncio.create_task(
+                            _handle_ws_browser_desktop(
+                                ws,
+                                msg,
+                                _node_identity(required=False),
+                                tunnel_handle=connection_tunnel_handle,
+                                tunnel_auth_digest=connection_tunnel_digest,
+                            )
+                        )
+                    elif msg_type == "browser_desktop_close":
+                        await _close_browser_desktop(
+                            msg.get("route_id", ""), owner_ws=ws
+                        )
                     elif msg_type == "agent_task":
                         _start_ws_agent_task(
                             ws,
@@ -1254,6 +2628,24 @@ async def _register_via_ws(advertise_url: str) -> None:
                             tunnel_handle=connection_tunnel_handle,
                             tunnel_auth_digest=connection_tunnel_digest,
                         )
+                    elif msg_type == "agent_task_status":
+                        await _handle_ws_agent_task_status(ws, msg)
+                    elif msg_type == "agent_event_ack":
+                        _resolve_ws_agent_event_ack(msg)
+                    elif msg_type == "terminal_start":
+                        asyncio.create_task(_handle_terminal_start(ws, msg))
+                    elif msg_type == "terminal_attach":
+                        asyncio.create_task(_handle_terminal_attach(ws, msg))
+                    elif msg_type == "terminal_takeover":
+                        asyncio.create_task(_handle_terminal_takeover(ws, msg))
+                    elif msg_type == "terminal_resize":
+                        asyncio.create_task(_handle_terminal_resize(msg))
+                    elif msg_type == "terminal_detach":
+                        asyncio.create_task(_handle_terminal_detach(msg))
+                    elif msg_type == "terminal_status":
+                        asyncio.create_task(_handle_terminal_status(ws, msg))
+                    elif msg_type == "terminal_stop":
+                        asyncio.create_task(_handle_terminal_stop(ws, msg))
                     elif msg_type == "cancel":
                         request_id = msg.get("request_id", "")
                         proc = _ACTIVE_COLLECTS.get(request_id)
@@ -1279,7 +2671,18 @@ async def _register_via_ws(advertise_url: str) -> None:
             )
             await asyncio.sleep(wait)
         finally:
-            _ACTIVE_PORTALS.clear()
+            for portal_id in tuple(_ACTIVE_PORTALS):
+                await _close_portal_runtime(portal_id)
+            for route_id, runtime in tuple(_ACTIVE_BROWSER_DESKTOPS.items()):
+                if connection_ws is not None and runtime.owner_ws is connection_ws:
+                    await _close_browser_desktop(
+                        route_id, owner_ws=connection_ws, expected_runtime=runtime
+                    )
+            if _ACTIVE_TERMINAL_WS is locals().get("ws"):
+                _ACTIVE_TERMINAL_WS = None
+                for session in _NATIVE_TERMINALS.values():
+                    session.attachments.clear()
+                    session.controller_attachment_id = None
             for task in tuple(_ACTIVE_AGENT_TASKS.values()):
                 task.cancel()
 
@@ -1442,10 +2845,12 @@ async def invoke_runtime_http(
         context = resolve_account_runtime_context(req)
     else:
         _require_collect_auth(authorization)
-    if req.runtime == "codex":
+    if req.runtime in {"codex", "omp"}:
         raise HTTPException(
             status_code=403,
-            detail="Codex runtime is only available through controller WS dispatch",
+            detail=(
+                f"{req.runtime.title()} runtime is only available through controller WS dispatch"
+            ),
         )
     if req.runtime not in _bundle_declared_runtimes():
         raise HTTPException(

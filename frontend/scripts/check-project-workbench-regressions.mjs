@@ -1,10 +1,8 @@
 import assert from 'node:assert/strict'
-import { existsSync, readFileSync } from 'node:fs'
 import { access, readFile } from 'node:fs/promises'
 import path from 'node:path'
-import { registerHooks, stripTypeScriptTypes } from 'node:module'
 import test from 'node:test'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { fileURLToPath } from 'node:url'
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const source = (file) => readFile(path.join(root, file), 'utf8')
 
@@ -38,8 +36,10 @@ test('project navigation exposes orchestration, data, and evidence as project su
   assert.match(navigation, /label: '业务编排'/)
   assert.match(navigation, /label: '数据工作台'/)
   assert.match(navigation, /label: '逻辑与证据'/)
-  assert.match(navigation, /projects\/\$\{projectId\}\/data/)
-  assert.match(navigation, /projects\/\$\{projectId\}\/evidence/)
+  assert.match(navigation, /<a key=\{section\.id\} href=\{href\}/)
+  assert.doesNotMatch(navigation, /import Link from 'next\/link'/)
+  assert.match(navigation, /buildProjectNavigationUrl\('data', scope, current\)/)
+  assert.match(navigation, /buildProjectNavigationUrl\('evidence', scope, current\)/)
 })
 
 test('project overview exposes Dify-style API access and logs monitoring with real run data', async () => {
@@ -77,9 +77,9 @@ test('project overview exposes Dify-style API access and logs monitoring with re
   assert.match(operationsPage, /TRACE_PAGE_SIZE/)
   assert.match(operationsPage, /下一批/)
   assert.match(operationsPage, /节点状态与事件/)
-  assert.match(navigation, /projects\/\$\{projectId\}\/api/)
+  assert.match(navigation, /buildProjectNavigationUrl\('apiAccess', scope, current\)/)
   assert.match(navigation, /label: 'API \/ MCP'/)
-  assert.match(navigation, /projects\/\$\{projectId\}\/operations/)
+  assert.match(navigation, /buildProjectNavigationUrl\('operations', scope, current\)/)
   assert.match(hooks, /useProjectRuntimeSummary/)
   assert.match(hooks, /useProjectRuntimeLogs/)
   assert.match(hooks, /useProjectRuntimeTrace/)
@@ -87,6 +87,55 @@ test('project overview exposes Dify-style API access and logs monitoring with re
   assert.match(endpoints, /runtime-logs/)
   assert.match(endpoints, /runs\/\$\{runId\}\/trace/)
   assert.match(endpoints, /afterSequence/)
+})
+
+test('run detail analysis snapshots use only the bounded redacted contract', async () => {
+  const operationsPage = await source('app/(app)/studio/projects/[projectId]/operations/page.tsx')
+  const panel = await source('components/studio/run-analysis-snapshot-panel.tsx')
+  const hooks = await source('lib/api/hooks.ts')
+  const endpoints = await source('lib/api/workspace-endpoints.ts')
+  const types = await source('lib/api/types.ts')
+
+  assert.match(operationsPage, /<RunAnalysisSnapshotPanel/)
+  assert.match(panel, /useRunAnalysisSnapshotCapability/)
+  assert.match(panel, /usePreviewRunAnalysisSnapshot/)
+  assert.match(panel, /useCreateRunAnalysisSnapshot/)
+  assert.match(panel, /useRunAnalysisSnapshotReceipts/)
+  assert.match(panel, /useRunAnalysisSnapshotReceipt/)
+  assert.match(panel, /useRunAnalysisSnapshotSummary/)
+  assert.match(panel, /type="datetime-local"/)
+  assert.match(panel, /step="0\.001"/)
+  assert.match(panel, /toUtcInputBoundary\(runStartAt, 'ceil'\)/)
+  assert.match(panel, /toUtcInputBoundary\(runEndAt, 'floor'\)/)
+  assert.match(panel, /compareUtcInstants/)
+  assert.match(panel, /rangesMatch\(preview\.sourceRange, range\)/)
+  assert.match(panel, /data: preview\.sourceRange/)
+  assert.match(panel, /当前预览不再匹配输入范围/)
+  assert.match(panel, /candidate\.snapshotId === activeReceipt\.snapshotId/)
+  assert.match(panel, /aria-describedby/)
+  assert.match(panel, /runStatus !== 'completed'/)
+  assert.match(panel, /未启用/)
+  assert.match(panel, /不可用/)
+  assert.match(panel, /运行异常/)
+  assert.match(panel, /可创建/)
+  assert.match(panel, /正在导出已脱敏快照/)
+  assert.match(panel, /快照已完成/)
+  assert.match(panel, /没有可导出的事件/)
+  assert.match(panel, /快照已过期/)
+  assert.match(panel, /快照创建失败/)
+  assert.doesNotMatch(panel, /toISOString\(\)\.slice\(0, 19\)/)
+  assert.doesNotMatch(panel, /useProjectRuntimeTrace|ProjectRuntimeTrace/)
+  for (const field of ['rawPayload', 'rawError', 'credential', 'credentials', 'token', 'tokens', 'request', 'requests', 'projection', 'projections', 'inputs', 'results', 'url', 'urls', 'endpoint', 'endpoints', 'artifact', 'artifacts', 'leaseData', 'providerResponse', 'providerResponses', 'sql']) {
+    assert.doesNotMatch(panel, new RegExp(`(?:\\.${field}\\b|["']${field}["']\\s*:)`, 'i'))
+  }
+
+  assert.match(endpoints, /analysis-snapshots\/capability/)
+  assert.match(endpoints, /analysis-snapshots\/preview/)
+  assert.match(endpoints, /getRunAnalysisSnapshotSummary/)
+  assert.match(hooks, /queryKey: \["run-analysis-snapshot-summary"/)
+  assert.match(types, /export interface RunAnalysisSnapshotReceipt/)
+  assert.match(types, /redactionVersion: 1/)
+  assert.match(types, /acquisitionExecutionMetrics/)
 })
 
 test('backend project API runs published versions and exposes project-scoped logs and trace', async () => {

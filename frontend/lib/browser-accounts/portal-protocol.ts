@@ -20,7 +20,7 @@ export type PortalWireControl = PortalBinding & {
   kind: 'field_input' | 'pointer' | 'key' | 'request_view' | 'takeover'
   sequence: number
   field_ref?: string
-  focused_field_ref?: string
+  focused_field_ref?: string | null
 }
 
 export type PortalWirePixel = PortalBinding & {
@@ -30,7 +30,36 @@ export type PortalWirePixel = PortalBinding & {
   byte_length: number
   expires_at: string
   frame_bytes?: string
-  focused_field_ref?: string
+  focused_field_ref?: string | null
+  clip: PortalClip
+}
+
+export type PortalClip = { x: number; y: number; width: number; height: number }
+export type PortalPointerAction = 'down' | 'move' | 'up'
+export type PortalSensitivePayload = {
+  key?: string | null
+  x?: number | null
+  y?: number | null
+  pointer_action?: PortalPointerAction | null
+}
+
+export const PORTAL_CONTROL_KEYS = ['Tab', 'Enter', 'Backspace', 'Escape', 'Delete', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'Space'] as const
+
+export function isPortalControlKey(key: string): boolean {
+  return PORTAL_CONTROL_KEYS.some((candidate) => candidate === key)
+}
+
+export function portalPointerCoordinates(
+  clip: PortalClip,
+  bounds: { left: number; top: number; width: number; height: number },
+  clientX: number,
+  clientY: number,
+): { x: number; y: number } | null {
+  if (![bounds.left, bounds.top, bounds.width, bounds.height, clientX, clientY].every(Number.isFinite) || bounds.width <= 0 || bounds.height <= 0) return null
+  return {
+    x: clip.x + Math.min(clip.width - 1, Math.max(0, Math.floor((clientX - bounds.left) * clip.width / bounds.width))),
+    y: clip.y + Math.min(clip.height - 1, Math.max(0, Math.floor((clientY - bounds.top) * clip.height / bounds.height))),
+  }
 }
 
 export const MAX_PORTAL_FRAME_BYTES = 4_000_000
@@ -120,10 +149,10 @@ function readPortalControl(value: unknown): PortalWireControl | null {
   const identity = readPortalIdentity(value)
   const kind = value.kind
   if (!identity || (kind !== 'field_input' && kind !== 'pointer' && kind !== 'key' && kind !== 'request_view' && kind !== 'takeover')) return null
-  const field_ref = value.field_ref === undefined ? undefined : readNonEmptyString(value.field_ref, 128)
-  const focused_field_ref = value.focused_field_ref === undefined ? undefined : readNonEmptyString(value.focused_field_ref, 128)
-  if (value.field_ref !== undefined && !field_ref || value.focused_field_ref !== undefined && !focused_field_ref) return null
-  return { ...identity, kind, ...(field_ref ? { field_ref } : {}), ...(focused_field_ref ? { focused_field_ref } : {}) }
+  const field_ref = value.field_ref == null ? undefined : readNonEmptyString(value.field_ref, 128)
+  const focused_field_ref = value.focused_field_ref == null ? value.focused_field_ref : readNonEmptyString(value.focused_field_ref, 128)
+  if (value.field_ref != null && !field_ref || value.focused_field_ref != null && !focused_field_ref) return null
+  return { ...identity, kind, ...(field_ref ? { field_ref } : {}), ...(focused_field_ref !== undefined ? { focused_field_ref } : {}) }
 }
 
 function readPortalPixel(value: unknown, bytes: Uint8Array): PortalWirePixel | null {
@@ -134,9 +163,15 @@ function readPortalPixel(value: unknown, bytes: Uint8Array): PortalWirePixel | n
   const byte_length = readPositiveInteger(value.byte_length)
   const expires_at = typeof value.expires_at === 'string' ? value.expires_at : ''
   if (!identity || !mime_type || !region_kind || byte_length !== bytes.byteLength || !Number.isFinite(Date.parse(expires_at)) || Date.parse(expires_at) <= Date.now()) return null
-  const focused_field_ref = value.focused_field_ref === undefined ? undefined : readNonEmptyString(value.focused_field_ref, 128)
-  if (value.focused_field_ref !== undefined && !focused_field_ref) return null
-  return { ...identity, mime_type, region_kind, byte_length, expires_at, ...(focused_field_ref ? { focused_field_ref } : {}) }
+  const focused_field_ref = value.focused_field_ref == null ? value.focused_field_ref : readNonEmptyString(value.focused_field_ref, 128)
+  if (value.focused_field_ref != null && !focused_field_ref) return null
+  if (!isRecord(value.clip)) return null
+  const x = readNonNegativeInteger(value.clip.x)
+  const y = readNonNegativeInteger(value.clip.y)
+  const width = readPositiveInteger(value.clip.width, 4096)
+  const height = readPositiveInteger(value.clip.height, 4096)
+  if (x === null || x > 8192 || y === null || y > 8192 || width === null || height === null) return null
+  return { ...identity, mime_type, region_kind, byte_length, expires_at, clip: { x, y, width, height }, ...(focused_field_ref !== undefined ? { focused_field_ref } : {}) }
 }
 
 export type DecodedPortalFrame =
@@ -180,8 +215,18 @@ export function encodePortalControlFrame(
   inputValue?: string,
 ): ArrayBuffer {
   const payload = inputValue ? new TextEncoder().encode(inputValue) : new Uint8Array()
+  const sensitive = isRecord(control.sensitive_payload) ? control.sensitive_payload : null
   const message = {
     ...control,
+    ...(sensitive ? {
+      sensitive_payload: {
+        value_present: false,
+        key: sensitive.key ?? null,
+        x: sensitive.x ?? null,
+        y: sensitive.y ?? null,
+        ...(sensitive.pointer_action !== undefined ? { pointer_action: sensitive.pointer_action } : {}),
+      },
+    } : {}),
     ...(inputValue !== undefined ? {
       sensitive_payload: { value_present: true, key: null, x: null, y: null },
     } : {}),

@@ -1,10 +1,12 @@
 import {
   Activity,
+  BookOpen,
+  Tags,
   Blocks,
-  Code2,
   Database,
   LayoutDashboard,
   PanelsTopLeft,
+  Sparkles,
   Settings2,
   ShieldAlert,
   ShieldCheck,
@@ -35,7 +37,7 @@ export const NAV_GROUPS: NavGroup[] = [
     items: [
       { href: '/dashboard', label: '概览', icon: LayoutDashboard },
       {
-        href: '/inbox',
+        href: '/inbox?tab=pending',
         label: '任务与通知',
         icon: Activity,
         match: ['/inbox', '/tasks', '/notifications'],
@@ -45,8 +47,8 @@ export const NAV_GROUPS: NavGroup[] = [
   {
     label: '构建',
     items: [
+      { href: '/launch', label: '新建工作', icon: Sparkles },
       { href: '/studio', label: '项目', icon: PanelsTopLeft, match: ['/studio', '/canvas'] },
-      { href: '/agent-workbench', label: 'Coding Workbench', icon: Code2 },
       { href: '/plugins', label: '插件中心', icon: Blocks },
       {
         href: '/operations-agents',
@@ -60,6 +62,7 @@ export const NAV_GROUPS: NavGroup[] = [
     label: '运行与数据',
     items: [
       { href: '/records', label: '成果与数据', icon: Database },
+      { href: '/knowledge', label: '知识库', icon: BookOpen },
       {
         href: '/nodes',
         label: '执行资源',
@@ -71,6 +74,8 @@ export const NAV_GROUPS: NavGroup[] = [
   {
     label: '管理',
     items: [
+      { href: '/browser-accounts', label: '工作区账号', icon: ShieldCheck },
+      { href: '/platform-browser-accounts', label: '平台账号登录', icon: ShieldCheck },
       {
         href: '/providers',
         label: '模型与连接',
@@ -78,7 +83,7 @@ export const NAV_GROUPS: NavGroup[] = [
         match: ['/providers'],
       },
       {
-        href: '/control/actions',
+        href: '/control/kill-switch',
         label: '控制与安全',
         icon: ShieldAlert,
         match: ['/control'],
@@ -98,6 +103,7 @@ export const ROUTE_LABELS: Record<string, string> = {
   '/dashboard': '概览',
   '/inbox': '任务与通知',
   '/studio': '项目',
+  '/launch': '新建工作',
   '/studio/workflow': '工作流编排',
   '/canvas': '节点工作流（兼容入口）',
   '/agent-workbench': 'Coding Workbench',
@@ -106,14 +112,17 @@ export const ROUTE_LABELS: Record<string, string> = {
   '/schedules': '自动化与智能体',
   '/tasks': '工作项',
   '/records': '成果与数据',
+  '/knowledge': '知识库',
+  '/brands': '品牌与产品（兼容）',
   '/notifications': '通知',
   '/agents': '智能体',
   '/operations-agents': '自动化与智能体',
   '/system': '系统设置',
   '/skills': '技能',
   '/providers': '模型与连接',
+  '/nodes': '执行资源',
   '/workers': 'Worker',
-  '/browser-accounts': 'Browser accounts',
+  '/browser-accounts': '账号集群',
   '/browsers': 'Chrome 池',
   '/control/actions': '控制与审计',
   '/control/kill-switch': '熔断开关',

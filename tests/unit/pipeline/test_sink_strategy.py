@@ -115,7 +115,8 @@ async def test_run_pipeline_selects_sink_by_strategy(db_session):
 
     with (
         patch(
-            "backend.pipeline.collector.collect", return_value=ChannelResult.ok([{"title": "x"}])
+            "backend.pipeline.collector.collect",
+            return_value=ChannelResult.ok([{"title": "x"}]),
         ),
         patch("backend.pipeline.pipeline.select_sink", return_value=fake) as sel,
     ):
@@ -153,9 +154,10 @@ async def test_run_pipeline_injected_sink_overrides_strategy(db_session):
 
     with (
         patch(
-            "backend.pipeline.collector.collect", return_value=ChannelResult.ok([{"title": "x"}])
+            "backend.pipeline.collector.collect",
+            return_value=ChannelResult.ok([{"title": "x"}]),
         ),
-        patch("backend.pipeline.sinks.strategy.select_sink") as sel,
+        patch("backend.pipeline.pipeline.select_sink") as sel,
     ):
         await run_pipeline(
             task.id, source, enable_ai=False, enable_notifications=False, sink=injected

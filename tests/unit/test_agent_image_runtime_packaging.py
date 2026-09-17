@@ -9,6 +9,17 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 
+@pytest.mark.parametrize("bundle,source", [("1", "script-host-v1.2"), ("2", "script-host-v1.2"), ("3", "script-host"), ("4", "platform-login-bundle4")])
+def test_packaged_script_host_matches_pinned_bundle_version(bundle, source):
+    manifest = json.loads((ROOT / "chrome/runtime-bundles/opencli-default" / bundle / "manifest.json").read_text(encoding="utf-8"))
+    component = next(item for item in manifest["components"] if item["id"] == "opencli-script-host")
+    extension = json.loads((ROOT / "chrome" / source / "manifest.json").read_text(encoding="utf-8"))
+    assert extension["version"] == component["version"]
+    for image in ("agent", "chrome"):
+        dockerfile = (ROOT / image / "Dockerfile").read_text(encoding="utf-8")
+        assert f"COPY chrome/{source}/ /opt/browser-runtime-bundles/opencli-default/{bundle}/extensions/opencli-script-host/" in dockerfile
+
+
 def test_agent_image_packages_runtime_adapter_modules():
     dockerfile = (ROOT / "agent" / "Dockerfile").read_text(encoding="utf-8")
 
@@ -232,6 +243,7 @@ def test_vnc_agent_image_is_the_registered_browser_bridge_runtime():
     assert "https://www.doubao.com/chat" in entrypoint
     assert "AGENT_MODE: ${AGENT_MODE:-bridge}" in compose
     assert "AGENT_REGISTER: ${AGENT_REGISTER:-ws}" in compose
+    assert "CENTRAL_API_URL: ${CENTRAL_API_URL:-http://api:8000}" in compose
     assert "AGENT_ADVERTISE_URL: ${AGENT_ADVERTISE_URL:-http://agent-1:19823}" in compose
     assert "agent_profile_1:${CHROME_PROFILE_DIR:-/home/chrome/.config/chromium}" in compose
     assert "agent_profile:${AGENT_PROFILE_DIR:-/home/agent/.config/chromium}" in compose

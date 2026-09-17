@@ -1,5 +1,6 @@
 import sys
 
+
 def main():
     sys.stdout.reconfigure(encoding='utf-8', newline='\n')
 
@@ -7,10 +8,16 @@ def main():
     (function() {
       try {
         if (window.location.pathname.includes('/sorry/')) {
-          return JSON.stringify({error: true, message: 'Google blocked the request — captcha required. Solve captcha and retry.'});
+          return JSON.stringify({
+            error: true,
+            message: 'Google blocked the request — captcha required. Solve captcha and retry.'
+          });
         }
         if (!document.querySelector('#search, #rso, #result-stats')) {
-          return JSON.stringify({error: true, message: 'No search results found on page. Check if the page loaded correctly.'});
+          return JSON.stringify({
+            error: true,
+            message: 'No search results found on page. Check if the page loaded correctly.'
+          });
         }
 
         var urlParams = new URLSearchParams(window.location.search);
@@ -27,9 +34,10 @@ def main():
           languageCode: urlParams.get('hl') || null
         };
 
-        var statsText = document.querySelector('#result-stats') ? document.querySelector('#result-stats').textContent.trim() : null;
+        var statsText = document.querySelector('#result-stats')
+          ? document.querySelector('#result-stats').textContent.trim()
+          : null;
         var totalMatch = statsText ? statsText.match(/[\d,]+/) : null;
-        var resultsTotal = totalMatch ? totalMatch[0].replace(/,/g, '') : null;
 
         var organicResults = Array.from(document.querySelectorAll('.tF2Cxc')).map(function(el, i) {
           var desc = el.querySelector('.VwiC3b');
@@ -43,9 +51,15 @@ def main():
           return {
             position: i + 1,
             type: 'organic',
-            title: el.querySelector('h3') ? el.querySelector('h3').textContent.trim() : null,
-            url: el.querySelector('a[href]') ? el.querySelector('a[href]').href : null,
-            displayedUrl: el.querySelector('cite') ? el.querySelector('cite').textContent.trim() : null,
+            title: el.querySelector('h3')
+              ? el.querySelector('h3').textContent.trim()
+              : null,
+            url: el.querySelector('a[href]')
+              ? el.querySelector('a[href]').href
+              : null,
+            displayedUrl: el.querySelector('cite')
+              ? el.querySelector('cite').textContent.trim()
+              : null,
             description: desc ? desc.textContent.trim() : null,
             emphasizedKeywords: emphasized,
             siteLinks: Array.from(el.querySelectorAll('.HiHjCd a, .fl a')).map(function(a) {
@@ -54,7 +68,9 @@ def main():
           };
         });
 
-        var paidResults = Array.from(document.querySelectorAll('#tads .uEierd')).map(function(el, i) {
+        var paidResults = Array.from(
+          document.querySelectorAll('#tads .uEierd')
+        ).map(function(el, i) {
           var urlEl = el.querySelector('a[data-rw]') || el.querySelector('a.sVXRqc');
           var titleEl = el.querySelector('.CCgQ5') || el.querySelector('.Va3FIb');
           var descEl = el.querySelector('.MUxGbd .yDYNvb') || el.querySelector('.yDYNvb');
@@ -63,7 +79,9 @@ def main():
             type: 'paid',
             title: titleEl ? titleEl.textContent.trim() : null,
             url: urlEl ? urlEl.href : null,
-            displayedUrl: el.querySelector('.x2VHCd') ? el.querySelector('.x2VHCd').textContent.trim() : null,
+            displayedUrl: el.querySelector('.x2VHCd')
+              ? el.querySelector('.x2VHCd').textContent.trim()
+              : null,
             description: descEl ? descEl.textContent.trim() : null,
             siteLinks: Array.from(el.querySelectorAll('.fl a')).map(function(a) {
               return {title: a.textContent.trim(), url: a.href};
@@ -82,15 +100,21 @@ def main():
 
         // AI Overview: only extract when heading is present and content is not an error state
         var aiOverview = null;
-        var aiHeadingPresent = Array.from(document.querySelectorAll('[role=heading], .Fzsovc')).some(function(el) {
+        var aiHeadingPresent = Array.from(
+          document.querySelectorAll('[role=heading], .Fzsovc')
+        ).some(function(el) {
           return el.textContent.trim() === 'AI Overview';
         });
         if (aiHeadingPresent) {
-          var notAvailable = Array.from(document.querySelectorAll('span')).some(function(el) {
+          var notAvailable = Array.from(
+            document.querySelectorAll('span')
+          ).some(function(el) {
             return el.textContent.trim().includes('AI Overview is not available');
           });
           if (!notAvailable) {
-            var aiTexts = Array.from(document.querySelectorAll('.rIRoqf.hXY9cf')).map(function(el) {
+            var aiTexts = Array.from(
+              document.querySelectorAll('.rIRoqf.hXY9cf')
+            ).map(function(el) {
               return el.textContent.trim();
             }).filter(function(t) { return t.length > 30; });
             if (aiTexts.length > 0) aiOverview = aiTexts.join(' ');

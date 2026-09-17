@@ -144,7 +144,7 @@ function SystemConfigOverview({ config }: { config: SystemConfig }) {
               value={config.public_url || '未配置'}
               badge={configuredBadge(Boolean(config.public_url))}
             />
-            <Button variant="ghost" render={<Link href="/nodes" />}>
+            <Button variant="ghost" nativeButton={false} render={<Link href="/nodes" />}>
               查看节点
             </Button>
           </CardContent>

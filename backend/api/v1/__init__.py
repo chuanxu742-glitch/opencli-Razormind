@@ -4,35 +4,44 @@ from fastapi import APIRouter
 
 from backend.api.v1 import (
     agent_conversations,
+    agent_data,
     agents,
+    analysis_findings,
+    analysis_snapshots,
     automations,
+    brand_knowledge,
+    browser_accounts,
+    platform_browser_accounts,
     browser_act,
     browser_containers,
     browser_accounts,
+    platform_browser_accounts,
     browser_spaces,
     browsers,
     chat,
     consumer_grants,
     control,
+    controlled_receiver_routes,
     cookies,
     dashboard,
     delivery_authorization_routes,
     delivery_connections,
-    controlled_receiver_routes,
     delivery_execution_routes,
     dify_imports,
     geo_acquisition,
+    geo_observations,
     iii_collections,
     identity,
-    odp_reconciliation,
-    research_graph_v2_routes,
+    iii_collections,
     image_studio,
     internal_agent_runs,
     internal_automations,
     internal_collaboration,
+    knowledge_libraries,
     model_defaults,
     nodes,
     notifications,
+    odp_reconciliation,
     operations_agents,
     operations_inbox,
     plan_ir,
@@ -42,12 +51,13 @@ from backend.api.v1 import (
     project_source_bindings,
     providers,
     records,
+    research,
+    research_graph_v2_routes,
     schedules,
     skill_bridge,
     skill_record,
     skills,
     sources,
-    studio,
     system,
     tasks,
     webhooks,
@@ -57,61 +67,79 @@ from backend.api.v1 import (
     workspace_sources,
     workspaces,
 )
+from backend.api.v1.studio import create_studio_router
+from backend.workflow.workflow_plugins import WorkflowPluginRegistry
 
-v1_router = APIRouter(prefix="/api/v1")
 
-v1_router.include_router(agents.router)
-v1_router.include_router(agent_conversations.router)
-v1_router.include_router(geo_acquisition.router)
-v1_router.include_router(iii_collections.router)
-v1_router.include_router(automations.router)
-v1_router.include_router(odp_reconciliation.router)
-v1_router.include_router(image_studio.router)
-v1_router.include_router(browser_act.router)
-v1_router.include_router(browser_containers.router)
-v1_router.include_router(browser_accounts.router)
-v1_router.include_router(browsers.router)
-v1_router.include_router(browsers.runtime_router)
-v1_router.include_router(chat.router)
-v1_router.include_router(control.router)
-v1_router.include_router(browser_spaces.router)
-v1_router.include_router(consumer_grants.router)
-v1_router.include_router(cookies.router)
-v1_router.include_router(model_defaults.router)
-v1_router.include_router(nodes.router)
-v1_router.include_router(plan_ir.router)
-v1_router.include_router(plans.router)
-v1_router.include_router(plugins.router)
-v1_router.include_router(plugins.workspace_router)
-v1_router.include_router(presets.router)
-v1_router.include_router(providers.router)
-v1_router.include_router(sources.router)
-v1_router.include_router(studio.router)
-v1_router.include_router(tasks.router)
-v1_router.include_router(records.router)
-v1_router.include_router(schedules.router)
-v1_router.include_router(skills.router)
-v1_router.include_router(skill_bridge.router)
-v1_router.include_router(skill_record.router)
-v1_router.include_router(webhooks.router)
-v1_router.include_router(workflows.router)
-v1_router.include_router(dify_imports.router)
-v1_router.include_router(notifications.router)
-v1_router.include_router(operations_inbox.router)
-v1_router.include_router(operations_agents.router)
-v1_router.include_router(workbench.router)
-v1_router.include_router(workers.router)
-v1_router.include_router(dashboard.router)
-v1_router.include_router(delivery_connections.router)
-v1_router.include_router(system.router)
-v1_router.include_router(identity.router)
-v1_router.include_router(workspaces.router)
-v1_router.include_router(workspace_sources.router)
-v1_router.include_router(project_source_bindings.router)
-v1_router.include_router(delivery_authorization_routes.router)
-v1_router.include_router(delivery_execution_routes.router)
-v1_router.include_router(controlled_receiver_routes.router)
-v1_router.include_router(research_graph_v2_routes.router)
-v1_router.include_router(internal_agent_runs.router)
-v1_router.include_router(internal_automations.router)
-v1_router.include_router(internal_collaboration.router)
+def create_v1_router(workflow_plugins: WorkflowPluginRegistry) -> APIRouter:
+    """Assemble core routes and explicitly injected workflow-plugin routes."""
+
+    v1_router = APIRouter(prefix="/api/v1")
+    v1_router.include_router(brand_knowledge.router)
+    v1_router.include_router(knowledge_libraries.router)
+    v1_router.include_router(knowledge_libraries.bindings_router)
+    studio_router = create_studio_router()
+
+    v1_router.include_router(agents.router)
+    v1_router.include_router(agent_conversations.router)
+    v1_router.include_router(agent_data.router)
+    v1_router.include_router(analysis_findings.router)
+    v1_router.include_router(analysis_snapshots.router)
+    v1_router.include_router(geo_observations.router)
+    v1_router.include_router(platform_browser_accounts.router)
+    v1_router.include_router(geo_acquisition.router)
+    v1_router.include_router(iii_collections.router)
+    v1_router.include_router(automations.router)
+    v1_router.include_router(odp_reconciliation.router)
+    v1_router.include_router(image_studio.router)
+    v1_router.include_router(browser_accounts.router)
+    v1_router.include_router(browser_act.router)
+    v1_router.include_router(browser_containers.router)
+    v1_router.include_router(browsers.router)
+    v1_router.include_router(browsers.runtime_router)
+    v1_router.include_router(chat.router)
+    v1_router.include_router(control.router)
+    v1_router.include_router(browser_spaces.router)
+    v1_router.include_router(consumer_grants.router)
+    v1_router.include_router(cookies.router)
+    v1_router.include_router(model_defaults.router)
+    v1_router.include_router(nodes.router)
+    v1_router.include_router(plan_ir.router)
+    v1_router.include_router(plans.router)
+    v1_router.include_router(plugins.router)
+    v1_router.include_router(plugins.workspace_router)
+    v1_router.include_router(presets.router)
+    v1_router.include_router(providers.router)
+    v1_router.include_router(sources.router)
+    v1_router.include_router(tasks.router)
+    v1_router.include_router(records.router)
+    v1_router.include_router(research.router)
+    v1_router.include_router(schedules.router)
+    v1_router.include_router(skills.router)
+    v1_router.include_router(skill_bridge.router)
+    v1_router.include_router(skill_record.router)
+    v1_router.include_router(webhooks.router)
+    v1_router.include_router(workflows.router)
+    v1_router.include_router(dify_imports.router)
+    v1_router.include_router(notifications.router)
+    v1_router.include_router(operations_inbox.router)
+    v1_router.include_router(operations_agents.router)
+    v1_router.include_router(workbench.router)
+    v1_router.include_router(workers.router)
+    v1_router.include_router(dashboard.router)
+    v1_router.include_router(delivery_connections.router)
+    v1_router.include_router(system.router)
+    v1_router.include_router(identity.router)
+    v1_router.include_router(workspaces.router)
+    v1_router.include_router(workspace_sources.router)
+    v1_router.include_router(project_source_bindings.router)
+    v1_router.include_router(delivery_authorization_routes.router)
+    v1_router.include_router(delivery_execution_routes.router)
+    v1_router.include_router(controlled_receiver_routes.router)
+    v1_router.include_router(research_graph_v2_routes.router)
+    v1_router.include_router(internal_agent_runs.router)
+    v1_router.include_router(internal_automations.router)
+    v1_router.include_router(internal_collaboration.router)
+    workflow_plugins.register_routes(v1_router, studio_router)
+    v1_router.include_router(studio_router)
+    return v1_router

@@ -1,0 +1,27 @@
+{
+  "id": "official-coupang",
+  "version": "0.1.0",
+  "platform": "coupang",
+  "allowed_origins": [
+    "https://login.coupang.com"
+  ],
+  "allowed_redirect_origins": [
+    "https://login.coupang.com"
+  ],
+  "login_url": "/login/login.pang",
+  "modes": [
+    "form"
+  ],
+  "qr_supported": false,
+  "interaction_supported": true,
+  "identity_probe_supported": false,
+  "authentication_verified": false,
+  "selectors": [
+    {
+      "id": "form",
+      "selector": "body",
+      "kind": "form",
+      "frame": "main"
+    }
+  ]
+}

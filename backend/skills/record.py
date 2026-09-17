@@ -50,7 +50,11 @@ from typing import Any
 
 from backend.skills.loop import StepRecord
 from backend.skills.page import SkillPage
-from backend.skills.perception import clear_session_sensitive, is_session_sensitive, set_session_sensitive
+from backend.skills.perception import (
+    clear_session_sensitive,
+    is_session_sensitive,
+    set_session_sensitive,
+)
 from backend.skills.trace import assemble_trace, outcome_from_loop
 
 logger = logging.getLogger(__name__)
@@ -227,7 +231,9 @@ class RecordSession:
     _pending_events_drained: bool = field(default=True, init=False, repr=False)
     _capture_generation: int = field(default=0, init=False, repr=False)
     _document_generation: int = field(default=0, init=False, repr=False)
-    _frame_document_generations: dict[Any, int] = field(default_factory=dict, init=False, repr=False)
+    _frame_document_generations: dict[Any, int] = field(
+        default_factory=dict, init=False, repr=False
+    )
     _main_frame: Any = field(default=None, init=False, repr=False)
     _frame_update_tasks: set[asyncio.Task[Any]] = field(default_factory=set, init=False, repr=False)
     stopped: bool = False
@@ -235,6 +241,7 @@ class RecordSession:
     _navigation_handler_installed: bool = field(default=False, init=False, repr=False)
     _close_handler_installed: bool = field(default=False, init=False, repr=False)
     _trace: dict[str, Any] | None = field(default=None, init=False, repr=False)
+
     def _raw_page(self) -> Any:
         return getattr(self.page, "page", self.page)
 
@@ -379,6 +386,22 @@ class RecordSession:
 
     async def start(self) -> None:
         """Wire the capture binding and listener onto every live frame."""
+        if self.capability == "account-login":
+            # Login records are transport guards, never general event recorders.
+            # Start blocked before touching any live document, including if the
+            # initial browser page already contains credentials or a QR code.
+            self._lock_sensitive_state()
+            raw_page = self._raw_page()
+            self._main_frame = getattr(raw_page, "main_frame", None)
+            raw_page.on("close", self._on_page_close)
+            self._close_handler_installed = True
+            raw_page.on("framenavigated", self._on_navigate)
+            self._navigation_handler_installed = True
+            await self._add_guarded_init_script()
+            await self._evaluate_capture({"sessionId": self.session_id, "sensitive": True})
+            await self._set_page_capture_state(True)
+            await self._drain_events()
+            return
         set_session_sensitive(self.session_id, False)
         raw_page = self._raw_page()
         raw_page.on("close", self._on_page_close)
@@ -409,6 +432,13 @@ class RecordSession:
         frames = self._frames()
         if frame_id is None:
             return self._main_frame or frames[0]
+        if (frame_id == 0 or frame_id == "0") and getattr(
+            self, "_portal_verified_page", None
+        ) is self._raw_page():
+            main = getattr(self._raw_page(), "main_frame", None)
+            if main is None or sum(frame is main for frame in frames) != 1:
+                raise ValueError("record main frame is missing or ambiguous")
+            return main
         for frame in frames:
             for attr in ("frame_id", "id", "name"):
                 candidate = getattr(frame, attr, None)
@@ -416,7 +446,7 @@ class RecordSession:
                     candidate = candidate()
                 if candidate == frame_id:
                     return frame
-        return self._main_frame or frames[0]
+        raise ValueError("record frame target is missing")
 
     def binding_identity(self, frame_id: Any | None = None) -> tuple[Any, Any, int, Any]:
         """Return page/frame/document-generation identity without payload fields."""
@@ -455,9 +485,7 @@ class RecordSession:
         # identity but are not user actions in the v1 trace.
         raw_page = self._raw_page()
         main_frame = getattr(raw_page, "main_frame", None)
-        self._frame_document_generations[frame] = (
-            self._frame_document_generations.get(frame, 0) + 1
-        )
+        self._frame_document_generations[frame] = self._frame_document_generations.get(frame, 0) + 1
         if frame is main_frame:
             self._document_generation = self._frame_document_generations[frame]
         self._schedule_frame_update(frame)
@@ -528,6 +556,7 @@ class RecordSession:
             set_session_sensitive(self.session_id, False)
         await self._drain_events()
         return True
+
     async def stop(self, *, status: str = "success", note: str | None = None) -> dict[str, Any]:
         """Revoke capture, drain callbacks, and assemble the recorded trace."""
         if self._trace is not None:
@@ -567,15 +596,28 @@ class RecordSession:
         return self._trace
 
 
-async def start_recording(cdp_endpoint: str, *, domain: str, capability: str) -> RecordSession:
+async def start_recording(
+    cdp_endpoint: str,
+    *,
+    domain: str,
+    capability: str,
+    target_id: str | None = None,
+) -> RecordSession:
     """Attach to ``cdp_endpoint`` (same acquisition path as the execute leg —
     the caller resolves it via ``browser_pool.get_pool().acquire()``) and start
     a new :class:`RecordSession`."""
     from backend.skills.page import open_skill_page
 
-    page = await open_skill_page(cdp_endpoint)
+    page = (
+        await open_skill_page(cdp_endpoint, target_id=target_id)
+        if target_id is not None
+        else await open_skill_page(cdp_endpoint)
+    )
     session = RecordSession(
-        session_id=uuid.uuid4().hex, domain=domain, capability=capability, page=page,
+        session_id=uuid.uuid4().hex,
+        domain=domain,
+        capability=capability,
+        page=page,
     )
     try:
         await session.start()
@@ -587,6 +629,8 @@ async def start_recording(cdp_endpoint: str, *, domain: str, capability: str) ->
         raise
     logger.info(
         "record session started | id=%s domain=%s capability=%s",
-        session.session_id, domain, capability,
+        session.session_id,
+        domain,
+        capability,
     )
     return session

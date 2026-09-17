@@ -32,6 +32,7 @@ def run_resolver(
     return subprocess.run(
         command,
         env=env,
+        encoding="utf-8",
         capture_output=True,
         text=True,
         timeout=30,
@@ -137,6 +138,12 @@ def run_entrypoint(
                 "PasswordManagerEnabled": False,
                 "AutofillAddressEnabled": False,
                 "AutofillCreditCardEnabled": False,
+                "DeveloperToolsAvailability": 0,
+                "RemoteDebuggingAllowed": True,
+                "AllowFileSelectionDialogs": False,
+                "DefaultFileSystemReadGuardSetting": 2,
+                "DefaultFileSystemWriteGuardSetting": 2,
+                "URLBlocklist": ["file:///*", "file://*", "view-source:*"],
             }
         )
     )
@@ -241,6 +248,7 @@ sleep() { if [ "$1" = 2 ]; then exit 0; fi; }
         cwd=ROOT,
         env=env,
         text=True,
+        encoding="utf-8",
         capture_output=True,
         timeout=30,
         check=False,

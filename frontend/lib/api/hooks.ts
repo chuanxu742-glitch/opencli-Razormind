@@ -34,10 +34,23 @@ export function useMyWorkspaces() {
   return useQuery({ queryKey: ["workspaces"], queryFn: api.listMyWorkspaces });
 }
 
-export function useAgentConversations(workspaceId: string | null, enabled = true) {
+export function useAgentConversations(
+  workspaceId: string | null,
+  options: {
+    enabled?: boolean
+    projectId?: string | null
+    workflowId?: string | null
+    runId?: string | null
+  } = {},
+) {
+  const { enabled = true, projectId, workflowId, runId } = options
   return useQuery({
-    queryKey: ['agent-conversations', workspaceId],
-    queryFn: () => api.listAgentConversations(workspaceId as string),
+    queryKey: ['agent-conversations', workspaceId, projectId, workflowId, runId],
+    queryFn: () => api.listAgentConversations(workspaceId as string, 20, {
+      project_id: projectId,
+      workflow_id: workflowId,
+      run_id: runId,
+    }),
     enabled: enabled && !!workspaceId,
   })
 }
@@ -90,11 +103,12 @@ export function useWorkspaceProjects(workspaceId: string | null) {
   });
 }
 
-export function useGovernedWorkspaces() {
+export function useGovernedWorkspaces(options?: { enabled?: boolean }) {
   return useQuery({
     queryKey: ["governance-workspaces"],
     queryFn: api.listGovernedWorkspaces,
-  });
+    enabled: options?.enabled ?? true,
+  })
 }
 
 export function useGovernedWorkspaceProjects(workspaceId: string | null) {
@@ -279,6 +293,207 @@ export function useProjectRuntimeTrace(
   });
 }
 
+export function useRunAnalysisSnapshotCapability(
+  workspaceId: string | null,
+  projectId: string | null,
+  workflowId: string | null,
+  runId: string | null,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: [
+      "run-analysis-snapshot-capability",
+      workspaceId,
+      projectId,
+      workflowId,
+      runId,
+    ],
+    queryFn: () =>
+      api.getRunAnalysisSnapshotCapability(
+        workspaceId as string,
+        projectId as string,
+        workflowId as string,
+        runId as string,
+      ),
+    enabled:
+      enabled && !!workspaceId && !!projectId && !!workflowId && !!runId,
+    staleTime: 15_000,
+  });
+}
+
+export function usePreviewRunAnalysisSnapshot() {
+  return useMutation({
+    mutationFn: ({
+      workspaceId,
+      projectId,
+      workflowId,
+      runId,
+      data,
+    }: {
+      workspaceId: string;
+      projectId: string;
+      workflowId: string;
+      runId: string;
+      data: Parameters<typeof api.previewRunAnalysisSnapshot>[4];
+    }) =>
+      api.previewRunAnalysisSnapshot(
+        workspaceId,
+        projectId,
+        workflowId,
+        runId,
+        data,
+      ),
+  });
+}
+
+export function useCreateRunAnalysisSnapshot() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      workspaceId,
+      projectId,
+      workflowId,
+      runId,
+      data,
+    }: {
+      workspaceId: string;
+      projectId: string;
+      workflowId: string;
+      runId: string;
+      data: Parameters<typeof api.createRunAnalysisSnapshot>[4];
+    }) =>
+      api.createRunAnalysisSnapshot(
+        workspaceId,
+        projectId,
+        workflowId,
+        runId,
+        data,
+      ),
+    onSuccess: (receipt, { workspaceId, projectId, workflowId, runId }) => {
+      queryClient.setQueryData(
+        [
+          "run-analysis-snapshot-receipt",
+          workspaceId,
+          projectId,
+          workflowId,
+          runId,
+          receipt.snapshotId,
+        ],
+        receipt,
+      );
+      void queryClient.invalidateQueries({
+        queryKey: [
+          "run-analysis-snapshot-receipts",
+          workspaceId,
+          projectId,
+          workflowId,
+          runId,
+        ],
+      });
+    },
+    onError: (_error, { workspaceId, projectId, workflowId, runId }) =>
+      queryClient.invalidateQueries({
+        queryKey: [
+          "run-analysis-snapshot-receipts",
+          workspaceId,
+          projectId,
+          workflowId,
+          runId,
+        ],
+      }),
+  });
+}
+
+export function useRunAnalysisSnapshotReceipts(
+  workspaceId: string | null,
+  projectId: string | null,
+  workflowId: string | null,
+  runId: string | null,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: [
+      "run-analysis-snapshot-receipts",
+      workspaceId,
+      projectId,
+      workflowId,
+      runId,
+    ],
+    queryFn: () =>
+      api.listRunAnalysisSnapshots(
+        workspaceId as string,
+        projectId as string,
+        workflowId as string,
+        runId as string,
+      ),
+    enabled:
+      enabled && !!workspaceId && !!projectId && !!workflowId && !!runId,
+  });
+}
+
+export function useRunAnalysisSnapshotReceipt(
+  workspaceId: string | null,
+  projectId: string | null,
+  workflowId: string | null,
+  runId: string | null,
+  snapshotId: string | null,
+) {
+  return useQuery({
+    queryKey: [
+      "run-analysis-snapshot-receipt",
+      workspaceId,
+      projectId,
+      workflowId,
+      runId,
+      snapshotId,
+    ],
+    queryFn: () =>
+      api.getRunAnalysisSnapshot(
+        workspaceId as string,
+        projectId as string,
+        workflowId as string,
+        runId as string,
+        snapshotId as string,
+      ),
+    enabled:
+      !!workspaceId &&
+      !!projectId &&
+      !!workflowId &&
+      !!runId &&
+      !!snapshotId,
+    refetchInterval: (query) =>
+      query.state.data?.status === "exporting" ? 1_000 : false,
+  });
+}
+
+export function useRunAnalysisSnapshotSummary(
+  workspaceId: string | null,
+  projectId: string | null,
+  workflowId: string | null,
+  runId: string | null,
+  snapshotId: string | null,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: ["run-analysis-snapshot-summary", workspaceId, projectId, workflowId, runId, snapshotId],
+    queryFn: () =>
+      api.getRunAnalysisSnapshotSummary(
+        workspaceId as string,
+        projectId as string,
+        workflowId as string,
+        runId as string,
+        snapshotId as string,
+      ),
+    enabled:
+      enabled &&
+      !!workspaceId &&
+      !!projectId &&
+      !!workflowId &&
+      !!runId &&
+      !!snapshotId,
+  });
+}
+
 export function useProjectRecordGraph(
   workspaceId: string | null,
   projectId: string | null,
@@ -340,12 +555,12 @@ export function useCreateProjectWorkflow() {
 export function useOperationsInbox(
   workspaceId: string | null,
   status?: string,
+  options?: { enabled?: boolean },
 ) {
   return useQuery({
-    queryKey: ["operations-inbox", workspaceId, status],
-    queryFn: () =>
-      api.listOperationsInbox(workspaceId as string, { status, limit: 100 }),
-    enabled: !!workspaceId,
+    queryKey: ['operations-inbox', workspaceId, status],
+    queryFn: () => api.listOperationsInbox(workspaceId as string, { status, limit: 100 }),
+    enabled: Boolean(workspaceId) && (options?.enabled ?? true),
     refetchInterval: 15_000,
   });
 }
@@ -738,11 +953,10 @@ export function useRecoverTask(taskId: string) {
   });
 }
 
-export function useInfiniteTasks(params?: {
-  source_id?: string;
-  status?: string;
-  limit?: number;
-}) {
+export function useInfiniteTasks(
+  params?: { source_id?: string; status?: string; limit?: number },
+  options?: { enabled?: boolean },
+) {
   return useInfiniteQuery({
     queryKey: ["tasks", "infinite", params],
     initialPageParam: 1,
@@ -755,6 +969,10 @@ export function useInfiniteTasks(params?: {
 }
 
 export function useRecords(params?: {
+  workspace_id?: string;
+  brand_id?: string;
+  product_id?: string;
+  unclassified?: boolean;
   source_id?: string;
   project_id?: string;
   status?: string;
@@ -769,10 +987,13 @@ export function useRecords(params?: {
     | "workflow_id"
     | "workflow_run_id";
   sort_order?: "asc" | "desc";
+  enabled?: boolean;
 }) {
+  const { enabled = true, ...requestParams } = params ?? {}
   return useQuery({
-    queryKey: ["records", params],
-    queryFn: () => api.listRecords(params),
+    queryKey: ["records", requestParams],
+    queryFn: () => api.listRecords(requestParams),
+    enabled,
   });
 }
 
@@ -1390,6 +1611,7 @@ export function useNotificationLogs(
 
 export function useInfiniteNotificationLogs(
   params?: { rule_id?: string; limit?: number },
+  options?: { enabled?: boolean },
 ) {
   return useInfiniteQuery({
     queryKey: ['notification-logs', 'infinite', params],
@@ -1399,6 +1621,7 @@ export function useInfiniteNotificationLogs(
       const meta = lastPage.meta
       return meta && meta.page < meta.pages ? meta.page + 1 : undefined
     },
+    enabled: options?.enabled ?? true,
   })
 }
 
@@ -1769,12 +1992,15 @@ export function useControlActions(params?: {
   });
 }
 
-export function useInfiniteControlActions(params?: {
-  source_id?: string;
-  mode?: string;
-  outcome?: string;
-  limit?: number;
-}) {
+export function useInfiniteControlActions(
+  params?: {
+    source_id?: string
+    mode?: string
+    outcome?: string
+    limit?: number
+  },
+  options?: { enabled?: boolean },
+) {
   return useInfiniteQuery({
     queryKey: ["control-actions", "infinite", params],
     initialPageParam: 1,
@@ -1784,7 +2010,8 @@ export function useInfiniteControlActions(params?: {
       const meta = lastPage.meta;
       return meta && meta.page < meta.pages ? meta.page + 1 : undefined;
     },
-  });
+    enabled: options?.enabled ?? true,
+  })
 }
 
 // ── Control plane (issue 03 / PR-Control-3.5 / C2) ──────────────────────────────

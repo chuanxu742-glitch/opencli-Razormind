@@ -22,7 +22,7 @@ export type BrowserAccountStatus =
 
 export type BrowserAuthEvidence = 'unknown' | 'valid' | 'invalid'
 export type BrowserEvidenceSource = 'rule_verified' | 'manual_fallback'
-export type BrowserLoginPurpose = 'login' | 'execution'
+export type BrowserLoginPurpose = 'login' | 'execution' | 'browser'
 
 export interface BrowserExternalIdentity {
   provider: string
@@ -75,6 +75,33 @@ export interface BrowserAccountCreateRequest {
   runtime_bundle_id?: string
   login_rule_id?: string
   login_rule_version?: string
+}
+
+export interface BrowserLoginOption {
+  id: string
+  label: string
+  site: string
+  login_url: string | null
+  rule_id: string | null
+  rule_version: string | null
+  allowed_origins: string[]
+  auth_type: string
+  category: string
+  browser_login_supported: boolean
+  interaction_supported: boolean
+  identity_probe_supported: boolean
+  requires_configuration: boolean
+  note?: string
+  qr_supported: boolean
+  available: boolean
+  reason_code: string
+  message: string
+}
+
+export interface BrowserLoginReadiness {
+  ready: boolean
+  code: string
+  message: string
 }
 
 export interface BrowserLoginSessionCreateRequest {
@@ -148,6 +175,18 @@ const sessionPath = (workspaceId: string, accountId: string, sessionId?: string)
   return sessionId ? `${base}/${encodeURIComponent(sessionId)}` : base
 }
 
+export const listBrowserLoginOptions = (workspaceId: string) =>
+  apiClient.get<ApiResponse<{ items: BrowserLoginOption[] }>>(`${accountPath(workspaceId)}/login-options`)
+    .then((response) => response.data.data.items)
+
+export const getBrowserLoginReadiness = (workspaceId: string, accountId: string) =>
+  apiClient.get<ApiResponse<BrowserLoginReadiness>>(`${accountPath(workspaceId, accountId)}/login-readiness`)
+    .then((response) => response.data.data)
+
+export const listBrowserLoginSessions = (workspaceId: string, accountId: string) =>
+  apiClient.get<ApiResponse<BrowserLoginSession[]>>(sessionPath(workspaceId, accountId), { params: { limit: 50 } })
+    .then((response) => response.data.data)
+
 const idempotencyHeaders = (key?: string) =>
   key ? { [IDEMPOTENCY_HEADER]: key } : undefined
 
@@ -178,6 +217,19 @@ export const createBrowserAccount = (
 export const getBrowserAccount = (workspaceId: string, accountId: string) =>
   apiClient
     .get<ApiResponse<BrowserAccount>>(accountPath(workspaceId, accountId))
+    .then((response) => response.data.data)
+
+export const renameBrowserAccount = (
+  workspaceId: string,
+  accountId: string,
+  label: string,
+  expectedRevision: number,
+) =>
+  apiClient
+    .patch<ApiResponse<BrowserAccount>>(accountPath(workspaceId, accountId), {
+      label,
+      expected_revision: expectedRevision,
+    }, { headers: { [REVISION_HEADER]: String(expectedRevision) } })
     .then((response) => response.data.data)
 
 export const createBrowserLoginSession = (
@@ -343,6 +395,26 @@ export const redeemBrowserPortalTicket = (
       },
     )
     .then((response) => response.data.data)
+
+export interface BrowserNativeWindowSupport {
+  available: boolean
+  message: string
+}
+
+export const getBrowserNativeWindowSupport = (workspaceId: string) =>
+  apiClient
+    .get<ApiResponse<BrowserNativeWindowSupport>>(`${accountPath(workspaceId)}/native-window-support`)
+    .then((response) => response.data.data)
+
+export const openBrowserNativeWindow = (workspaceId: string, accountId: string, sessionId: string) =>
+  apiClient
+    .post<ApiResponse<{ status: 'opened' | 'already_open'; session_id: string; message: string }>>(
+      `${sessionPath(workspaceId, accountId, sessionId)}/native-window`,
+      {},
+      { withCredentials: true, timeout: 30_000 },
+    )
+    .then((response) => response.data.data)
+
 export interface BrowserWorkspaceMember {
   user_id: string
   subject: string

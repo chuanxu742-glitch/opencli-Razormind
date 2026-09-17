@@ -12,7 +12,8 @@ pipeline, so downstream evidence and research operators use the same trace.
   "channel_config": {
     "question": "麻将机内容为什么会被 AI 反复引用？请列出实际引用的完整来源 URL。",
     "extract_citations": true,
-    "site_session": "ephemeral"
+    "site_session": "ephemeral",
+    "observation_capture": {"version": "1", "mode": "append_per_run"}
   },
   "tags": ["research", "doubao"]
 }
@@ -26,6 +27,16 @@ is recorded as zero; it is not presented as evidence.
 `ephemeral` is the default because it isolates a collection run from an
 interactive browser session; use `persistent` only when its logged-in session
 has been verified for background collection.
+
+`observation_capture` is optional and only supported by `doubao_research`.
+When enabled, every completed TaskRun persists one append-only answer snapshot
+per distinct answer hash in `geo_answer_observations`, including an answer that
+the normal `collected_records` projection skips as already known. Each snapshot
+has its collector-owned `observed_at`, `source_id`, `task_id`, and `task_run_id`.
+Read it through `GET /api/v1/geo-observations?source_id=<id>` (optional
+`task_id`, `task_run_id`, `page`, `limit`). The normal record de-duplication
+contract remains unchanged for all other sources and for this source's normal
+record projection.
 
 For one public Douyin video, use `channel_type: "douyin_detail"`. It takes a
 canonical video URL (or a numeric `aweme_id`) and records the description,

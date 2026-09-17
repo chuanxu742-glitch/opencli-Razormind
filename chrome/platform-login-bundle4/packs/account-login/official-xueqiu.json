@@ -1,0 +1,27 @@
+{
+  "id": "official-xueqiu",
+  "version": "0.1.0",
+  "platform": "xueqiu",
+  "allowed_origins": [
+    "https://xueqiu.com"
+  ],
+  "allowed_redirect_origins": [
+    "https://xueqiu.com"
+  ],
+  "login_url": "/",
+  "modes": [
+    "form"
+  ],
+  "qr_supported": false,
+  "interaction_supported": true,
+  "identity_probe_supported": false,
+  "authentication_verified": false,
+  "selectors": [
+    {
+      "id": "form",
+      "selector": "body",
+      "kind": "form",
+      "frame": "main"
+    }
+  ]
+}

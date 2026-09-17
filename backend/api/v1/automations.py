@@ -19,45 +19,17 @@ from backend.security.workspace_rbac import (
     get_workspace_access,
     require_permission,
 )
+from backend.services.automation_schedule_service import (
+    AutomationBindingError,
+    create_bound_automation_run,
+    validate_automation_binding,
+)
 from backend.services.automation_starter_service import (
     install_starters,
     preview_starter_installation,
 )
 
 router = APIRouter(prefix="/workspaces/{workspace_id}/automations", tags=["automations"])
-
-@router.get(
-    "/starters/preview",
-    response_model=ApiResponse[StarterInstallationPreview],
-)
-async def preview_automation_starters(
-    workspace_id: str,
-    identity: RequestIdentity = Depends(get_request_identity),
-    db: AsyncSession = Depends(get_db),
-) -> ApiResponse:
-    access = await get_workspace_access(db, workspace_id, identity)
-    require_permission(access, WorkspacePermission.READ)
-    preview = await preview_starter_installation(db, workspace_id=workspace_id)
-    return ApiResponse.ok(preview)
-
-
-@router.post(
-    "/starters/install",
-    response_model=ApiResponse[StarterInstallationResult],
-)
-async def install_automation_starters(
-    workspace_id: str,
-    identity: RequestIdentity = Depends(get_request_identity),
-    db: AsyncSession = Depends(get_db),
-) -> ApiResponse:
-    access = await get_workspace_access(db, workspace_id, identity)
-    require_permission(access, WorkspacePermission.MANAGE_AGENT_IDENTITIES)
-    result = await install_starters(
-        db,
-        workspace_id=workspace_id,
-        created_by_user_id=access.user_id,
-    )
-    return ApiResponse.ok(result)
 
 
 @router.get(
@@ -126,7 +98,9 @@ async def create_automation(
     access = await get_workspace_access(db, workspace_id, identity)
     require_permission(access, WorkspacePermission.MANAGE_AGENT_IDENTITIES)
     row = Automation(
-        workspace_id=workspace_id, created_by_user_id=access.user_id, **body.model_dump()
+        workspace_id=workspace_id,
+        created_by_user_id=access.user_id,
+        **body.model_dump(),
     )
     db.add(row)
     await db.flush()
@@ -150,7 +124,10 @@ async def update_automation(
     require_permission(access, WorkspacePermission.MANAGE_AGENT_IDENTITIES)
     row = await db.scalar(
         select(Automation)
-        .where(Automation.workspace_id == workspace_id, Automation.id == automation_id)
+        .where(
+            Automation.workspace_id == workspace_id,
+            Automation.id == automation_id,
+        )
         .with_for_update()
     )
     if row is None:
@@ -199,7 +176,6 @@ async def start_automation_run(
     except AutomationBindingError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     return ApiResponse.ok(OperationsAgentRunRead.model_validate(run))
-
 
 
 

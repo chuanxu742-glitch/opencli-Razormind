@@ -1,3 +1,4 @@
+import asyncio
 import fnmatch
 import os
 import time
@@ -6,6 +7,7 @@ from urllib.parse import urlparse
 
 import httpx
 from jsonschema import ValidationError, validate
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.browser import (
@@ -13,6 +15,7 @@ from backend.models.browser import (
     BrowserInstance,
     BrowserRuntimeBundle,
 )
+from backend.models.browser_space import BrowserSpace, BrowserSpaceTask
 from backend.schemas.browser import RuntimeBundleManifest
 from backend.schemas.browser_account import BrowserAccountErrorCode, LoginObservationV1
 from backend.services.browser_service import (
@@ -331,6 +334,20 @@ def _capability_for(bundle: BrowserRuntimeBundle, capability_name: str) -> Any:
     manifest = RuntimeBundleManifest.model_validate(bundle.manifest)
     return next((item for item in manifest.capabilities if item.name == capability_name), None)
 
+
+def validate_capability_args(capability: Any, args: dict) -> None:
+    """Shared preflight used before Space task persistence and runtime dispatch."""
+    try:
+        validate(instance=args, schema=capability.args_schema)
+    except ValidationError as exc:
+        raise BrowserRuntimeError("invalid_capability_args", "invalid capability args") from exc
+    if capability.allowed_hosts:
+        candidate_url = args.get("url")
+        host = urlparse(candidate_url).hostname if isinstance(candidate_url, str) else None
+        if not host or not _host_allowed(host, capability.allowed_hosts):
+            raise BrowserRuntimeError("host_not_allowed", "requested host is not allowed")
+
+
 async def _dispatch_capability(
     instance: BrowserInstance,
     capability: Any,
@@ -389,7 +406,35 @@ async def invoke_capability(
     *,
     gate_authorized: bool = False,
     audit_input_payload: dict | None = None,
+    commit_before_dispatch: bool = False,
+    space_task_id: str | None = None,
 ) -> BrowserCapabilityInvocation:
+    reserved_space = await session.scalar(
+        select(BrowserSpace)
+        .where(BrowserSpace.browser_instance_id == instance.id)
+        .where(BrowserSpace.status != "closed")
+    )
+    if reserved_space is not None:
+        if space_task_id is None:
+            raise BrowserRuntimeError(
+                "browser_space_reserved",
+                "reserved browser instances only accept an active Browser Space task",
+            )
+        task = await session.scalar(
+            select(BrowserSpaceTask).where(
+                BrowserSpaceTask.id == space_task_id,
+                BrowserSpaceTask.space_id == reserved_space.id,
+                BrowserSpaceTask.workspace_id == reserved_space.workspace_id,
+                BrowserSpaceTask.capability == capability_name,
+                BrowserSpaceTask.status == "running",
+                BrowserSpaceTask.cancel_requested.is_(False),
+            )
+        )
+        if task is None or reserved_space.control_mode != "agent":
+            raise BrowserRuntimeError(
+                "browser_space_control_denied",
+                "reserved browser instance is not controlled by a running agent task",
+            )
     deployment = await get_runtime_deployment(session, instance.id)
     bundle = (
         await get_runtime_bundle(session, instance.runtime_bundle_id)
@@ -487,6 +532,10 @@ async def invoke_capability(
                 f"capability {capability_name!r} requires an authorized "
                 f"{capability.required_gate!r} gate",
             )
+        if commit_before_dispatch:
+            # Space executors use expire_on_commit=False and own this session.
+            # Persist the audit start, then release all locks before agent I/O.
+            await session.commit()
         result = await _dispatch_capability(instance, capability, args)
         if login_capability:
             if capability.action == "login.observe":
@@ -506,6 +555,11 @@ async def invoke_capability(
             invocation.output_payload = result
             invocation.page_before = result.get("page_before")
             invocation.page_after = result.get("page_after")
+        if commit_before_dispatch and result.get("type") == "error":
+            raise BrowserRuntimeError("agent_invocation_failed", "agent reported a runtime failure")
+    except asyncio.CancelledError:
+        invocation.error = {"code": "capability_cancelled", "message": "capability call cancelled"}
+        raise
     except BrowserRuntimeError as exc:
         invocation.error = _safe_login_error(exc.code) if login_capability else {
             "code": exc.code,

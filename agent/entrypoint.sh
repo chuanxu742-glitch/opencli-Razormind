@@ -60,6 +60,8 @@ SCRIPT_HOST_VERSION="$(read_manifest_component_version opencli-script-host)"
 VIOLENTMONKEY_VERSION="$(read_manifest_component_version violentmonkey)"
 BUNDLE_EXTENSION_DIRS=()
 if [ -n "$BUNDLE_EXTENSION_OUTPUT" ]; then mapfile -t BUNDLE_EXTENSION_DIRS <<< "$BUNDLE_EXTENSION_OUTPUT"; fi
+BBX_EXTENSION_DIR="/opt/browser-bridge-extension"
+if [ -d "$BBX_EXTENSION_DIR" ]; then BUNDLE_EXTENSION_DIRS+=("$BBX_EXTENSION_DIR"); fi
 CHROME_EXTRA_FLAGS=(--disable-extensions)
 if [ "${#BUNDLE_EXTENSION_DIRS[@]}" -gt 0 ]; then
   EXTENSION_DIRS="$(IFS=,; echo "${BUNDLE_EXTENSION_DIRS[*]}")"
@@ -88,7 +90,7 @@ verify_profile_ready() {
   done
 }
 verify_chromium_policy() {
-  node -e 'const p=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); if(p.PasswordManagerEnabled!==false || (p.AutofillAddressEnabled!==undefined && p.AutofillAddressEnabled!==false) || (p.AutofillCreditCardEnabled!==undefined && p.AutofillCreditCardEnabled!==false)) process.exit(1);' "$CHROMIUM_POLICY_FILE"
+  node -e 'const p=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); const urls=Array.isArray(p.URLBlocklist)?p.URLBlocklist:[]; if(p.PasswordManagerEnabled!==false || p.AutofillAddressEnabled!==false || p.AutofillCreditCardEnabled!==false || p.DeveloperToolsAvailability!==0 || p.RemoteDebuggingAllowed!==true || p.AllowFileSelectionDialogs!==false || p.DefaultFileSystemReadGuardSetting!==2 || p.DefaultFileSystemWriteGuardSetting!==2 || !["file:///*","file://*","view-source:*"].every((item)=>urls.includes(item))) process.exit(1);' "$CHROMIUM_POLICY_FILE"
 }
 
 ACCOUNT_RUNTIME_MANAGED=false
@@ -232,7 +234,7 @@ if [ "$ACCOUNT_RUNTIME_MANAGED" = "true" ]; then
     echo "[agent] BROWSER_RUNTIME_BUNDLE_ID is required for account runtime" >&2
     exit 1
   }
-  for command_name in Xvfb bbx bbx-daemon node; do
+  for command_name in Xvfb x11vnc bbx bbx-daemon node; do
     command -v "$command_name" >/dev/null 2>&1 || {
       echo "[agent] account runtime prerequisite unavailable: $command_name" >&2
       exit 1
@@ -325,9 +327,9 @@ elif [ "$HAVE_CHROME" = "true" ]; then
   start_chrome() {
     verify_profile_ready
     if [ "$CHROME_SESSION_MODE" = "true" ]; then
-      exec setsid "$CHROME_BIN" --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --remote-allow-origins='*' --no-sandbox --disable-dev-shm-usage --no-first-run --no-default-browser-check --disable-session-crashed-bubble --disable-save-password-bubble --user-data-dir="$CHROME_PROFILE" --profile-directory=Default "${CHROME_EXTRA_FLAGS[@]}" --window-size=1280,900 "$@"
+      exec setsid "$CHROME_BIN" --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --no-sandbox --disable-dev-shm-usage --no-first-run --no-default-browser-check --disable-session-crashed-bubble --disable-save-password-bubble --user-data-dir="$CHROME_PROFILE" --profile-directory=Default "${CHROME_EXTRA_FLAGS[@]}" --window-size=1280,900 "$@"
     else
-      exec "$CHROME_BIN" --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --remote-allow-origins='*' --no-sandbox --disable-dev-shm-usage --no-first-run --no-default-browser-check --disable-session-crashed-bubble --disable-save-password-bubble --user-data-dir="$CHROME_PROFILE" --profile-directory=Default "${CHROME_EXTRA_FLAGS[@]}" --window-size=1280,900 "$@"
+      exec "$CHROME_BIN" --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --no-sandbox --disable-dev-shm-usage --no-first-run --no-default-browser-check --disable-session-crashed-bubble --disable-save-password-bubble --user-data-dir="$CHROME_PROFILE" --profile-directory=Default "${CHROME_EXTRA_FLAGS[@]}" --window-size=1280,900 "$@"
     fi
   }
   request_chrome_close() {

@@ -1,0 +1,27 @@
+{
+  "id": "official-quark",
+  "version": "0.1.0",
+  "platform": "quark",
+  "allowed_origins": [
+    "https://pan.quark.cn"
+  ],
+  "allowed_redirect_origins": [
+    "https://pan.quark.cn"
+  ],
+  "login_url": "/",
+  "modes": [
+    "form"
+  ],
+  "qr_supported": false,
+  "interaction_supported": true,
+  "identity_probe_supported": false,
+  "authentication_verified": false,
+  "selectors": [
+    {
+      "id": "form",
+      "selector": "body",
+      "kind": "form",
+      "frame": "main"
+    }
+  ]
+}

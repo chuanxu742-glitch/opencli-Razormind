@@ -123,7 +123,7 @@ def _contracts() -> tuple[DurableCommandV1, NodeClaimV1, SessionEnvelopeV1, Node
         epoch=claim.epoch,
         lease_expires_at=claim.expires_at,
         runtime_bundle_id="opencli-default",
-        runtime_bundle_version="2",
+        runtime_bundle_version="3",
         login_rule_id="controlled-login-fixture",
         login_rule_version="1.0.0",
         view_generation=0,
@@ -242,7 +242,7 @@ async def verify(*, barrier_dir: Path, participant: str) -> dict[str, Any]:
                 "BROWSER_RUNTIME_BUNDLE_ID": "opencli-default",
                 "BROWSER_RUNTIME_BUNDLE_ROOT": "/opt/browser-runtime-bundles",
                 "BROWSER_RUNTIME_BUNDLE_MANIFEST": (
-                    "/opt/browser-runtime-bundles/opencli-default/2/manifest.json"
+                    "/opt/browser-runtime-bundles/opencli-default/3/manifest.json"
                 ),
                 "CHROMIUM_POLICY_FILE": (
                     "/etc/chromium/policies/managed/opencli-account-runtime.json"

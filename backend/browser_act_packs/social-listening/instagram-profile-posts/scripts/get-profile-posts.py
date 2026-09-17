@@ -1,20 +1,24 @@
 import argparse
 import sys
 
+
 def main():
-    sys.stdout.reconfigure(encoding='utf-8', newline='\n')
+    sys.stdout.reconfigure(encoding="utf-8", newline="\n")
     parser = argparse.ArgumentParser()
-    parser.add_argument('user_id')            # Numeric user ID
-    parser.add_argument('--count', default='12')   # Posts per page (max 12)
-    parser.add_argument('--max-id', default='')    # Pagination cursor (empty for first page)
+    parser.add_argument("user_id")  # Numeric user ID
+    parser.add_argument("--count", default="12")  # Posts per page (max 12)
+    parser.add_argument(
+        "--max-id", default=""
+    )  # Pagination cursor (empty for first page)
     args = parser.parse_args()
 
-    max_id_param = f'&max_id={args.max_id}' if args.max_id else ''
+    max_id_param = f"&max_id={args.max_id}" if args.max_id else ""
 
     js = f"""
     (async function() {{
       try {{
-        var url = 'https://www.instagram.com/api/v1/feed/user/{args.user_id}/?count={args.count}{max_id_param}';
+        var url = 'https://www.instagram.com/api/v1/feed/user/{args.user_id}/'
+          + '?count={args.count}{max_id_param}';
         var r = await fetch(url, {{
           headers: {{
             'X-IG-App-ID': '936619743392459',
@@ -23,7 +27,10 @@ def main():
         }});
         if (!r.ok) {{
           var errText = await r.text();
-          return JSON.stringify({{ error: true, message: 'HTTP ' + r.status, detail: errText.slice(0, 200) }});
+          return JSON.stringify({{
+            error: true, message: 'HTTP ' + r.status,
+            detail: errText.slice(0, 200)
+          }});
         }}
         var data = await r.json();
         if (data.require_login) return JSON.stringify({{ error: true, message: 'Login required' }});
@@ -36,7 +43,9 @@ def main():
             like_count: m.like_count,
             comment_count: m.comment_count,
             caption: m.caption ? m.caption.text : null,
-            thumbnail_url: m.image_versions2 && m.image_versions2.candidates && m.image_versions2.candidates[0] ? m.image_versions2.candidates[0].url : null,
+            thumbnail_url: m.image_versions2 && m.image_versions2.candidates
+              && m.image_versions2.candidates[0]
+              ? m.image_versions2.candidates[0].url : null,
             video_url: m.video_versions && m.video_versions[0] ? m.video_versions[0].url : null,
             location: m.location ? {{ id: m.location.pk, name: m.location.name }} : null,
             username: m.user ? m.user.username : null,
@@ -54,6 +63,3 @@ def main():
     }})()
     """
     print(js)
-
-if __name__ == '__main__':
-    main()

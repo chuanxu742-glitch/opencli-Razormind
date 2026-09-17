@@ -1,0 +1,27 @@
+{
+  "id": "official-douban",
+  "version": "0.1.0",
+  "platform": "douban",
+  "allowed_origins": [
+    "https://accounts.douban.com"
+  ],
+  "allowed_redirect_origins": [
+    "https://accounts.douban.com"
+  ],
+  "login_url": "/passport/login",
+  "modes": [
+    "form"
+  ],
+  "qr_supported": false,
+  "interaction_supported": true,
+  "identity_probe_supported": false,
+  "authentication_verified": false,
+  "selectors": [
+    {
+      "id": "form",
+      "selector": "body",
+      "kind": "form",
+      "frame": "main"
+    }
+  ]
+}

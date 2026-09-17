@@ -1,0 +1,27 @@
+{
+  "id": "official-notebooklm",
+  "version": "0.1.0",
+  "platform": "notebooklm",
+  "allowed_origins": [
+    "https://accounts.google.com"
+  ],
+  "allowed_redirect_origins": [
+    "https://accounts.google.com"
+  ],
+  "login_url": "/ServiceLogin?service=lso&continue=https%3A%2F%2Fnotebooklm.google.com%2F",
+  "modes": [
+    "form"
+  ],
+  "qr_supported": false,
+  "interaction_supported": true,
+  "identity_probe_supported": false,
+  "authentication_verified": false,
+  "selectors": [
+    {
+      "id": "form",
+      "selector": "body",
+      "kind": "form",
+      "frame": "main"
+    }
+  ]
+}

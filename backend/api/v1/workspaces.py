@@ -1,3 +1,5 @@
+from datetime import UTC
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -5,8 +7,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.api.v1.studio_projects import bootstrap_project
 from backend.api.v1.studio_schemas import ProjectBootstrapCreate
 from backend.database import get_db
-from backend.models.identity import Team, User, Workspace, WorkspaceMembership, WorkspaceRole
-from backend.models.workflow import Project
+from backend.models.identity import (
+    Team,
+    User,
+    Workspace,
+    WorkspaceMembership,
+    WorkspaceRole,
+)
+from backend.models.studio import StudioProject, StudioWorkspace
+from backend.models.workflow import Project as LegacyProject
 from backend.schemas.common import ApiResponse
 from backend.schemas.workflow_asset import ProjectRead
 from backend.schemas.workspace import (
@@ -56,6 +65,7 @@ async def _get_or_create_user(
         raise HTTPException(status.HTTP_409_CONFLICT, "Disabled user cannot join a Workspace")
     return user
 
+
 async def _ensure_local_admin_workspace(
     db: AsyncSession,
     identity: RequestIdentity,
@@ -93,9 +103,7 @@ async def _ensure_local_admin_workspace(
         )
 
     team = await db.scalar(
-        select(Team)
-        .where(Team.workspace_id == workspace.id)
-        .where(Team.slug == "default")
+        select(Team).where(Team.workspace_id == workspace.id).where(Team.slug == "default")
     )
     if team is None:
         db.add(Team(workspace_id=workspace.id, name="默认团队", slug="default"))
@@ -142,18 +150,40 @@ async def list_governance_projects(
 ) -> ApiResponse:
     access = await get_workspace_access(db, workspace_id, identity)
     require_permission(access, WorkspacePermission.READ)
-    rows = (
-        (
-            await db.execute(
-                select(Project)
-                .where(Project.workspace_id == workspace_id, Project.archived.is_(False))
-                .order_by(Project.updated_at.desc())
+    legacy_rows = (
+        await db.scalars(
+            select(LegacyProject).where(
+                LegacyProject.workspace_id == workspace_id,
+                LegacyProject.archived.is_(False),
             )
         )
-        .scalars()
-        .all()
+    ).all()
+    studio_rows = (
+        await db.scalars(
+            select(StudioProject).where(
+                StudioProject.workspace_id == workspace_id,
+                StudioProject.archived.is_(False),
+            )
+        )
+    ).all()
+    # Both project stores remain live during the Studio migration. Preserve old
+    # workflow projects, prefer the Studio representation on an ID collision,
+    # and expose one stable newest-first list to governed callers.
+    projects_by_id = {row.id: ProjectRead.model_validate(row) for row in legacy_rows}
+    projects_by_id.update({row.id: ProjectRead.model_validate(row) for row in studio_rows})
+    rows = sorted(
+        projects_by_id.values(),
+        key=lambda row: (
+            row.updated_at.replace(tzinfo=UTC)
+            if row.updated_at.tzinfo is None
+            else row.updated_at.astimezone(UTC),
+            row.id,
+        ),
+        reverse=True,
     )
-    return ApiResponse.ok([ProjectRead.model_validate(row) for row in rows])
+    return ApiResponse.ok(rows)
+
+
 @router.post(
     "/governance/workspaces/{workspace_id}/projects/bootstrap",
     response_model=ApiResponse,
@@ -194,6 +224,7 @@ async def create_workspace(
     workspace = Workspace(name=body.name, slug=body.slug)
     db.add(workspace)
     await db.flush()
+    db.add(StudioWorkspace(id=workspace.id, name=workspace.name, slug=workspace.slug))
     membership = WorkspaceMembership(
         workspace_id=workspace.id,
         user_id=first_admin.id,

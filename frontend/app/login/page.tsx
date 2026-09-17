@@ -180,6 +180,7 @@ function LoginForm() {
   const { status, developmentLoginEnabled, signInWithPassword, enterDevelopmentMode } = useAuth()
   const [username, setUsername] = useState('admin')
   const [password, setPassword] = useState('')
+  const [rememberLogin, setRememberLogin] = useState(false)
   const [submitting, setSubmitting] = useState<'password' | 'development' | null>(null)
   const [reduceMotion, setReduceMotion] = useState(true)
   const [backdrop, setBackdrop] = useState<LoginBackdrop>('liquid')
@@ -215,7 +216,7 @@ function LoginForm() {
     event.preventDefault()
     setSubmitting('password')
     try {
-      const usingDefaultPassword = await signInWithPassword(username, password)
+      const usingDefaultPassword = await signInWithPassword(username, password, rememberLogin)
       toast.success(
         usingDefaultPassword
           ? '登录成功。请在账户设置中修改安装器生成的初始密码。'
@@ -382,6 +383,10 @@ function LoginForm() {
                     <FieldDescription>登录后可以在账户设置中修改密码。</FieldDescription>
                   </Field>
                 </FieldGroup>
+                <label className="flex items-center gap-2 text-sm">
+                  <input type="checkbox" checked={rememberLogin} onChange={(event) => setRememberLogin(event.target.checked)} disabled={submitting !== null} className="size-4 accent-primary" />
+                  记住登录 30 天
+                </label>
               </form>
             </CardContent>
             <CardFooter className="flex-col gap-2">

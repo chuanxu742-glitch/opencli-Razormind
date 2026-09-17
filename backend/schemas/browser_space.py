@@ -10,8 +10,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 OwnerType = Literal["operator", "runtime_agent"]
 SpaceStatus = Literal["idle", "running", "closed", "error"]
+ControlMode = Literal["agent", "human"]
 TaskStatus = Literal["queued", "running", "completed", "failed", "cancelled"]
-EventKind = Literal["queued", "started", "completed", "failed", "cancel_requested", "cancelled"]
+EventKind = Literal[
+    "queued", "started", "completed", "failed", "cancel_requested", "cancelled", "control_changed"
+]
 
 
 class BrowserSpaceCreate(BaseModel):
@@ -41,6 +44,7 @@ class BrowserSpaceTaskCreate(BaseModel):
     capability: str = Field(min_length=1, max_length=255)
     args: dict[str, Any] = Field(default_factory=dict)
     timeout_seconds: int = Field(default=60, ge=1, le=600)
+    gate: str | None = Field(default=None, max_length=100)
 
     @field_validator("capability")
     @classmethod
@@ -53,12 +57,19 @@ class BrowserSpaceTaskCreate(BaseModel):
     @classmethod
     def validate_args(cls, value: dict[str, Any]) -> dict[str, Any]:
         try:
-            encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
         except (TypeError, ValueError) as exc:
             raise ValueError("args must be JSON-serializable") from exc
         if len(encoded.encode("utf-8")) > 65536:
             raise ValueError("args exceeds the 64 KiB limit")
         return value
+
+
+class BrowserSpaceControlUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: ControlMode
+    expected_revision: int = Field(ge=0)
 
 
 class BrowserSpaceTaskRead(BaseModel):
@@ -86,14 +97,14 @@ class BrowserSpaceRead(BaseModel):
     owner_type: OwnerType
     owner_id: str
     status: SpaceStatus
+    control_mode: ControlMode
     granted_capabilities: list[str]
     revision: int
     last_error_code: str | None
     created_at: datetime
     updated_at: datetime
     active_task: BrowserSpaceTaskRead | None = None
-
-
+    latest_task: BrowserSpaceTaskRead | None = None
 
 
 class BrowserSpaceEventRead(BaseModel):

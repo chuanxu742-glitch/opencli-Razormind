@@ -1,0 +1,27 @@
+{
+  "id": "official-12306",
+  "version": "0.1.0",
+  "platform": "12306",
+  "allowed_origins": [
+    "https://kyfw.12306.cn"
+  ],
+  "allowed_redirect_origins": [
+    "https://kyfw.12306.cn"
+  ],
+  "login_url": "/otn/resources/login.html",
+  "modes": [
+    "form"
+  ],
+  "qr_supported": false,
+  "interaction_supported": true,
+  "identity_probe_supported": false,
+  "authentication_verified": false,
+  "selectors": [
+    {
+      "id": "form",
+      "selector": "body",
+      "kind": "form",
+      "frame": "main"
+    }
+  ]
+}

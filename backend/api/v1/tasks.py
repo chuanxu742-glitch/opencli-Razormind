@@ -1,6 +1,5 @@
 import asyncio
 import json
-from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
@@ -57,8 +56,8 @@ def _http_account_error(
 
 @router.get("", response_model=ApiResponse[list[CollectionTaskRead]])
 async def list_tasks(
-    source_id: Optional[str] = None,
-    status: Optional[str] = None,
+    source_id: str | None = None,
+    status: str | None = None,
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
@@ -67,7 +66,9 @@ async def list_tasks(
         db, source_id=source_id, status=status, page=page, limit=limit
     )
     source_ids = list({t.source_id for t in tasks})
-    sources = (await db.execute(select(DataSource).where(DataSource.id.in_(source_ids)))).scalars().all()
+    sources = (
+        await db.execute(select(DataSource).where(DataSource.id.in_(source_ids)))
+    ).scalars().all()
     name_map = {s.id: s.name for s in sources}
     data = []
     for task in tasks:

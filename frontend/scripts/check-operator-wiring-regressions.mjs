@@ -41,11 +41,12 @@ test('control center exposes all real control-plane states and actions', async (
   assert.match(center, /role=\{killFeedback\.kind === 'error' \? 'alert' : 'status'\}/)
   assert.match(center, /onError: \(cause: Error\)/)
   assert.match(center, /实时熔断|熔断/)
+  assert.match(tabs, /href: '\/inbox\?tab=controls'/)
   assert.match(killSwitch, /useKillSwitch/)
   assert.match(killSwitch, /useSetKillSwitch/)
   assert.match(advisory, /useAdvisoryReport/)
   assert.match(odp, /useOdpState/)
-  for (const href of ['/control/actions', '/control/kill-switch', '/control/advisory-report', '/control/odp-state']) {
+  for (const href of ['/control/kill-switch', '/control/advisory-report', '/control/odp-state']) {
     assert.match(tabs, new RegExp(`href: '${href.replaceAll('/', '\\/')}'`))
   }
 })
@@ -125,7 +126,6 @@ test('all requested W5 wrappers and workspace settings remain wired', async () =
     assert.match(project, new RegExp(`\\b${hook}\\b`), `${hook} should be consumed by a page or component`)
   }
 
-  const endpoints = await read('lib/api/endpoints.ts')
   const workspaceEndpoints = await read('lib/api/workspace-endpoints.ts')
   const hooks = await read('lib/api/hooks.ts')
   const types = await read('lib/api/types.ts')

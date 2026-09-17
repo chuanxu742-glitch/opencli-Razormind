@@ -1,7 +1,8 @@
 """Tests for pipeline error handling branches."""
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from backend.channels.base import ChannelFetchError, ChannelResult
 from backend.pipeline.pipeline import run_pipeline
@@ -98,7 +99,10 @@ async def test_pipeline_captcha_failure_pauses_source_for_review(db_session):
     with (
         patch("backend.pipeline.collector.collect", return_value=channel_result),
         patch("backend.database.AsyncSessionLocal", return_value=mock_session_cm),
-        patch("backend.control.actuator.pause_source_for_captcha", new_callable=AsyncMock) as mock_pause,
+        patch(
+            "backend.control.actuator.pause_source_for_captcha",
+            new_callable=AsyncMock,
+        ) as mock_pause,
         patch("backend.config.get_settings") as mock_settings,
     ):
         mock_settings.return_value.control_pause_ttl_seconds = 900
@@ -136,7 +140,10 @@ async def test_pipeline_ordinary_failure_does_not_pause_source(db_session):
 
     with (
         patch("backend.pipeline.collector.collect", return_value=channel_result),
-        patch("backend.control.actuator.pause_source_for_captcha", new_callable=AsyncMock) as mock_pause,
+        patch(
+            "backend.control.actuator.pause_source_for_captcha",
+            new_callable=AsyncMock,
+        ) as mock_pause,
     ):
         result = await run_pipeline(task.id, source)
 
@@ -177,7 +184,10 @@ async def test_pipeline_with_ai_failure_still_returns_success(db_session):
 
     with (
         patch("backend.pipeline.collector.collect", return_value=channel_result),
-        patch("backend.pipeline.storer.store_records", new=AsyncMock(return_value=(mock_records, 0))),
+        patch(
+            "backend.pipeline.storer.store_records",
+            new=AsyncMock(return_value=(mock_records, 0)),
+        ),
         patch("backend.database.AsyncSessionLocal", return_value=mock_session_cm),
         patch(
             "backend.pipeline.ai_processor.process_with_ai",
@@ -212,7 +222,10 @@ async def test_pipeline_collect_retryable_exception_propagates(db_session):
     db_session.add(task)
     await db_session.flush()
 
-    with patch("backend.pipeline.collector.collect", side_effect=ConnectionError("dial tcp: refused")):
+    with patch(
+        "backend.pipeline.collector.collect",
+        side_effect=ConnectionError("dial tcp: refused"),
+    ):
         with pytest.raises(ConnectionError, match="dial tcp"):
             await run_pipeline(task.id, source)
 
@@ -286,7 +299,10 @@ async def test_pipeline_sink_retryable_exception_propagates(db_session):
 
     with (
         patch("backend.pipeline.collector.collect", return_value=channel_result),
-        patch("backend.pipeline.storer.store_records", side_effect=ConnectionError("pool exhausted")),
+        patch(
+            "backend.pipeline.storer.store_records",
+            side_effect=ConnectionError("pool exhausted"),
+        ),
     ):
         with pytest.raises(ConnectionError, match="pool exhausted"):
             await run_pipeline(task.id, source)

@@ -2,7 +2,7 @@
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
 
@@ -33,14 +33,14 @@ def _parse_item_timestamp(value: Any) -> datetime | None:
     try:
         dt = parsedate_to_datetime(value)
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.replace(tzinfo=UTC)
         return dt
     except (TypeError, ValueError):
         pass
     try:
         dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.replace(tzinfo=UTC)
         return dt
     except (TypeError, ValueError):
         return None
@@ -267,8 +267,25 @@ async def run_pipeline(
     from backend.database import AsyncSessionLocal
     from backend.pipeline import ai_processor, collector, notifier_dispatch
 
-    started = datetime.now(timezone.utc)
+    started = datetime.now(UTC)
     params = dict(parameters or {})
+    from backend.pipeline.geo_observations import geo_observation_capture_enabled
+
+    try:
+        geo_observation_capture = geo_observation_capture_enabled(
+            source.channel_type, source.channel_config
+        )
+    except ValueError as exc:
+        return PipelineResult(success=False, source_id=source.id, error=str(exc))
+    if geo_observation_capture and getattr(source, "write_strategy", None) == "odp_only":
+        return PipelineResult(
+            success=False,
+            source_id=source.id,
+            error=(
+                "GEO observation capture requires a local record sink; "
+                "write_strategy=odp_only is unsupported"
+            ),
+        )
     account_ref = None
     account_session = None
     try:
@@ -313,7 +330,7 @@ async def run_pipeline(
         source.channel_type,
         _display_parameters(params),
     )
-    step1_start = datetime.now(timezone.utc)
+    step1_start = datetime.now(UTC)
 
     if run_id:
         # Skill channel receives the same immutable account envelope as OpenCLI.
@@ -390,7 +407,9 @@ async def run_pipeline(
         if run_id:
             await _record_measurement_best_effort(
                 source_id=source.id, run_id=run_id,
-                fetch_latency_ms=int((datetime.now(timezone.utc) - step1_start).total_seconds() * 1000),
+                fetch_latency_ms=int(
+                    (datetime.now(UTC) - step1_start).total_seconds() * 1000
+                ),
                 error_kind=map_exception(exc),
                 raw={"stage": "collect", "error": str(exc), "error_type": error_type},
             )
@@ -440,7 +459,7 @@ async def run_pipeline(
                         await pause_source_for_captcha(
                             session,
                             source=src,
-                            now=datetime.now(timezone.utc),
+                            now=datetime.now(UTC),
                             ttl_seconds=ttl,
                         )
                         await session.commit()
@@ -466,7 +485,9 @@ async def run_pipeline(
         if run_id:
             await _record_measurement_best_effort(
                 source_id=source.id, run_id=run_id,
-                fetch_latency_ms=int((datetime.now(timezone.utc) - step1_start).total_seconds() * 1000),
+                fetch_latency_ms=int(
+                    (datetime.now(UTC) - step1_start).total_seconds() * 1000
+                ),
                 error_type=channel_result.error_type,
                 raw={"stage": "collect", "error": channel_result.error},
             )
@@ -479,7 +500,7 @@ async def run_pipeline(
             )
         return PipelineResult(success=False, source_id=source.id, error=channel_result.error)
 
-    step1_elapsed = int((datetime.now(timezone.utc) - step1_start).total_seconds() * 1000)
+    step1_elapsed = int((datetime.now(UTC) - step1_start).total_seconds() * 1000)
     logger.info("[task:%s] step1/collect done | count=%d metadata=%s",
                 task_id, channel_result.count, channel_result.metadata)
     if run_id:
@@ -504,6 +525,8 @@ async def run_pipeline(
             account_ref.source_binding_revision_id if account_ref is not None else None
         ),
         lineage=collection_lineage,
+        geo_observation_capture=geo_observation_capture,
+        observed_at=datetime.now(UTC),
     )
     logger.info("[task:%s] step2-3/sink start | sink=%s items=%d",
                 task_id, type(active_sink).__name__, channel_result.count)
@@ -749,7 +772,7 @@ async def run_pipeline(
                     level="warning",
                 )
 
-    duration_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+    duration_ms = int((datetime.now(UTC) - started).total_seconds() * 1000)
 
     if shadow_errors:
         # Non-blocking signal onto the result too (in addition to the emitted
@@ -763,7 +786,10 @@ async def run_pipeline(
     if run_id:
         await events.emit(
             run_id, "complete",
-            f"任务完成 | 总耗时 {duration_ms}ms | 采集 {channel_result.count} 新增 {len(new_records)} 跳过 {skipped}",
+            (
+                f"任务完成 | 总耗时 {duration_ms}ms | 采集 {channel_result.count} "
+                f"新增 {len(new_records)} 跳过 {skipped}"
+            ),
             detail={
                 "duration_ms": duration_ms,
                 "collected": channel_result.count,
@@ -771,7 +797,7 @@ async def run_pipeline(
                 "skipped": skipped,
             },
         )
-        completed_at = datetime.now(timezone.utc)
+        completed_at = datetime.now(UTC)
         # A successful run has no terminal error_type by definition — shadow-sink
         # errors are non-blocking (the run still succeeded) and are already
         # surfaced via the "complete" event above and PipelineResult.metadata;

@@ -2,6 +2,7 @@ import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from backend.acquisition.registry import OFFICIAL_SITE_CAPABILITY_COMMIT
 from backend.browser_pool import init_pool
@@ -142,7 +143,7 @@ async def test_runtime_probe_rejects_tracked_checkout_changes(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_catalog_stays_ready_while_anonymous_inventory_is_busy(monkeypatch):
+async def test_catalog_stays_ready_while_anonymous_inventory_is_busy(monkeypatch, db_engine):
     from backend.acquisition import capabilities
 
     monkeypatch.setattr(
@@ -150,6 +151,10 @@ async def test_catalog_stays_ready_while_anonymous_inventory_is_busy(monkeypatch
     )
     monkeypatch.setattr(
         capabilities, "_registration_is_available", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(
+        "backend.database.AsyncSessionLocal",
+        async_sessionmaker(db_engine, expire_on_commit=False),
     )
     endpoint = "http://anonymous-profile:9222"
     pool = init_pool([endpoint], use_redis=False)

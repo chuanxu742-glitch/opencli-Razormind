@@ -3,8 +3,9 @@ import type { ApiResponse } from './types'
 
 export type BrowserSpaceStatus = 'idle' | 'running' | 'closed' | 'error'
 export type BrowserSpaceTaskStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
-export type BrowserSpaceEventKind = 'queued' | 'started' | 'completed' | 'failed' | 'cancel_requested' | 'cancelled'
+export type BrowserSpaceEventKind = 'queued' | 'started' | 'completed' | 'failed' | 'cancel_requested' | 'cancelled' | 'control_changed'
 export type BrowserSpaceOwnerType = 'operator' | 'runtime_agent'
+export type BrowserSpaceControlMode = 'agent' | 'human'
 
 export interface BrowserSpace {
   id: string
@@ -17,6 +18,7 @@ export interface BrowserSpace {
   epoch: number
   owner_type: BrowserSpaceOwnerType
   owner_id: string
+  control_mode: BrowserSpaceControlMode
   status: BrowserSpaceStatus
   granted_capabilities: string[]
   revision: number
@@ -53,6 +55,7 @@ export interface BrowserSpaceList {
 
 export type BrowserSpaceDetail = BrowserSpace & {
   active_task?: BrowserSpaceTask | null
+  latest_task?: BrowserSpaceTask | null
 }
 
 export interface BrowserSpaceTaskRequest {
@@ -83,6 +86,11 @@ export interface BrowserSpaceTaskResponse {
   error: string | null
 }
 
+export interface BrowserSpaceControlRequest {
+  mode: BrowserSpaceControlMode
+  expected_revision: number
+}
+
 export interface BrowserSpaceEvents {
   events: BrowserSpaceEvent[]
 }
@@ -91,6 +99,11 @@ const spacePath = (workspaceId: string, spaceId?: string) => {
   const base = `/workspaces/${encodeURIComponent(workspaceId)}/browser-spaces`
   return spaceId ? `${base}/${encodeURIComponent(spaceId)}` : base
 }
+
+export const listBrowserSpaceInstances = (workspaceId: string) =>
+  apiClient
+    .get<ApiResponse<{ id: string; capabilities: string[] }[]>>(`${spacePath(workspaceId)}/instances`)
+    .then((response) => response.data.data)
 
 export const listBrowserSpaces = (workspaceId: string, limit = 20) =>
   apiClient
@@ -130,14 +143,35 @@ export const closeBrowserSpace = (workspaceId: string, spaceId: string) =>
     .post<ApiResponse<BrowserSpace>>( `${spacePath(workspaceId, spaceId)}/close`)
     .then((response) => response.data.data)
 
+export const updateBrowserSpaceControl = (
+  workspaceId: string,
+  spaceId: string,
+  data: BrowserSpaceControlRequest,
+) => apiClient
+  .post<ApiResponse<BrowserSpace>>(`${spacePath(workspaceId, spaceId)}/control`, data)
+  .then((response) => response.data.data)
+
 export const listBrowserSpaceEvents = (
   workspaceId: string,
   spaceId: string,
   afterSequence = 0,
   limit = 100,
-) =>
-  apiClient
-    .get<ApiResponse<BrowserSpaceEvent[]>>(`${spacePath(workspaceId, spaceId)}/events`, {
-      params: { after_sequence: afterSequence, limit },
-    })
-    .then((response) => ({ events: response.data.data }))
+) => {
+  // Drain bounded replay pages so polling continues beyond the first 100 events.
+  const read = async () => {
+    const events: BrowserSpaceEvent[] = []
+    let cursor = afterSequence
+    while (true) {
+      const response = await apiClient.get<ApiResponse<BrowserSpaceEvent[]>>(
+        `${spacePath(workspaceId, spaceId)}/events`,
+        { params: { after_sequence: cursor, limit } },
+      )
+      const page = response.data.data
+      events.push(...page)
+      if (page.length < limit || page[page.length - 1].sequence <= cursor) break
+      cursor = page[page.length - 1].sequence
+    }
+    return { events }
+  }
+  return read()
+}
