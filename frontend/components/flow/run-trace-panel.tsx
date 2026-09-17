@@ -1,6 +1,6 @@
-import { getApiAuthToken } from "@/lib/api/auth-token"
 "use client"
 
+import { getApiAuthToken } from "@/lib/api/auth-token"
 import { useEffect, useMemo, useRef, useState } from "react"
 import { Activity, FileInput, Loader2, Play, RotateCcw } from "lucide-react"
 import { useSearchParams } from "next/navigation"
